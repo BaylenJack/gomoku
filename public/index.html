@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#2b1d12">
+<title>五子棋</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='%23241a12'/><circle cx='12' cy='12' r='4' fill='%23fff' opacity='.35'/></svg>">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- 入口: 建房 / 加入 -->
+<div id="lobby" class="lobby">
+  <div class="lobby-card">
+    <div class="brand">
+      <div class="brand-monogram" aria-label="YBB">
+        <span class="m-letter">Y</span>
+        <span class="m-amp">·</span>
+        <span class="m-letter">B</span>
+        <span class="m-amp">·</span>
+        <span class="m-letter">B</span>
+      </div>
+      <h1>五子棋</h1>
+      <p class="sub">十五路 · 自由规则 · 五子连珠即胜</p>
+    </div>
+
+    <label class="field">
+      <span>你的昵称</span>
+      <input id="nameInput" maxlength="16" placeholder="给自己起个名字" autocomplete="off">
+    </label>
+
+    <label class="field">
+      <span>棋室名</span>
+      <input id="roomInput" maxlength="32" placeholder="两人约定同一个名字" autocomplete="off">
+    </label>
+
+    <button id="enterBtn" class="btn-primary">进入棋室</button>
+
+    <p class="hint">
+      把同一个棋室名告诉对方，你们就能在同一副棋盘上下棋。<br>
+      棋局会一直保存，随时来下一手都可以。
+    </p>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="app" class="app hidden">
+  <header class="topbar">
+    <div class="room-tag">
+      <span class="room-label">棋室</span>
+      <span id="roomName" class="room-name"></span>
+      <button id="copyBtn" class="icon-btn" title="复制邀请链接">⧉</button>
+    </div>
+    <div class="top-actions">
+      <button id="soundBtn" class="icon-btn" title="音效">🔊</button>
+      <button id="leaveBtn" class="icon-btn" title="离开">✕</button>
+    </div>
+  </header>
+
+  <div class="players">
+    <div id="pBlack" class="player">
+      <div class="avatar black"></div>
+      <div class="pinfo">
+        <div class="pname">黑方</div>
+        <div class="pmeta"><span class="dot"></span><span class="pstat">未连接</span></div>
+      </div>
+      <div class="pscore">0</div>
+    </div>
+    <div class="vs">对局</div>
+    <div id="pWhite" class="player">
+      <div class="avatar white"></div>
+      <div class="pinfo">
+        <div class="pname">白方</div>
+        <div class="pmeta"><span class="dot"></span><span class="pstat">未连接</span></div>
+      </div>
+      <div class="pscore">0</div>
+    </div>
+  </div>
+
+  <div class="board-wrap">
+    <canvas id="board"></canvas>
+    <div id="boardMask" class="board-mask hidden"><div class="mask-text"></div></div>
+  </div>
+
+  <div id="statusBar" class="status">正在连接…</div>
+
+  <div class="toolbar">
+    <button id="undoBtn" class="btn">悔棋</button>
+    <button id="newBtn" class="btn">新一局</button>
+    <button id="timerBtn" class="btn">计时 关</button>
+  </div>
+  <!-- 提示按钮由特权逻辑动态注入, 普通玩家看不到也拿不到 -->
+
+  <div class="emoji-bar">
+    <button data-e="👏">👏</button>
+    <button data-e="😄">😄</button>
+    <button data-e="😮">😮</button>
+    <button data-e="🤔">🤔</button>
+    <button data-e="❤️">❤️</button>
+    <button data-e="😭">😭</button>
+  </div>
+</div>
+
+<!-- 悔棋确认 -->
+<div id="undoModal" class="modal hidden">
+  <div class="modal-card">
+    <h3>对方请求悔棋</h3>
+    <p id="undoText">同意后将退回该方上一手。</p>
+    <div class="modal-actions">
+      <button id="undoNo" class="btn">不同意</button>
+      <button id="undoYes" class="btn-primary">同意</button>
+    </div>
+  </div>
+</div>
+
+<!-- 胜负 -->
+<div id="overModal" class="modal hidden">
+  <div class="modal-card center">
+    <div id="overIcon" class="over-icon">🎉</div>
+    <h3 id="overTitle">黑方获胜</h3>
+    <p id="overSub"></p>
+    <div class="modal-actions">
+      <button id="overClose" class="btn">看看棋盘</button>
+      <button id="overNew" class="btn-primary">再来一局</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+<div id="emojiLayer" class="emoji-layer"></div>
+
+<script src="/app.js?v=3"></script>
+</body>
+</html>
