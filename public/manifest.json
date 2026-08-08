@@ -1,0 +1,26 @@
+{
+  "name": "五子棋",
+  "short_name": "五子棋",
+  "description": "双人在线五子棋 — 实时对战、AI 提示、棋局持久化",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1b120b",
+  "theme_color": "#2b1d12",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

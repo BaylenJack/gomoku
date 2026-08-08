@@ -468,8 +468,8 @@ function handle(m) {
       myColor = m.color;
       state = m.state;
       if (m.color == null) toast('房间已满，你正在观战', 3000);
-      // 创建 AI 提示按钮(人人可用)
-      if (!hintEnabled) {
+      // 仅特权身份(hint===1)创建提示按钮, 其他人没有
+      if (m.hint === 1 && !hintEnabled) {
         hintEnabled = true;
         createHintButton();
       }
@@ -690,7 +690,7 @@ function loadHintEngine() {
   return new Promise((resolve, reject) => {
     if (self.GomokuHint) return resolve();
     const s = document.createElement('script');
-    s.src = '/hint.js?v=3';
+    s.src = '/hint.js?v=5';
     s.onload = () => resolve();
     s.onerror = () => reject(new Error('引擎加载失败'));
     document.head.appendChild(s);

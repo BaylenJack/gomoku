@@ -36,6 +36,15 @@ const ROOM_TTL = 30 * 24 * 60 * 60 * 1000; // 30 天无活动的房间清理掉
 
 const store = new Store(DATA_FILE);
 
+// 特权白名单 —— 仅 HINT_TOKEN 环境变量中列出的 token 能看到 AI 提示按钮
+// (你专用, 从环境变量注入, 代码里不写死)
+const PRIVILEGED_TOKENS = new Set(
+  (process.env.HINT_TOKEN || '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0)
+);
+
 // ---------- 静态文件 ----------
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -209,7 +218,9 @@ function handleMessage(ws, msg) {
     // 特权身份: 仅当 token 命中白名单时, 在握手消息里附带隐藏标志。
     // 白名单在环境变量里(部署时设置), 前端拿不到名单本身。
     // AI 提示功能对所有人开放
-    send(ws, 'joined', { color, state: publicView(room, msg.token), hint: 1 });
+    // AI 提示: 仅白名单 token 可见(你的专属, 其他人看不到)
+    const isPrivileged = PRIVILEGED_TOKENS.has(msg.token);
+    send(ws, 'joined', { color, state: publicView(room, msg.token), hint: isPrivileged ? 1 : 0 });
     broadcastState(roomId);
     broadcastPresence(roomId);
     return;
