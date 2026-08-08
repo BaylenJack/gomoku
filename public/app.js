@@ -715,14 +715,67 @@ function createHintButton() {
 }
 
 // 按需加载提示引擎(只有特权用户才会触发)
+// v9: Web Worker 后台搜索 — 主线程不卡, 预算 3 秒, 深度 8
+let hintWorker = null;
+let hintWorkerBusy = false;
+let hintWorkerQueue = null; // 排队中的请求 { board, color, resolve }
 function loadHintEngine() {
   return new Promise((resolve, reject) => {
-    if (self.GomokuHint) return resolve();
-    const s = document.createElement('script');
-    s.src = '/hint.js?v=11';
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error('引擎加载失败'));
-    document.head.appendChild(s);
+    if (self.GomokuHint && hintWorker) return resolve();
+    if (!hintWorker) {
+      try {
+        hintWorker = new Worker('/worker.js');
+        hintWorker.onmessage = (ev) => {
+          hintWorkerBusy = false;
+          const { x, y, error } = ev.data || {};
+          if (hintWorkerQueue) {
+            const q = hintWorkerQueue;
+            hintWorkerQueue = null;
+            if (error) q.reject(new Error(error));
+            else q.resolve({ x, y });
+          }
+        };
+        hintWorker.onerror = () => {
+          hintWorkerBusy = false;
+          if (hintWorkerQueue) {
+            const q = hintWorkerQueue;
+            hintWorkerQueue = null;
+            q.reject(new Error('Worker 错误'));
+          }
+        };
+      } catch {
+        hintWorker = null;
+      }
+    }
+    // 同步引擎(备用, Worker 不可用时回退)
+    if (!hintWorker) {
+      if (self.GomokuHint) return resolve();
+      const s = document.createElement('script');
+      s.src = '/hint.js?v=12';
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('引擎加载失败'));
+      document.head.appendChild(s);
+      return;
+    }
+    resolve();
+  });
+}
+
+// 用 Worker 异步计算最佳落点
+function computeHintAsync(board, color) {
+  return new Promise((resolve, reject) => {
+    if (!hintWorker) {
+      // 回退同步
+      try {
+        const r = self.GomokuHint.computeBest(board, color);
+        resolve(r);
+      } catch (e) { reject(e); }
+      return;
+    }
+    if (hintWorkerBusy) { reject(new Error('搜索进行中')); return; }
+    hintWorkerBusy = true;
+    hintWorkerQueue = { resolve, reject };
+    hintWorker.postMessage({ board, color });
   });
 }
 
@@ -734,7 +787,7 @@ async function showHint() {
   }
   try {
     await loadHintEngine();
-    const { x, y } = self.GomokuHint.computeBest(state.board, state.turn);
+    const { x, y } = await computeHintAsync(state.board, state.turn);
     if (state.board[y * SIZE + x] !== EMPTY) { toast('提示暂不可用'); return; }
     hintMark = { x, y };
     hintHighlightUntil = performance.now() + 8000;

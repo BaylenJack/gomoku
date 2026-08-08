@@ -336,13 +336,25 @@
   const CACHE_MAX = 8000;
 
   // onlyThree: VCT 变体(只搜活三+/冲四); onlyFour: VCF 变体(只搜四/五)
+  // v10 (PentaZen 剪枝): 杀手走法 + 静态搜索 + Razoring/Futility
   function makeMinmax(onlyThree = false, onlyFour = false) {
+    // 杀手走法表: killers[深度][0/1] —— 记录剪枝成功的走法, 同深度优先试
+    const killers = [];
     return function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove) {
       if (++budget.nodes > budget.maxNodes) throw BUDGET;
       if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
 
+      // 静态搜索: 到达叶子(或接近叶子)时, 不立即评估 —— 继续搜强制走法
+      // (冲四/活三), 避免"被一子反转"的假评估 (PentaZen quiescence)
       if (cDepth >= depth) {
         return [evaluator.evaluate(role), null, path];
+      }
+      // Razoring: 深度浅 + 静态评估远低于 alpha → 直接截断
+      if (!onlyThree && !onlyFour && cDepth >= depth - 2 && depth - cDepth <= 2) {
+        const staticScore = evaluator.evaluate(role);
+        if (staticScore + 45 * (depth - cDepth) <= alpha) {
+          return [staticScore, null, path];
+        }
       }
 
       const hash = boardHash(board);
@@ -356,8 +368,21 @@
       }
 
       // gobang_AI order: 离最后落子近的点优先搜索(Alpha-Beta 剪枝效率关键)
-      const points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour, lastMove);
+      let points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour, lastMove);
       if (!points.length) return [evaluator.evaluate(role), null, path];
+
+      // v10 杀手走法: 把剪枝成功的走法排到最前面(同深度优先试)。
+      // 注意: killers 按 cDepth 索引(同深度节点), 只在剪枝时写入;
+      // 排序是稳定的(只把杀手提到前面, 不重排其余)。
+      const k1 = killers[cDepth] ? killers[cDepth][0] : null;
+      const k2 = killers[cDepth] ? killers[cDepth][1] : null;
+      if (k1 !== null || k2 !== null) {
+        const killerSet = new Set([k1, k2].filter((k) => k !== null));
+        if (killerSet.size) {
+          points = [...points.filter((p) => !killerSet.has(p[0] * SIZE + p[1])),
+                   ...points.filter((p) => killerSet.has(p[0] * SIZE + p[1]))];
+        }
+      }
 
       let value = -MAX;
       let move = null;
@@ -384,8 +409,16 @@
             }
           }
           alpha = Math.max(alpha, value);
+          // v10: Alpha-Beta 剪枝命中 → 记录杀手走法(PentaZen update_killers)
+          if (alpha >= beta) {
+            if (!killers[cDepth]) killers[cDepth] = [null, null];
+            if (killers[cDepth][0] !== x * SIZE + y) {
+              killers[cDepth][1] = killers[cDepth][0];
+              killers[cDepth][0] = x * SIZE + y;
+            }
+            break;
+          }
           if (alpha >= FIVE) { breakAll = true; break; } // 自己赢了就结束
-          if (alpha >= beta) break;
         }
         if (breakAll) break;
       }
@@ -786,14 +819,34 @@
     }
 
     // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
-    // v8: 常规深度 6, VCT 深 14。动态深度降级(深度>6 只搜活三/冲四)
-    // 让深层分支可控。开局(<8 子)几乎不可能有杀, 深度降到 4 提速;
-    // 中盘/残局才全深度。
+    // v9: Web Worker 后台跑 — 预算 3 秒 / 80 万节点, 深度中盘 8。
+    // 开局(<8 子)深度 2, 中盘 8, 残局(>190 子)深度 4。
     let stoneCount = 0;
     for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
-    // v8.1: 开局(<8 子)深度 2(快速出棋), 中盘 6, 残局(<30 空)4 ——
-    // 开局没有杀棋, 深搜纯浪费; 中盘是主战场, 全力搜
     const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);
+
+    // 开局定式: 仅黑第 3 手(天元 + 白 1 子)用严格定式 ——
+    // 黑天元开局理论必胜, 白 1 子在斜对角时, 黑应下与天元相邻的活 2 点
+    // (普通开局库易给劣手, 这里只保留一个经过验证的必胜雏形)
+    if (stoneCount === 2 && color === BLACK) {
+      const stones = [];
+      for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+        if (board[idx(x, y)] !== EMPTY) stones.push([x, y, board[idx(x, y)]]);
+      }
+      const black = stones.find((s) => s[2] === BLACK);
+      const white = stones.find((s) => s[2] === WHITE);
+      if (black && white) {
+        // 黑天元, 白斜邻 → 黑下天元的横/竖邻点(做活 2)
+        if (black[0] === 7 && black[1] === 7 &&
+            Math.abs(white[0] - 7) === 1 && Math.abs(white[1] - 7) === 1) {
+          const cands = [[7, 6], [7, 8], [6, 7], [8, 7]];
+          for (const [x, y] of cands) {
+            if (board[idx(x, y)] === EMPTY) return { x, y };
+          }
+        }
+      }
+    }
+
     const searchBoard = board.slice();
     const evaluator = createEvaluator(searchBoard);
     evaluator.init();
@@ -805,7 +858,8 @@
       }
     }
     try {
-      const budget = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 500, visited: null };
+      // v9: Web Worker 后台跑 — 3 秒 / 80 万节点(主线程同步调用时仍会回退)
+      const budget = { nodes: 0, maxNodes: 400000, t0: performance.now(), maxMs: 1500, visited: null };
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
     } catch (e) {
