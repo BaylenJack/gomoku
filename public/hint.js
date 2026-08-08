@@ -412,22 +412,28 @@
   // 主搜索: VCT 找杀 → 常规 minmax → 防守校验(对方杀棋路径是否变长)
   // v8: 常规深度 6(动态深度降级后深层只搜威胁, 分支可控),
   // VCT 深度 14(gobang depth+8 的加强版)。
+  // v8.1: 各阶段独立预算 —— 共享预算会让防守校验的 VCT 饿死 minmax。
   function minmaxSearch(evaluator, board, role, depth, budget, lastMove) {
     const cache = new Map();
     const vctDepth = depth + 8;
 
-    let [value, move, bestPath] = vct(evaluator, board, role, vctDepth, 0, [], -MAX, MAX, budget, cache, lastMove);
+    // 阶段 1: VCT 找杀(预算 35%)
+    const b1 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35), t0: budget.t0, maxMs: budget.maxMs * 0.35 };
+    let [value, move, bestPath] = vct(evaluator, board, role, vctDepth, 0, [], -MAX, MAX, b1, cache, lastMove);
     if (value >= FIVE && move) return { move, value, path: bestPath };
 
-    [value, move, bestPath] = _minmax(evaluator, board, role, depth, 0, [], -MAX, MAX, budget, cache, lastMove);
+    // 阶段 2: 常规 minmax(预算 40%)
+    const b2 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.4), t0: budget.t0, maxMs: budget.maxMs * 0.4 };
+    [value, move, bestPath] = _minmax(evaluator, board, role, depth, 0, [], -MAX, MAX, b2, cache, lastMove);
     if (!move) return null;
 
-    // 防守校验: 假设自己走了 move, 对方还有杀棋吗? 路径变长则有效
+    // 阶段 3: 防守校验(预算 25%)
+    const b3 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25), t0: budget.t0, maxMs: budget.maxMs * 0.25 };
     evaluator.move(move[0], move[1], role);
-    let [value2, move2, path2] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, budget, cache, move);
+    let [value2, move2, path2] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
     evaluator.undo(move[0], move[1]);
     if (value < FIVE && value2 >= FIVE && move2 && path2.length > bestPath.length) {
-      let [value3, , path3] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, budget, cache, move);
+      let [value3, , path3] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
       if (path2.length <= path3.length) {
         return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
       }
@@ -780,8 +786,14 @@
     }
 
     // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
-    // v8: 常规深度 4 → 6(动态深度降级让深层分支可控), VCT 深 14。
-    // 预算: 500ms —— 深度够到"先手进攻"的收益(浅搜索天然偏保守防守)。
+    // v8: 常规深度 6, VCT 深 14。动态深度降级(深度>6 只搜活三/冲四)
+    // 让深层分支可控。开局(<8 子)几乎不可能有杀, 深度降到 4 提速;
+    // 中盘/残局才全深度。
+    let stoneCount = 0;
+    for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
+    // v8.1: 开局(<8 子)深度 2(快速出棋), 中盘 6, 残局(<30 空)4 ——
+    // 开局没有杀棋, 深搜纯浪费; 中盘是主战场, 全力搜
+    const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);
     const searchBoard = board.slice();
     const evaluator = createEvaluator(searchBoard);
     evaluator.init();
@@ -794,7 +806,7 @@
     }
     try {
       const budget = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 500, visited: null };
-      const res = minmaxSearch(evaluator, searchBoard, color, 6, budget, lastMove);
+      const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
     } catch (e) {
       if (e !== BUDGET) throw e;
