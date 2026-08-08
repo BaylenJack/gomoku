@@ -21,7 +21,33 @@ function getToken() {
   }
   return t;
 }
-const TOKEN = getToken();
+let TOKEN = getToken();
+
+// ---------- 专属链接兑换特权 ----------
+// 打开带 ?claim=<密钥> 的链接时, 自动把当前浏览器身份升级为特权(AI 提示可见)。
+// 换电脑/清缓存后重新打开专属链接即可恢复, 无需改服务器配置。
+// 兑换成功后把 key 从 URL 里去掉, 防止密钥留在地址栏。
+(async function claimPrivilege() {
+  const claim = new URLSearchParams(location.search).get('claim');
+  if (!claim) return;
+  try {
+    const resp = await fetch('/claim?key=' + encodeURIComponent(claim));
+    const data = await resp.json();
+    if (data.ok && data.token) {
+      localStorage.setItem('gomoku.token', data.token);
+      TOKEN = data.token;
+      toast('已激活专属 AI 提示');
+    } else {
+      toast('专属链接无效', 3000);
+    }
+  } catch {
+    toast('专属链接激活失败, 请检查网络', 3000);
+  }
+  // 无论成败都去掉密钥参数, 避免残留
+  const url = new URL(location.href);
+  url.searchParams.delete('claim');
+  history.replaceState(null, '', url);
+})();
 
 // ---------- 元素 ----------
 const $ = (id) => document.getElementById(id);
@@ -690,7 +716,7 @@ function loadHintEngine() {
   return new Promise((resolve, reject) => {
     if (self.GomokuHint) return resolve();
     const s = document.createElement('script');
-    s.src = '/hint.js?v=5';
+    s.src = '/hint.js?v=6';
     s.onload = () => resolve();
     s.onerror = () => reject(new Error('引擎加载失败'));
     document.head.appendChild(s);

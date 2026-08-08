@@ -11,6 +11,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { Store } from './store.js';
@@ -45,6 +46,35 @@ const PRIVILEGED_TOKENS = new Set(
     .filter((t) => t.length > 0)
 );
 
+// 专属链接兑换密钥 —— ?claim=<HINT_KEY> 访问时, 自动把当前浏览器
+// 身份升级为特权。换电脑/清缓存后重新打开专属链接即可恢复, 不用改配置。
+const CLAIM_KEY = process.env.HINT_KEY || '';
+const HINT_TOKENS_FILE = path.join(__dirname, '..', 'data', 'hint_tokens.json');
+
+// 持久化特权 token 名单(兑换产生的), 服务重启不丢
+function loadHintTokens() {
+  try {
+    if (!fs.existsSync(HINT_TOKENS_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(HINT_TOKENS_FILE, 'utf8'));
+    if (Array.isArray(raw.tokens)) {
+      for (const t of raw.tokens) PRIVILEGED_TOKENS.add(t);
+    }
+  } catch (e) {
+    console.error('[server] hint_tokens.json 读取失败:', e.message);
+  }
+}
+function saveHintToken(token) {
+  try {
+    const raw = fs.existsSync(HINT_TOKENS_FILE) ? JSON.parse(fs.readFileSync(HINT_TOKENS_FILE, 'utf8')) : {};
+    const tokens = Array.isArray(raw.tokens) ? raw.tokens : [];
+    if (!tokens.includes(token)) tokens.push(token);
+    fs.writeFileSync(HINT_TOKENS_FILE, JSON.stringify({ savedAt: Date.now(), tokens }));
+  } catch (e) {
+    console.error('[server] hint_tokens.json 写入失败:', e.message);
+  }
+}
+loadHintTokens();
+
 // ---------- 静态文件 ----------
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -64,6 +94,22 @@ const server = http.createServer((req, res) => {
     if (pathname === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       return res.end('ok');
+    }
+
+    // 专属链接兑换: ?claim=<HINT_KEY> → 把当前浏览器身份升级为特权
+    if (pathname === '/claim') {
+      const key = url.searchParams.get('key') || '';
+      if (!CLAIM_KEY || key !== CLAIM_KEY) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '密钥无效' }));
+      }
+      const token = Array.from(crypto.randomBytes(16))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+      PRIVILEGED_TOKENS.add(token);
+      saveHintToken(token);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, token }));
     }
 
     if (pathname === '/') pathname = '/index.html';
