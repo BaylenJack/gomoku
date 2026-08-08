@@ -207,8 +207,8 @@
     };
   }
 
-  // ---------- 分级移动生成 (gobang eval.js getPoints/getMoves) ----------
-  function getValuableMoves(evaluator, board, role, depth, onlyThree, onlyFour) {
+  // ---------- 分级移动生成 (gobang eval.js getPoints/getMoves + gobang_AI order/has_neightnor) ----------
+  function getValuableMoves(evaluator, board, role, depth, onlyThree, onlyFour, lastMove) {
     const N = SIZE;
     const sets = {
       five: [], blockFive: [], four: [], fourFour: [], fourThree: [],
@@ -217,6 +217,8 @@
     for (let y = 0; y < N; y++) {
       for (let x = 0; x < N; x++) {
         if (board[idx(x, y)] !== EMPTY) continue;
+        // gobang_AI has_neightnor: 无邻居的点不评估(搜索聚焦, 深度更深)
+        if (!hasNeighbor(board, x, y)) continue;
         for (const r of [role, other(role)]) {
           let fourCnt = 0, blockFourCnt = 0, threeCnt = 0, twoCnt = 0;
           let best = SH.NONE;
@@ -254,15 +256,51 @@
       }
       return out;
     };
-    const take = (arr, n) => dedupe(arr).slice(0, n);
+    // gobang_AI order: 离最后落子近的点排前面(Alpha-Beta 剪枝效率关键)。
+    // v7 修正: 当最后落子是远离战场的孤立子(如开局远角), 以"离最近的
+    // 己方/对方棋子"为基准排序 —— 聚焦在真正的战场, 而非对手的闲子。
+    const orderNear = (arr, n) => {
+      const deduped = dedupe(arr);
+      if (!lastMove) return deduped.slice(0, n);
+      deduped.sort((a, b) => {
+        const da = distToNearestStone(a, board);
+        const db = distToNearestStone(b, board);
+        return da - db;
+      });
+      return deduped.slice(0, n);
+    };
 
-    if (sets.five.length || sets.blockFive.length) return take([...sets.five, ...sets.blockFive], 8);
-    if (onlyFour || sets.four.length) return take([...sets.four, ...sets.blockFour], 12);
-    if (sets.fourFour.length) return take([...sets.fourFour, ...sets.blockFour], 12);
-    if (sets.fourThree.length) return take([...sets.fourThree, ...sets.blockFour, ...sets.three], 14);
-    if (sets.threeThree.length) return take([...sets.threeThree, ...sets.blockFour, ...sets.three], 14);
-    if (onlyThree) return take([...sets.blockFour, ...sets.three], 14);
-    return take([...sets.blockFour, ...sets.three, ...sets.blockThree, ...sets.twoTwo, ...sets.two], 16);
+    if (sets.five.length || sets.blockFive.length) return orderNear([...sets.five, ...sets.blockFive], 8);
+    if (onlyFour || sets.four.length) return orderNear([...sets.four, ...sets.blockFour], 12);
+    if (sets.fourFour.length) return orderNear([...sets.fourFour, ...sets.blockFour], 12);
+    if (sets.fourThree.length) return orderNear([...sets.fourThree, ...sets.blockFour, ...sets.three], 14);
+    if (sets.threeThree.length) return orderNear([...sets.threeThree, ...sets.blockFour, ...sets.three], 14);
+    if (onlyThree) return orderNear([...sets.blockFour, ...sets.three], 14);
+    return orderNear([...sets.blockFour, ...sets.three, ...sets.blockThree, ...sets.twoTwo, ...sets.two], 16);
+  }
+
+  function hasNeighbor(board, x, y) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx, ny = y + dy;
+        if (inB(nx, ny) && board[idx(nx, ny)] !== EMPTY) return true;
+      }
+    }
+    return false;
+  }
+
+  // 点到最近棋子的切比雪夫距离
+  function distToNearestStone(pt, board) {
+    let best = 99;
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        if (board[idx(x, y)] === EMPTY) continue;
+        const d = Math.max(Math.abs(pt[0] - x), Math.abs(pt[1] - y));
+        if (d < best) best = d;
+      }
+    }
+    return best;
   }
 
   // ---------- 胜负判定 (落子后增量检查) ----------
@@ -290,7 +328,7 @@
 
   // onlyThree: VCT 变体(只搜活三+/冲四); onlyFour: VCF 变体(只搜四/五)
   function makeMinmax(onlyThree = false, onlyFour = false) {
-    return function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache) {
+    return function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove) {
       if (++budget.nodes > budget.maxNodes) throw BUDGET;
       if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
 
@@ -305,7 +343,8 @@
         return [prev.value, prev.move, [...path, ...prev.path]];
       }
 
-      const points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour);
+      // gobang_AI order: 离最后落子近的点优先搜索(Alpha-Beta 剪枝效率关键)
+      const points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour, lastMove);
       if (!points.length) return [evaluator.evaluate(role), null, path];
 
       let value = -MAX;
@@ -319,7 +358,7 @@
         for (const [x, y] of points) {
           evaluator.move(x, y, role);
           const newPath = [...path, [x, y]];
-          let [cv, , cp] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache);
+          let [cv, , cp] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y]);
           cv = -cv;
           evaluator.undo(x, y);
 
@@ -356,22 +395,22 @@
   const vcf = makeMinmax(false, true);
 
   // 主搜索: VCT 找杀 → 常规 minmax → 防守校验(对方杀棋路径是否变长)
-  function minmaxSearch(evaluator, board, role, depth, budget) {
+  function minmaxSearch(evaluator, board, role, depth, budget, lastMove) {
     const cache = new Map();
     const vctDepth = depth + 8;
 
-    let [value, move, bestPath] = vct(evaluator, board, role, vctDepth, 0, [], -MAX, MAX, budget, cache);
+    let [value, move, bestPath] = vct(evaluator, board, role, vctDepth, 0, [], -MAX, MAX, budget, cache, lastMove);
     if (value >= FIVE && move) return { move, value, path: bestPath };
 
-    [value, move, bestPath] = _minmax(evaluator, board, role, depth, 0, [], -MAX, MAX, budget, cache);
+    [value, move, bestPath] = _minmax(evaluator, board, role, depth, 0, [], -MAX, MAX, budget, cache, lastMove);
     if (!move) return null;
 
     // 防守校验: 假设自己走了 move, 对方还有杀棋吗? 路径变长则有效
     evaluator.move(move[0], move[1], role);
-    let [value2, move2, path2] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, budget, cache);
+    let [value2, move2, path2] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, budget, cache, move);
     evaluator.undo(move[0], move[1]);
     if (value < FIVE && value2 >= FIVE && move2 && path2.length > bestPath.length) {
-      let [value3, , path3] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, budget, cache);
+      let [value3, , path3] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, budget, cache, move);
       if (path2.length <= path3.length) {
         return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
       }
@@ -543,12 +582,31 @@
     live3: 3e6, jump3: 3e5, sleep3: 3e4,
     live2: 8e3,
   };
+  // 评估: 己方模式分 - 对方模式分 × 攻防系数。
+  // 借鉴 gobang_AI: 对手分只按 0.1 折算 —— 五子棋 AI 必须进攻压倒防守,
+  // 防守偏差过大(如 1.08)会让引擎只会堵、不会攻("太蠢"的根因之一)。
+  const DEF_RATIO = 0.1;
   function evalBoard(board, color) {
     const mc = patternCounts(board, color);
     const mo = patternCounts(board, other(color));
     let s = 0;
-    for (const k in PW) s += PW[k] * (mc[k] - mo[k] * 1.08);
+    for (const k in PW) s += PW[k] * (mc[k] - mo[k] * DEF_RATIO);
     return s;
+  }
+
+  // v7 gobang_AI 交叉加成: 落子后若形成 >=2 个活三级方向(双活三/活三+冲四),
+  // 交叉威胁是"对手堵不完"的杀棋之源, 分数暴增。
+  // 这是评估函数"一子双威胁"的关键 —— 做棋点评分暴涨, 引擎会主动找交叉。
+  function crossBonus(board, x, y, color) {
+    let threeCnt = 0, fourCnt = 0;
+    for (const [dx, dy] of DIRS) {
+      const l = dirThreat(board, x, y, dx, dy, color);
+      if (l >= 4) fourCnt++;
+      else if (l >= 3) threeCnt++;
+    }
+    if (fourCnt >= 1 && threeCnt >= 1) return PW.live3;      // 冲四+活三
+    if (threeCnt >= 2) return PW.live3;                       // 双活三
+    return 0;
   }
 
   function connectivity(board, color) {
@@ -619,6 +677,8 @@
       } else if (d2 >= 1) {
         s += 1.5e5;
       }
+      // v7 交叉加成: 一子形成双活三/活三+冲四 → 对手堵不完, 杀棋之源
+      s += crossBonus(b2, x, y, color);
       if (liveThreeBlocks(b2, color).length) s += 1e6; // 先手权
       if (winPoints(b2, opp).length) s -= 1e10;
 
@@ -656,24 +716,21 @@
       return { x: best.x, y: best.y };
     }
 
-    // 2b. 硬性防守: 对手落子即成活四/双威胁/跳四的点 → 必堵或抢占
+    // 2b. 硬性防守: 对手落子即成活四/双威胁的点 → 必堵或抢占
     // (搜索会算到这些威胁, 但硬性规则更快更稳, 且搜索预算有限)
+    // v7: 跳三缺口(非活四)不再硬性必堵 —— 交给搜索评估。
+    // gobang_AI 攻防系数 0.1: 下棋优先于堵棋, 跳三可晚一步堵。
     const urgent = oppOpenFourPoints(board, opp);
     const double = oppDoubleThreatPoints(board, opp);
-    const rush = oppRushFourPoints(board, opp);
     const line = oppLineBlocks(board, opp);
-    if (urgent.length || double.length || rush.length || line.length) {
-      const cands = [...urgent, ...double, ...rush, ...line];
-      // 紧迫度: 活四(对手下一手必胜) > 双威胁 > 跳四 > 聚子
+    if (urgent.length || double.length || line.length) {
+      const cands = [...urgent, ...double, ...line];
+      // 紧迫度: 活四(对手下一手必胜) > 双威胁 > 聚子
       const urgency = new Map();
       for (const p of urgent) urgency.set(p.y * SIZE + p.x, 3);
       for (const p of double) {
         const k = p.y * SIZE + p.x;
         if (!urgency.has(k) || urgency.get(k) < 2) urgency.set(k, 2);
-      }
-      for (const p of rush) {
-        const k = p.y * SIZE + p.x;
-        if (!urgency.has(k)) urgency.set(k, 1);
       }
       for (const p of line) {
         const k = p.y * SIZE + p.x;
@@ -708,9 +765,16 @@
     const searchBoard = board.slice();
     const evaluator = createEvaluator(searchBoard);
     evaluator.init();
+    // 找最后落子(用于搜索聚焦排序)
+    let lastMove = null;
+    for (let y = SIZE - 1; y >= 0 && !lastMove; y--) {
+      for (let x = SIZE - 1; x >= 0; x--) {
+        if (board[idx(x, y)] !== EMPTY) { lastMove = [x, y]; break; }
+      }
+    }
     try {
       const budget = { nodes: 0, maxNodes: 150000, t0: performance.now(), maxMs: 350, visited: null };
-      const res = minmaxSearch(evaluator, searchBoard, color, 4, budget);
+      const res = minmaxSearch(evaluator, searchBoard, color, 4, budget, lastMove);
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
     } catch (e) {
       if (e !== BUDGET) throw e;
