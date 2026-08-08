@@ -761,8 +761,34 @@ function loadHintEngine() {
   });
 }
 
-// 用 Worker 异步计算最佳落点
+// 计算最佳落点: 服务器端 AI 优先(3s 深搜), 失败/超时回退本地 Worker
 function computeHintAsync(board, color) {
+  // 5 秒超时 → 回退本地
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('hint timeout')), 5000));
+  return Promise.race([
+    fetch('/hint', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ board, color, token: TOKEN }),
+    })
+      .then((resp) => {
+        if (!resp.ok) throw new Error('hint ' + resp.status);
+        return resp.json();
+      })
+      .then((data) => {
+        if (!data.ok || typeof data.x !== 'number' || typeof data.y !== 'number') throw new Error('hint bad');
+        return { x: data.x, y: data.y, server: true };
+      }),
+    timeout,
+  ])
+    .catch((e) => {
+      // 回退本地 Worker (断网 / 服务器挂了 / 无权限 / 超时都走这里)
+      return computeHintLocal(board, color).then((r) => ({ ...r, server: false }));
+    });
+}
+
+// 原本地 Worker 计算逻辑 (兜底)
+function computeHintLocal(board, color) {
   return new Promise((resolve, reject) => {
     if (!hintWorker) {
       // 回退同步
@@ -787,11 +813,11 @@ async function showHint() {
   }
   try {
     await loadHintEngine();
-    const { x, y } = await computeHintAsync(state.board, state.turn);
+    const { x, y, server } = await computeHintAsync(state.board, state.turn);
     if (state.board[y * SIZE + x] !== EMPTY) { toast('提示暂不可用'); return; }
     hintMark = { x, y };
     hintHighlightUntil = performance.now() + 8000;
-    toast(`建议 (${x + 1}, ${y + 1})`, 2500);
+    toast(`${server ? '🤖' : '📱'} 建议 (${x + 1}, ${y + 1})`, 2500);
     draw();
     loop();
   } catch {

@@ -12,6 +12,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { Store } from './store.js';
@@ -86,6 +87,100 @@ const MIME = {
   '.webmanifest': 'application/manifest+json',
 };
 
+// ---------- 服务器端 AI 提示引擎 ----------
+// 用 vm 沙箱加载 hint.js(浏览器同款引擎), 预算提到 3s/100万节点,
+// 比浏览器 Worker 的 1.5s/40万节点 深 2-3 层, 棋力更强。
+// 特权 token 才允许调用(沿用 HINT_TOKEN / claim 兑换机制)。
+
+let hintModule = null; // 缓存编译结果, 避免每次请求都重编译
+let hintLoadError = null;
+
+function loadHintEngine() {
+  if (hintModule) return hintModule;
+  const hintPath = path.join(PUBLIC_DIR, 'hint.js');
+  let src;
+  try {
+    src = fs.readFileSync(hintPath, 'utf8');
+  } catch (e) {
+    hintLoadError = '引擎文件读取失败';
+    return null;
+  }
+  // 预算替换: 浏览器 1.5s/40万节点 → 服务器 3s/100万节点
+  src = src
+    .replace('maxNodes: 400000', 'maxNodes: 1000000')
+    .replace('maxMs: 1500', 'maxMs: 3000');
+  const sandbox = {
+    module: { exports: {} },
+    exports: {},
+    global: {},
+    self: undefined,
+    performance: { now: () => Date.now() },
+    console,
+  };
+  sandbox.globalThis = sandbox;
+  try {
+    vm.createContext(sandbox);
+    vm.runInContext(src, sandbox, { timeout: 10000 });
+    hintModule = sandbox.module.exports;
+    if (!hintModule || typeof hintModule.computeBest !== 'function') {
+      hintLoadError = '引擎加载异常';
+      return null;
+    }
+    return hintModule;
+  } catch (e) {
+    hintLoadError = '引擎编译失败: ' + e.message;
+    return null;
+  }
+}
+
+function handleHint(req, res) {
+  // 只接受小体积 JSON (225 数字)
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => {
+    size += c.length;
+    if (size > 8192) {
+      req.destroy();
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: '请求过大' }));
+    }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    try {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const token = typeof body.token === 'string' ? body.token : '';
+      // 特权校验: 只有白名单 token 能调用服务器 AI
+      if (!PRIVILEGED_TOKENS.has(token)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '无权限' }));
+      }
+      const board = Array.isArray(body.board) ? body.board : null;
+      const color = body.color === 1 || body.color === 2 ? body.color : 0;
+      if (!board || board.length !== 225 || color === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '参数不合法' }));
+      }
+      const engine = loadHintEngine();
+      if (!engine) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: hintLoadError || '引擎不可用' }));
+      }
+      const t0 = Date.now();
+      const r = engine.computeBest(board, color);
+      const ms = Date.now() - t0;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, x: r.x, y: r.y, ms }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: '计算失败: ' + e.message }));
+    }
+  });
+  req.on('error', () => {
+    try { res.writeHead(400); res.end(); } catch {}
+  });
+}
+
 const server = http.createServer((req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -94,6 +189,13 @@ const server = http.createServer((req, res) => {
     if (pathname === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       return res.end('ok');
+    }
+
+    // 服务器端 AI 提示: POST /hint { board, color, token }
+    // 特权 token 校验 → vm 沙箱跑引擎(预算 3s/100万节点) → 返回 { x, y, ms }
+    if (pathname === '/hint' && req.method === 'POST') {
+      handleHint(req, res);
+      return;
     }
 
     // 专属链接兑换: ?claim=<HINT_KEY>&token=<现有token> → 把当前浏览器身份升级为特权。
