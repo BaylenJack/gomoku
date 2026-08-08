@@ -208,8 +208,13 @@
   }
 
   // ---------- 分级移动生成 (gobang eval.js getPoints/getMoves + gobang_AI order/has_neightnor) ----------
+  // v8: 动态深度降级 —— 深度 > 6 层时强制只搜活三/冲四(gobang onlyThreeThreshold)。
+  // 这是 gobang 能搜 12 层的核心: 深层只搜威胁, 分支砍到极小。
+  const ONLY_THREE_THRESHOLD = 6;
   function getValuableMoves(evaluator, board, role, depth, onlyThree, onlyFour, lastMove) {
     const N = SIZE;
+    // 深度降级: 深层搜索只保留活三/冲四/成五级威胁
+    const deep = depth > ONLY_THREE_THRESHOLD && !onlyThree && !onlyFour;
     const sets = {
       five: [], blockFive: [], four: [], fourFour: [], fourThree: [],
       threeThree: [], blockFour: [], three: [], twoTwo: [], blockThree: [], two: [],
@@ -243,6 +248,10 @@
           else if (best === SH.BLOCK_THREE) cat = 'blockThree';
           else if (best === SH.TWO) cat = 'two';
           else continue;
+          // 深度降级: 深层只保留活三/冲四/成五
+          if (deep && cat !== 'five' && cat !== 'blockFive' && cat !== 'four' &&
+              cat !== 'blockFour' && cat !== 'fourFour' && cat !== 'fourThree' &&
+              cat !== 'threeThree' && cat !== 'three') continue;
           sets[cat].push([x, y]);
         }
       }
@@ -337,9 +346,12 @@
       }
 
       const hash = boardHash(board);
-      const key = (hash + role * 2654435761 + (depth - cDepth) * 4101842887) >>> 0;
+      // v8: 缓存 key 含变体标志 —— VCT/VCF 与常规搜索的缓存不通用(gobang)
+      const key = (hash + role * 2654435761 + (depth - cDepth) * 4101842887 +
+        (onlyThree ? 1 : 0) * 7919 + (onlyFour ? 1 : 0) * 104729) >>> 0;
       const prev = cache.get(key);
-      if (prev && (Math.abs(prev.value) >= FIVE || prev.depth >= depth - cDepth)) {
+      if (prev && (Math.abs(prev.value) >= FIVE || prev.depth >= depth - cDepth) &&
+          prev.onlyThree === onlyThree && prev.onlyFour === onlyFour) {
         return [prev.value, prev.move, [...path, ...prev.path]];
       }
 
@@ -384,6 +396,9 @@
           value,
           move,
           path: bestPath.slice(cDepth),
+          // v8: 缓存区分变体 —— VCT/VCF 与常规搜索的缓存不通用(gobang)
+          onlyThree,
+          onlyFour,
         });
       }
       return [value, move, bestPath];
@@ -395,6 +410,8 @@
   const vcf = makeMinmax(false, true);
 
   // 主搜索: VCT 找杀 → 常规 minmax → 防守校验(对方杀棋路径是否变长)
+  // v8: 常规深度 6(动态深度降级后深层只搜威胁, 分支可控),
+  // VCT 深度 14(gobang depth+8 的加强版)。
   function minmaxSearch(evaluator, board, role, depth, budget, lastMove) {
     const cache = new Map();
     const vctDepth = depth + 8;
@@ -725,23 +742,26 @@
     const line = oppLineBlocks(board, opp);
     if (urgent.length || double.length || line.length) {
       const cands = [...urgent, ...double, ...line];
-      // 紧迫度: 活四(对手下一手必胜) > 双威胁 > 聚子
+      // 紧迫度: 对手活三/四(必堵) > 对手双威胁 > 己方活四机会 > 聚子
+      // v8 修正: 堵对手活三的端点必须优先于己方活四机会 ——
+      // 对手活三下一步成活四就输了, 己方活四机会晚一步下还在。
       const urgency = new Map();
+      // line(对手同线 3 子必堵端点)提到最高, 与 urgent 同级
+      for (const p of line) {
+        const k = p.y * SIZE + p.x;
+        if (!urgency.has(k) || urgency.get(k) < 3) urgency.set(k, 3);
+      }
       for (const p of urgent) urgency.set(p.y * SIZE + p.x, 3);
       for (const p of double) {
         const k = p.y * SIZE + p.x;
         if (!urgency.has(k) || urgency.get(k) < 2) urgency.set(k, 2);
-      }
-      for (const p of line) {
-        const k = p.y * SIZE + p.x;
-        if (!urgency.has(k)) urgency.set(k, 0);
       }
       let best = cands[0], bestScore = -Infinity;
       for (const b of cands) {
         const b2 = board.slice();
         b2[idx(b.x, b.y)] = color;
         let s = evalBoardConn(b2, color);
-        // 必堵活四的点: 大额加权 —— 对手下一手必胜, 优先于一切
+        // 必堵活四/活三的点: 大额加权 —— 对手下一手必胜, 优先于一切
         const u = urgency.get(b.y * SIZE + b.x) || 0;
         s += u * 8e6;
         // v6 反击: 防守点若同时形成自己的活三/双活二(先手), 加权
@@ -760,8 +780,8 @@
     }
 
     // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
-    // gobang 默认 depth 4 + VCT(depth+8); 这里 depth 4, VCT 深 12。
-    // 预算: 350ms —— 深度够到"先手进攻"的收益(浅搜索天然偏保守防守)。
+    // v8: 常规深度 4 → 6(动态深度降级让深层分支可控), VCT 深 14。
+    // 预算: 500ms —— 深度够到"先手进攻"的收益(浅搜索天然偏保守防守)。
     const searchBoard = board.slice();
     const evaluator = createEvaluator(searchBoard);
     evaluator.init();
@@ -773,8 +793,8 @@
       }
     }
     try {
-      const budget = { nodes: 0, maxNodes: 150000, t0: performance.now(), maxMs: 350, visited: null };
-      const res = minmaxSearch(evaluator, searchBoard, color, 4, budget, lastMove);
+      const budget = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 500, visited: null };
+      const res = minmaxSearch(evaluator, searchBoard, color, 6, budget, lastMove);
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
     } catch (e) {
       if (e !== BUDGET) throw e;
