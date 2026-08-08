@@ -719,7 +719,7 @@ function loadHintEngine() {
   return new Promise((resolve, reject) => {
     if (self.GomokuHint) return resolve();
     const s = document.createElement('script');
-    s.src = '/hint.js?v=7';
+    s.src = '/hint.js?v=8';
     s.onload = () => resolve();
     s.onerror = () => reject(new Error('引擎加载失败'));
     document.head.appendChild(s);

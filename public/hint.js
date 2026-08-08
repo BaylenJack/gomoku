@@ -1,18 +1,15 @@
-// 五子棋提示引擎 v4 — 威胁空间搜索 + 模式计数评估
+// 五子棋提示引擎 v6 — 借鉴 gobang (lihongxun945) 的 MiniMax + Alpha-Beta + VCT/VCF
 //
-// 理论依据 (Allis 1993 "Go-Moku Solved by New Search Techniques"):
-//   - 五子棋的胜负由"强制威胁链"决定, 威胁空间搜索只搜这些链
-//   - 冲四(VCF)是"绝对先手": 对方只能堵, 链可以全深度展开
-//   - 活三/双威胁(VCT)推进: 制造"对方挡不住两个方向"的强制胜势
-//   - 依赖原则: 新威胁必须与最后一步相关, 否则是独立威胁(可组合)
-//
-// v3 → v4 升级:
-//   1. 转换表 (Zobrist 哈希 + 增量维护): 消除重复局面, 长链搜索不再烧预算
-//   2. 预算分配: 每个候选走法独立预算(节点+时间), 搜索能在深度内完成,
-//      而不是整棵树在深链完成前耗尽预算回退启发式 (v3 的根因)
-//   3. 全局模式计数评估: 活四/冲四/活三/跳三/眠三/活二的精确计数加权,
-//      替代局部 dirValue 打分, 稀疏局面的落子更像人类"经营多线"
-//   4. 威胁阶梯完整实现: 成五 > 活四 > 冲四 > 活三 > 双威胁 > 眠三
+// 架构来源: https://github.com/lihongxun945/gobang
+//   1. 增量点位评估: 每个空位缓存四方向棋形分数, 落子只更新周围 5 格,
+//      评估 = 己方全盘空位分数 - 对方全盘空位分数 (免全盘重扫)
+//   2. 分级移动生成: 成五 > 活四 > 冲四 > 双四 > 双三 > 冲四活三 > 活三 >
+//      双活二 > 眠三 > 活二, 每级取前 N 个; 复合棋形(双四/双三/冲四活三)组合计数
+//   3. 迭代加深 Alpha-Beta: 只搜偶数层(己方能赢的解), 必胜即返回,
+//      必输选最长路径挣扎; 缓存(Zobrist)跨搜索共享
+//   4. VCT/VCF: 只搜活三/冲四(强制链)的变体, 先找杀, 再常规搜索
+//   5. 防守妙手: 走一步后检查对方杀棋路径是否变长 —— 变长则防守有效,
+//      否则改堵对方杀棋起点。这解决"看不到对手经营意图"的盲区
 //
 // 预算: 节点 + 时间双重上限, 超时回退启发式 —— 手机上不卡。
 // 隐私: 纯本地计算, 结果只画在本地 canvas, 不经 WebSocket。
@@ -30,10 +27,9 @@
   const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
   const other = (c) => (c === BLACK ? WHITE : BLACK);
 
-  // 预算超限信号(威胁搜索内部抛出, computeBest 捕获后回退启发式)
   const BUDGET = Symbol('budget');
 
-  // ---------- Zobrist 哈希 (确定性种子, 增量维护) ----------
+  // ---------- Zobrist 哈希 (确定性种子) ----------
   function mulberry32(a) {
     return function () {
       a |= 0; a = (a + 0x6D2B79F5) | 0;
@@ -57,25 +53,345 @@
     return h;
   }
 
-  // ---------- 棋形扫描 ----------
-  // 在 (x,y) 放置 color 后, 沿 (dx,dy) 方向的棋形:
-  //   n    = 连续段长度
-  //   open = 连续段两端中为空的数量
-  //   jump = 连续段外"隔一格空再有一子"的数量(跳子结构)
+  // ---------- 棋形识别 (gobang shape.js 字符串法) ----------
+  const SH = {
+    FIVE: 5, BLOCK_FIVE: 50, FOUR: 4, FOUR_FOUR: 44, FOUR_THREE: 43,
+    THREE_THREE: 33, BLOCK_FOUR: 40, THREE: 3, BLOCK_THREE: 30,
+    TWO_TWO: 22, TWO: 2, NONE: 0,
+  };
+  const PAT = {
+    five: /11111/,
+    blockfive: /211111|111112/,
+    four: /011110/,
+    blockFour: /10111|11011|11101|211110|211101|211011|210111|011112|101112|110112|111012/,
+    three: /011100|011010|010110|001110/,
+    blockThree: /211100|211010|210110|001112|010112|011012/,
+    two: /001100|011000|000110|010100|001010/,
+  };
+
+  // 在 (x,y) 放 role 后沿 (dx,dy) 方向的棋形
+  function getShape(board, x, y, dx, dy, role) {
+    let s = '1';
+    for (let i = 1; i <= 5; i++) {
+      const nx = x + dx * i, ny = y + dy * i;
+      if (!inB(nx, ny)) { s += '2'; break; }
+      const v = board[idx(nx, ny)];
+      if (v === EMPTY) s += '0';
+      else if (v === role) s += '1';
+      else { s += '2'; break; }
+    }
+    for (let i = 1; i <= 5; i++) {
+      const nx = x - dx * i, ny = y - dy * i;
+      if (!inB(nx, ny)) { s = '2' + s; break; }
+      const v = board[idx(nx, ny)];
+      if (v === EMPTY) s = '0' + s;
+      else if (v === role) s = '1' + s;
+      else { s = '2' + s; break; }
+    }
+    if (PAT.five.test(s)) return SH.FIVE;
+    if (PAT.blockfive.test(s)) return SH.BLOCK_FIVE;
+    if (PAT.four.test(s)) return SH.FOUR;
+    if (PAT.blockFour.test(s)) return SH.BLOCK_FOUR;
+    if (PAT.three.test(s)) return SH.THREE;
+    if (PAT.blockThree.test(s)) return SH.BLOCK_THREE;
+    if (PAT.two.test(s)) return SH.TWO;
+    return SH.NONE;
+  }
+
+  // ---------- 评分权重 (gobang eval.js) ----------
+  const FIVE = 10000000;
+  const FOUR = 100000;
+  const FOUR_FOUR = FOUR;
+  const FOUR_THREE = FOUR;
+  const THREE_THREE = FOUR / 2;
+  const BLOCK_FOUR = 1500;
+  const THREE = 1000;
+  const BLOCK_THREE = 150;
+  const TWO_TWO = 200;
+  const TWO = 100;
+  const BLOCK_TWO = 15;
+  const ONE = 10;
+
+  // 棋形 → 落子潜力分 (当前点未落子的得分)
+  function shapeScore(shape) {
+    switch (shape) {
+      case SH.FIVE: return FOUR;
+      case SH.BLOCK_FIVE: return BLOCK_FOUR;
+      case SH.FOUR: return THREE;
+      case SH.FOUR_FOUR: return THREE;
+      case SH.FOUR_THREE: return THREE;
+      case SH.BLOCK_FOUR: return BLOCK_THREE;
+      case SH.THREE: return TWO;
+      case SH.THREE_THREE: return THREE_THREE / 10;
+      case SH.BLOCK_THREE: return BLOCK_TWO;
+      case SH.TWO: return ONE;
+      case SH.TWO_TWO: return TWO_TWO / 10;
+      default: return 0;
+    }
+  }
+
+  // ---------- 增量点位评估器 (gobang eval.js) ----------
+  // scores[roleIdx][cell], shapeCache[roleIdx][cell*4+dir]
+  function createEvaluator(board) {
+    const N = SIZE, NN = N * N;
+    const scores = [new Float64Array(NN), new Float64Array(NN)];
+    const shapeCache = [new Int8Array(NN * 4), new Int8Array(NN * 4)];
+
+    function updatePoint(x, y, role) {
+      const rIdx = role - 1;
+      const c = idx(x, y);
+      let total = 0;
+      let fourCnt = 0, blockFourCnt = 0, threeCnt = 0, twoCnt = 0;
+      for (let d = 0; d < 4; d++) {
+        const [dx, dy] = DIRS[d];
+        const sh = getShape(board, x, y, dx, dy, role);
+        shapeCache[rIdx][c * 4 + d] = sh;
+        if (sh === SH.FOUR) fourCnt++;
+        else if (sh === SH.BLOCK_FOUR) blockFourCnt++;
+        else if (sh === SH.THREE) threeCnt++;
+        else if (sh === SH.TWO) twoCnt++;
+        total += shapeScore(sh);
+      }
+      // 复合棋形: 双四/冲四活三/双三/双活二
+      if (fourCnt >= 2 || (fourCnt && blockFourCnt >= 2)) {
+        // 双冲四或活四+冲四 → 极高
+        total += FOUR_FOUR * 0.6;
+      } else if (blockFourCnt >= 2) {
+        total += FOUR_FOUR * 0.4;
+      } else if (blockFourCnt && threeCnt) {
+        total += FOUR_THREE * 0.4;
+      } else if (threeCnt >= 2) {
+        total += THREE_THREE * 0.4;
+      } else if (twoCnt >= 2) {
+        total += TWO_TWO * 0.4;
+      }
+      scores[rIdx][c] = total;
+    }
+
+    function refresh(x, y) {
+      // 落子点影响周围 5 格内的所有空位
+      for (const [dx, dy] of DIRS) {
+        for (const sign of [1, -1]) {
+          for (let step = 1; step <= 5; step++) {
+            const nx = x + sign * step * dx, ny = y + sign * step * dy;
+            if (!inB(nx, ny)) break;
+            if (board[idx(nx, ny)] !== EMPTY) continue;
+            updatePoint(nx, ny, 1);
+            updatePoint(nx, ny, 2);
+          }
+        }
+      }
+    }
+
+    return {
+      init() {
+        for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+          if (board[idx(x, y)] === EMPTY) { updatePoint(x, y, 1); updatePoint(x, y, 2); }
+        }
+      },
+      move(x, y, role) {
+        board[idx(x, y)] = role;
+        refresh(x, y);
+      },
+      undo(x, y) {
+        board[idx(x, y)] = EMPTY;
+        refresh(x, y);
+      },
+      evaluate(role) {
+        const rIdx = role - 1, oIdx = 1 - rIdx;
+        let s = 0;
+        for (let i = 0; i < NN; i++) s += scores[rIdx][i] - scores[oIdx][i];
+        return s;
+      },
+      shapeAt(x, y, d, role) { return shapeCache[role - 1][idx(x, y) * 4 + d]; },
+    };
+  }
+
+  // ---------- 分级移动生成 (gobang eval.js getPoints/getMoves) ----------
+  function getValuableMoves(evaluator, board, role, depth, onlyThree, onlyFour) {
+    const N = SIZE;
+    const sets = {
+      five: [], blockFive: [], four: [], fourFour: [], fourThree: [],
+      threeThree: [], blockFour: [], three: [], twoTwo: [], blockThree: [], two: [],
+    };
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        if (board[idx(x, y)] !== EMPTY) continue;
+        for (const r of [role, other(role)]) {
+          let fourCnt = 0, blockFourCnt = 0, threeCnt = 0, twoCnt = 0;
+          let best = SH.NONE;
+          for (let d = 0; d < 4; d++) {
+            const sh = evaluator.shapeAt(x, y, d, r);
+            if (sh > best) best = sh;
+            if (sh === SH.FOUR) fourCnt++;
+            else if (sh === SH.BLOCK_FOUR) blockFourCnt++;
+            else if (sh === SH.THREE) threeCnt++;
+            else if (sh === SH.TWO) twoCnt++;
+          }
+          let cat;
+          if (best === SH.FIVE || best === SH.BLOCK_FIVE) cat = best === SH.FIVE ? 'five' : 'blockFive';
+          else if (fourCnt >= 2 || (fourCnt && blockFourCnt)) cat = 'fourFour';
+          else if (blockFourCnt >= 2) cat = 'fourFour';
+          else if (blockFourCnt && threeCnt) cat = 'fourThree';
+          else if (threeCnt >= 2) cat = 'threeThree';
+          else if (fourCnt) cat = 'four';
+          else if (blockFourCnt) cat = 'blockFour';
+          else if (threeCnt) cat = 'three';
+          else if (twoCnt >= 2) cat = 'twoTwo';
+          else if (best === SH.BLOCK_THREE) cat = 'blockThree';
+          else if (best === SH.TWO) cat = 'two';
+          else continue;
+          sets[cat].push([x, y]);
+        }
+      }
+    }
+
+    const dedupe = (arr) => {
+      const seen = new Set(), out = [];
+      for (const [x, y] of arr) {
+        const k = y * SIZE + x;
+        if (!seen.has(k)) { seen.add(k); out.push([x, y]); }
+      }
+      return out;
+    };
+    const take = (arr, n) => dedupe(arr).slice(0, n);
+
+    if (sets.five.length || sets.blockFive.length) return take([...sets.five, ...sets.blockFive], 8);
+    if (onlyFour || sets.four.length) return take([...sets.four, ...sets.blockFour], 12);
+    if (sets.fourFour.length) return take([...sets.fourFour, ...sets.blockFour], 12);
+    if (sets.fourThree.length) return take([...sets.fourThree, ...sets.blockFour, ...sets.three], 14);
+    if (sets.threeThree.length) return take([...sets.threeThree, ...sets.blockFour, ...sets.three], 14);
+    if (onlyThree) return take([...sets.blockFour, ...sets.three], 14);
+    return take([...sets.blockFour, ...sets.three, ...sets.blockThree, ...sets.twoTwo, ...sets.two], 16);
+  }
+
+  // ---------- 胜负判定 (落子后增量检查) ----------
+  function winsAfter(board, x, y, role) {
+    for (const [dx, dy] of DIRS) {
+      let n = 1;
+      for (let i = 1; i < 5; i++) {
+        const nx = x + dx * i, ny = y + dy * i;
+        if (!inB(nx, ny) || board[idx(nx, ny)] !== role) break;
+        n++;
+      }
+      for (let i = 1; i < 5; i++) {
+        const nx = x - dx * i, ny = y - dy * i;
+        if (!inB(nx, ny) || board[idx(nx, ny)] !== role) break;
+        n++;
+      }
+      if (n >= 5) return true;
+    }
+    return false;
+  }
+
+  // ---------- MiniMax + Alpha-Beta + 迭代加深 (gobang minmax.js) ----------
+  const MAX = 1000000000;
+  const CACHE_MAX = 8000;
+
+  // onlyThree: VCT 变体(只搜活三+/冲四); onlyFour: VCF 变体(只搜四/五)
+  function makeMinmax(onlyThree = false, onlyFour = false) {
+    return function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache) {
+      if (++budget.nodes > budget.maxNodes) throw BUDGET;
+      if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
+
+      if (cDepth >= depth) {
+        return [evaluator.evaluate(role), null, path];
+      }
+
+      const hash = boardHash(board);
+      const key = (hash + role * 2654435761 + (depth - cDepth) * 4101842887) >>> 0;
+      const prev = cache.get(key);
+      if (prev && (Math.abs(prev.value) >= FIVE || prev.depth >= depth - cDepth)) {
+        return [prev.value, prev.move, [...path, ...prev.path]];
+      }
+
+      const points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour);
+      if (!points.length) return [evaluator.evaluate(role), null, path];
+
+      let value = -MAX;
+      let move = null;
+      let bestPath = path;
+      let bestDepth = 0;
+
+      for (let d = cDepth + 1; d <= depth; d += 1) {
+        if (d % 2 !== 0) continue; // 迭代加深只搜偶数层(己方能赢的解)
+        let breakAll = false;
+        for (const [x, y] of points) {
+          evaluator.move(x, y, role);
+          const newPath = [...path, [x, y]];
+          let [cv, , cp] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache);
+          cv = -cv;
+          evaluator.undo(x, y);
+
+          if (cv >= FIVE || d === depth) {
+            // 必输的棋也挣扎: 选最长路径
+            if (cv > value || (cv <= -FIVE && value <= -FIVE && cp.length > bestDepth)) {
+              value = cv;
+              move = [x, y];
+              bestPath = cp;
+              bestDepth = cp.length;
+            }
+          }
+          alpha = Math.max(alpha, value);
+          if (alpha >= FIVE) { breakAll = true; break; } // 自己赢了就结束
+          if (alpha >= beta) break;
+        }
+        if (breakAll) break;
+      }
+
+      if (cache.size < CACHE_MAX && (!prev || prev.depth < depth - cDepth)) {
+        cache.set(key, {
+          depth: depth - cDepth,
+          value,
+          move,
+          path: bestPath.slice(cDepth),
+        });
+      }
+      return [value, move, bestPath];
+    };
+  }
+
+  const _minmax = makeMinmax();
+  const vct = makeMinmax(true);
+  const vcf = makeMinmax(false, true);
+
+  // 主搜索: VCT 找杀 → 常规 minmax → 防守校验(对方杀棋路径是否变长)
+  function minmaxSearch(evaluator, board, role, depth, budget) {
+    const cache = new Map();
+    const vctDepth = depth + 8;
+
+    let [value, move, bestPath] = vct(evaluator, board, role, vctDepth, 0, [], -MAX, MAX, budget, cache);
+    if (value >= FIVE && move) return { move, value, path: bestPath };
+
+    [value, move, bestPath] = _minmax(evaluator, board, role, depth, 0, [], -MAX, MAX, budget, cache);
+    if (!move) return null;
+
+    // 防守校验: 假设自己走了 move, 对方还有杀棋吗? 路径变长则有效
+    evaluator.move(move[0], move[1], role);
+    let [value2, move2, path2] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, budget, cache);
+    evaluator.undo(move[0], move[1]);
+    if (value < FIVE && value2 >= FIVE && move2 && path2.length > bestPath.length) {
+      let [value3, , path3] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, budget, cache);
+      if (path2.length <= path3.length) {
+        return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
+      }
+    }
+    return { move, value, path: bestPath };
+  }
+
+  // ---------- 启发式保底 (v5 做棋/防守) ----------
   function scanLine(board, x, y, dx, dy, color) {
     let n1 = 0;
     for (let p = 1; p < 5; p++) {
       const nx = x - dx * p, ny = y - dy * p;
       if (!inB(nx, ny)) break;
-      if (board[idx(nx, ny)] === color) n1++;
-      else break;
+      if (board[idx(nx, ny)] === color) n1++; else break;
     }
     let n2 = 0;
     for (let p = 1; p < 5; p++) {
       const nx = x + dx * p, ny = y + dy * p;
       if (!inB(nx, ny)) break;
-      if (board[idx(nx, ny)] === color) n2++;
-      else break;
+      if (board[idx(nx, ny)] === color) n2++; else break;
     }
     const n = n1 + 1 + n2;
     const e1x = x - dx * (n1 + 1), e1y = y - dy * (n1 + 1);
@@ -91,31 +407,17 @@
     return { n, open, jump };
   }
 
-  // 方向威胁级别: 5=成五, 4=四连(活四/冲四/跳四), 3=活三/跳三, 2=活二, 0=无
   function dirThreat(board, x, y, dx, dy, color) {
     const { n, open, jump } = scanLine(board, x, y, dx, dy, color);
     if (n >= 5) return 5;
     if (n === 4 && open >= 1) return 4;
-    if (n === 3 && open === 2) return 3;                     // 活三
-    if (n === 3 && open === 1 && jump >= 1) return 3;        // 一端封但有跳子(近似跳三)
-    if (open === 2 && jump >= 1 && n === 2) return 3;        // XX_X / X_XX 跳三
+    if (n === 3 && open === 2) return 3;
+    if (n === 3 && open === 1 && jump >= 1) return 3;
+    if (open === 2 && jump >= 1 && n === 2) return 3;
     if (n === 2 && open === 2) return 2;
     return 0;
   }
 
-  // 落子 (x,y) 后: 威胁方向数与最高级别
-  function threatDirs(board, x, y, color) {
-    let count = 0, max = 0;
-    for (const [dx, dy] of DIRS) {
-      const l = dirThreat(board, x, y, dx, dy, color);
-      if (l > max) max = l;
-      if (l >= 3) count++;
-    }
-    return { count, max };
-  }
-
-  // ---------- 候选点 ----------
-  // 所有棋子周围 2 格内的空位(五连点/四连点必然紧贴己方棋子, 2 格内足够)
   function nearCells(board) {
     const set = new Set();
     let any = false;
@@ -134,51 +436,9 @@
     return any ? [...set].map((i) => [i % SIZE, Math.floor(i / SIZE)]) : [[7, 7]];
   }
 
-  // 仅某色棋子周围的候选点
-  function nearCellsOf(board, color) {
-    const set = new Set();
-    for (let y = 0; y < SIZE; y++) {
-      for (let x = 0; x < SIZE; x++) {
-        if (board[idx(x, y)] !== color) continue;
-        for (let dy = -2; dy <= 2; dy++) {
-          for (let dx = -2; dx <= 2; dx++) {
-            const nx = x + dx, ny = y + dy;
-            if (inB(nx, ny) && board[idx(nx, ny)] === EMPTY) set.add(ny * SIZE + nx);
-          }
-        }
-      }
-    }
-    return [...set].map((i) => [i % SIZE, Math.floor(i / SIZE)]);
-  }
-
-  // 依赖原则的候选点: 中心(最近落子)附近某色棋子周围的空位。
-  // Allis 论文: 威胁链上每步新威胁必须与上一步相关, 搜索只在局部展开。
-  // center=null 时回退全盘。
-  function cellsNear(board, color, center, r) {
-    if (!center) return nearCellsOf(board, color);
-    const R = r + 2;
-    const x0 = Math.max(0, center.x - R), x1 = Math.min(SIZE - 1, center.x + R);
-    const y0 = Math.max(0, center.y - R), y1 = Math.min(SIZE - 1, center.y + R);
-    const set = new Set();
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        if (board[idx(x, y)] !== color) continue;
-        for (let dy = -2; dy <= 2; dy++) {
-          for (let dx = -2; dx <= 2; dx++) {
-            const nx = x + dx, ny = y + dy;
-            if (inB(nx, ny) && board[idx(nx, ny)] === EMPTY) set.add(ny * SIZE + nx);
-          }
-        }
-      }
-    }
-    return [...set].map((i) => [i % SIZE, Math.floor(i / SIZE)]);
-  }
-
-  // 成五点: 落子后直接五连(含跳四缺口)。center 限定时只搜依赖威胁(±3)
-  function winPoints(board, color, center) {
+  function winPoints(board, color) {
     const out = [];
-    for (const [x, y] of cellsNear(board, color, center, 2)) {
-      if (center && Math.max(Math.abs(x - center.x), Math.abs(y - center.y)) > 3) continue;
+    for (const [x, y] of nearCells(board)) {
       for (const [dx, dy] of DIRS) {
         if (dirThreat(board, x, y, dx, dy, color) >= 5) { out.push({ x, y }); break; }
       }
@@ -186,40 +446,60 @@
     return out;
   }
 
-  // 四连点: 落子后形成四连(活四/冲四/跳四)。center 限定时只搜依赖威胁(±3)
-  function fourPoints(board, color, center) {
-    const out = [];
-    for (const [x, y] of cellsNear(board, color, center, 2)) {
-      if (center && Math.max(Math.abs(x - center.x), Math.abs(y - center.y)) > 3) continue;
+  // 对手"落子即成活四/冲四"的点(必要防守的候选)
+  function oppOpenFourPoints(board, opp) {
+    const pts = new Set();
+    for (const [x, y] of nearCells(board)) {
       for (const [dx, dy] of DIRS) {
-        if (dirThreat(board, x, y, dx, dy, color) >= 4) { out.push({ x, y }); break; }
+        const s = scanLine(board, x, y, dx, dy, opp);
+        if (s.n === 4 && s.open === 2) { pts.add(y * SIZE + x); break; }
       }
     }
-    return out;
+    return [...pts].map((i) => ({ x: i % SIZE, y: Math.floor(i / SIZE) }));
   }
 
-  // 棋盘上已有的四连(连续 4 子): 返回 'open'(活四, 挡不住) 或堵点列表。
-  // center: 依赖原则 —— 对方刚形成的四连必然在最近落子附近, 局部扫描即可
-  function existingFourBlocks(board, color, center) {
+  // 对手"落子即形成双威胁"(双活三/活三+冲四)的点 —— 必争点
+  function oppDoubleThreatPoints(board, opp) {
+    const pts = [];
+    for (const [x, y] of nearCells(board)) {
+      let count = 0, max = 0;
+      for (const [dx, dy] of DIRS) {
+        const l = dirThreat(board, x, y, dx, dy, opp);
+        if (l > max) max = l;
+        if (l >= 3) count++;
+      }
+      if (count >= 2 && max >= 3) pts.push({ x, y });
+    }
+    return pts;
+  }
+
+  // 对手"落子即成跳四/冲四"的点(跳三缺口) —— 次紧急
+  function oppRushFourPoints(board, opp) {
+    const pts = new Set();
+    for (const [x, y] of nearCells(board)) {
+      for (const [dx, dy] of DIRS) {
+        const s = scanLine(board, x, y, dx, dy, opp);
+        if (s.n === 4 && s.open >= 1) { pts.add(y * SIZE + x); break; }
+        if (s.n === 3 && s.jump >= 1 && s.open >= 1) { pts.add(y * SIZE + x); break; }
+      }
+    }
+    return [...pts].map((i) => ({ x: i % SIZE, y: Math.floor(i / SIZE) }));
+  }
+
+  // 对手同线聚子(连续 3 子) → 堵端点防成杀
+  function oppLineBlocks(board, opp) {
     const blocks = new Set();
-    const [x0, x1] = center
-      ? [Math.max(0, center.x - 4), Math.min(SIZE - 1, center.x + 4)]
-      : [0, SIZE - 1];
-    const [y0, y1] = center
-      ? [Math.max(0, center.y - 4), Math.min(SIZE - 1, center.y + 4)]
-      : [0, SIZE - 1];
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        if (board[idx(x, y)] !== color) continue;
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        if (board[idx(x, y)] !== opp) continue;
         for (const [dx, dy] of DIRS) {
           const px = x - dx, py = y - dy;
-          if (inB(px, py) && board[idx(px, py)] === color) continue; // 只从连续段起点扫
+          if (inB(px, py) && board[idx(px, py)] === opp) continue;
           let n = 0, cx = x, cy = y;
-          while (inB(cx, cy) && board[idx(cx, cy)] === color) { n++; cx += dx; cy += dy; }
-          if (n !== 4) continue;
+          while (inB(cx, cy) && board[idx(cx, cy)] === opp) { n++; cx += dx; cy += dy; }
+          if (n < 3) continue;
           const o1 = inB(x - dx, y - dy) && board[idx(x - dx, y - dy)] === EMPTY;
           const o2 = inB(cx, cy) && board[idx(cx, cy)] === EMPTY;
-          if (o1 && o2) return 'open';                       // 活四: 挡不住
           if (o1) blocks.add((y - dy) * SIZE + (x - dx));
           if (o2) blocks.add(cy * SIZE + cx);
         }
@@ -228,22 +508,82 @@
     return [...blocks].map((i) => ({ x: i % SIZE, y: Math.floor(i / SIZE) }));
   }
 
-  // 棋盘上已有的活三(连续 3 子且两端开放): 返回堵点列表。
-  // center: 同上, 局部扫描
-  function liveThreeBlocks(board, color, center) {
-    const blocks = new Set();
-    const [x0, x1] = center
-      ? [Math.max(0, center.x - 4), Math.min(SIZE - 1, center.x + 4)]
-      : [0, SIZE - 1];
-    const [y0, y1] = center
-      ? [Math.max(0, center.y - 4), Math.min(SIZE - 1, center.y + 4)]
-      : [0, SIZE - 1];
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
+  function patternCounts(board, color) {
+    const c = { five: 0, open4: 0, rush4: 0, live3: 0, jump3: 0, sleep3: 0, live2: 0, double3: 0 };
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
         if (board[idx(x, y)] !== color) continue;
         for (const [dx, dy] of DIRS) {
           const px = x - dx, py = y - dy;
-          if (inB(px, py) && board[idx(px, py)] === color) continue; // 只从连续段起点扫
+          if (inB(px, py) && board[idx(px, py)] === color) continue;
+          let n = 0, cx = x, cy = y;
+          while (inB(cx, cy) && board[idx(cx, cy)] === color) { n++; cx += dx; cy += dy; }
+          const o1 = inB(x - dx, y - dy) && board[idx(x - dx, y - dy)] === EMPTY;
+          const o2 = inB(cx, cy) && board[idx(cx, cy)] === EMPTY;
+          const open = (o1 ? 1 : 0) + (o2 ? 1 : 0);
+          const jump1 = o1 && inB(x - 2 * dx, y - 2 * dy) && board[idx(x - 2 * dx, y - 2 * dy)] === color;
+          const jump2 = o2 && inB(cx + dx, cy + dy) && board[idx(cx + dx, cy + dy)] === color;
+          if (n >= 5) c.five++;
+          else if (n === 4) { if (open === 2) c.open4++; else if (open === 1) c.rush4++; }
+          else if (n === 3) { if (open === 2) c.live3++; else if (open === 1) c.sleep3++; }
+          else if (n === 2) {
+            if (open === 2) c.live2++;
+            if (open >= 1 && (jump1 || jump2)) c.jump3++;
+          }
+        }
+      }
+    }
+    if (c.live3 >= 2) c.double3 = 1;
+    return c;
+  }
+
+  const PW = {
+    five: 1e9, open4: 5e8, rush4: 1e8,
+    double3: 8e6,
+    live3: 3e6, jump3: 3e5, sleep3: 3e4,
+    live2: 8e3,
+  };
+  function evalBoard(board, color) {
+    const mc = patternCounts(board, color);
+    const mo = patternCounts(board, other(color));
+    let s = 0;
+    for (const k in PW) s += PW[k] * (mc[k] - mo[k] * 1.08);
+    return s;
+  }
+
+  function connectivity(board, color) {
+    let total = 0;
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        if (board[idx(x, y)] !== color) continue;
+        let n = 0;
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx, ny = y + dy;
+            if (inB(nx, ny) && board[idx(nx, ny)] === color) n++;
+          }
+        }
+        total += n;
+      }
+    }
+    return total;
+  }
+
+  function evalBoardConn(board, color) {
+    const mine = evalBoard(board, color);
+    const conn = connectivity(board, color) - connectivity(board, other(color));
+    return mine + conn * 5e3;
+  }
+
+  function liveThreeBlocks(board, color) {
+    const blocks = new Set();
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        if (board[idx(x, y)] !== color) continue;
+        for (const [dx, dy] of DIRS) {
+          const px = x - dx, py = y - dy;
+          if (inB(px, py) && board[idx(px, py)] === color) continue;
           let n = 0, cx = x, cy = y;
           while (inB(cx, cy) && board[idx(cx, cy)] === color) { n++; cx += dx; cy += dy; }
           if (n !== 3) continue;
@@ -259,331 +599,30 @@
     return [...blocks].map((i) => ({ x: i % SIZE, y: Math.floor(i / SIZE) }));
   }
 
-  // ---------- 威胁棋 ----------
-  // 落子后形成 >= 活三级威胁的点, 按威胁强度排序
-  //   level 4 = 成四(活四 > 冲四 > 跳四), dbl = 双威胁(两个活三+), level 3 = 活三/跳三
-  // center: 依赖原则 —— 只搜最近落子附近的威胁; null = 全盘(根节点)
-  function threatMoves(board, color, center) {
-    const out = [];
-    for (const [x, y] of cellsNear(board, color, center, 2)) {
-      if (center && Math.max(Math.abs(x - center.x), Math.abs(y - center.y)) > 3) continue;
-      const { count, max } = threatDirs(board, x, y, color);
-      if (max >= 4) {
-        // 区分活四(直接胜势)与冲四(强制链)
-        let open = 0;
-        for (const [dx, dy] of DIRS) {
-          const s = scanLine(board, x, y, dx, dy, color);
-          if (s.n === 4) open = Math.max(open, s.open);
-        }
-        out.push({ x, y, level: 4, s: open === 2 ? 4.6 : 4.3 + count * 0.01 });
-      } else if (count >= 2 && max >= 3) {
-        out.push({ x, y, level: 3, dbl: true, s: 3.7 + count * 0.01 });
-      } else if (max >= 3) {
-        out.push({ x, y, level: 3, s: 3.1 + count * 0.01 });
-      }
-    }
-    out.sort((a, b) => b.s - a.s);
-    return out;
-  }
-
-  // 对方回应集: 堵我方的四连/活三(必要) + 对方自己的反击(成四或双威胁), 按必要度排序。
-  // center=null 时全盘(防守必须看到所有威胁); center 限定时只搜依赖威胁(进攻)
-  function repliesOf(board, me, opp, center) {
-    const map = new Map();
-    const add = (x, y, d) => {
-      const k = y * SIZE + x;
-      if (!map.has(k) || d > map.get(k).d) map.set(k, { x, y, d });
-    };
-    for (const p of fourPoints(board, me, center)) add(p.x, p.y, 3);       // 必须堵我的四
-    for (const p of liveThreeBlocks(board, me, center)) {
-      if (center && Math.max(Math.abs(p.x - center.x), Math.abs(p.y - center.y)) > 2) continue;
-      add(p.x, p.y, 2);                                                     // 必须堵我的活三
-    }
-    for (const m of threatMoves(board, opp)) {
-      if (center && Math.max(Math.abs(m.x - center.x), Math.abs(m.y - center.y)) > 2) continue;
-      if (m.level >= 4) add(m.x, m.y, 1);                                   // 对方可反杀
-      else if (m.dbl) add(m.x, m.y, 0);                                     // 对方可双威胁
-    }
-    const arr = [...map.values()];
-    arr.sort((a, b) => b.d - a.d);
-    return arr.slice(0, 8);
-  }
-
-  // ---------- 威胁空间搜索 ----------
-  // 交替攻防, 双方都只走"威胁棋"或被迫堵:
-  //   - 对方刚形成四连 → 必堵(活四挡不住直接输)
-  //   - 对方刚形成活三 → 必堵端点(不堵下步对方成活四/双威胁)
-  //   - 无被迫应对 → 只能走威胁棋(成四 > 双威胁 > 活三), 且走完必须
-  //     让对方有必须回应的威胁, 否则这手不算威胁棋
-  // 返回 turn 能否强制获胜。预算超限抛出 BUDGET。
-  // hash 为增量维护的 Zobrist 值; center 为最近落子(依赖原则, 局部搜索)。
-  function threatWin(board, turn, depth, budget, hash, center) {
-    if (++budget.nodes > budget.maxNodes) throw BUDGET;
-    if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
-    const opp = other(turn);
-
-    // 转换表: 相同局面(含深度与轮次)只搜索一次
-    const key = (hash + turn * 2654435761 + depth * 4101842887) >>> 0;
-    const hit = budget.visited.get(key);
-    if (hit !== undefined) return hit;
-
-    let res;
-    if (winPoints(board, turn, center).length) {
-      res = true;                                    // 现在就能成五
-    } else if (winPoints(board, opp, center).length) {
-      res = false;                                   // 对方已成五
-    } else {
-      // 被迫应对: 先堵对方刚形成的四连, 再堵活三(局部扫描, 必在上一步附近)
-      const oppFours = existingFourBlocks(board, opp, center);
-      if (oppFours === 'open') {
-        res = false;                                 // 对方活四, 挡不住
-      } else {
-        const oppThrees = oppFours.length ? [] : liveThreeBlocks(board, opp, center);
-        const moves = oppFours.length ? oppFours : (oppThrees.length ? oppThrees : null);
-        let free = null;
-        if (!moves) {
-          const tms = threatMoves(board, turn, center);
-          free = tms.filter((m) => m.level >= 4 || m.dbl || depth > 4).slice(0, 4);
-        }
-        if (!moves && !free) {
-          res = false;
-        } else {
-          res = false;
-          for (const m of moves || free) {
-            board[idx(m.x, m.y)] = turn;
-            const h2 = (hash ^ zOf(idx(m.x, m.y), turn)) >>> 0;
-            const mc = { x: m.x, y: m.y };
-            let oppSurvives = false;
-            if (free) {
-              // 自由威胁棋: 必须让对方有必须回应的威胁。
-              // 依赖原则只限制进攻方(新威胁贴近自己的上一步);
-              // 防守候选必须全盘(对手的威胁可以在任何地方)。
-              const replies = repliesOf(board, turn, opp, null);
-              if (replies.length && depth > 1) {
-                for (const r of replies) {
-                  board[idx(r.x, r.y)] = opp;
-                  let inner;
-                  try {
-                    inner = threatWin(board, turn, depth - 1, budget, (h2 ^ zOf(idx(r.x, r.y), opp)) >>> 0, mc);
-                  } catch (e) {
-                    board[idx(r.x, r.y)] = EMPTY;
-                    board[idx(m.x, m.y)] = EMPTY;
-                    throw e;
-                  }
-                  board[idx(r.x, r.y)] = EMPTY;
-                  if (!inner) { oppSurvives = true; break; }   // 对方找到活路
-                }
-              } else {
-                oppSurvives = true;                  // 深度到头或没造出威胁
-              }
-              board[idx(m.x, m.y)] = EMPTY;
-            } else {
-              // 被迫堵: 堵完让对方走; 对方还能强制赢则本手失败
-              let inner;
-              try {
-                inner = threatWin(board, opp, depth - 1, budget, h2, mc);
-              } catch (e) {
-                board[idx(m.x, m.y)] = EMPTY;
-                throw e;
-              }
-              board[idx(m.x, m.y)] = EMPTY;
-              if (!inner) oppSurvives = true;
-            }
-            if (!oppSurvives) { res = true; break; } // 这个走法对方怎么都挡不住
-          }
-        }
-      }
-    }
-    if (budget.visited.size < 4000) budget.visited.set(key, res);
-    return res;
-  }
-
-  // 找强制胜的第一手: 候选威胁棋 → 对方所有必要回应 → 都能强制赢 → 返回该手。
-  // 节点预算按候选重置: 每个候选有完整的搜索树预算, 第一个候选耗尽
-  // 预算不会饿死后面可能藏着必胜手的候选; 时间预算全局共享, 总耗时受控。
-  // 候选宽度 8 → 5 (Allis: 黑方只取 N 个最优威胁, 提高搜索深度)
-  function forcingMove(board, me, budget, rootHash) {
-    const opp = other(me);
-    const cands = threatMoves(board, me, null).slice(0, 5);
-    for (const m of cands) {
-      const b = {
-        nodes: 0,
-        maxNodes: budget.maxNodes,
-        t0: budget.t0,
-        maxMs: budget.maxMs,
-        visited: budget.visited, // 转换表跨候选共享(局面重叠时白赚)
-      };
-      board[idx(m.x, m.y)] = me;
-      const h2 = (rootHash ^ zOf(idx(m.x, m.y), me)) >>> 0;
-      const mc = { x: m.x, y: m.y };
-      const replies = repliesOf(board, me, opp, mc);
-      let wins = true;
-      for (const r of replies) {
-        board[idx(r.x, r.y)] = opp;
-        let res;
-        try {
-          res = threatWin(board, me, m.level >= 4 ? 26 : 12, b, (h2 ^ zOf(idx(r.x, r.y), opp)) >>> 0, mc);
-        } catch (e) {
-          board[idx(r.x, r.y)] = EMPTY;
-          board[idx(m.x, m.y)] = EMPTY;
-          throw e;
-        }
-        board[idx(r.x, r.y)] = EMPTY;
-        if (!res) { wins = false; break; }
-      }
-      board[idx(m.x, m.y)] = EMPTY;
-      if (wins && replies.length) return { x: m.x, y: m.y };
-    }
-    return null;
-  }
-
-  // 防守: 对方有强制胜, 找一手棋让对方的强制胜失效(化解其威胁或自己更快)
-  function parry(board, me, opp, budget, rootHash) {
-    // 化解点 = 对方的威胁点(四连点/活三跳三延伸点) + 我方的反击点
-    const threats = new Map();
-    for (const p of fourPoints(board, opp)) {
-      threats.set(p.y * SIZE + p.x, { x: p.x, y: p.y });
-    }
-    for (const m of threatMoves(board, opp)) {
-      if (m.level >= 3) {
-        const k = m.y * SIZE + m.x;
-        if (!threats.has(k)) threats.set(k, { x: m.x, y: m.y });
-      }
-    }
-    for (const m of threatMoves(board, me)) {
-      const k = m.y * SIZE + m.x;
-      if (!threats.has(k)) threats.set(k, { x: m.x, y: m.y });
-    }
-    const cands = [...threats.values()].slice(0, 12);
-
-    for (const c of cands) {
-      board[idx(c.x, c.y)] = me;
-      const h2 = (rootHash ^ zOf(idx(c.x, c.y), me)) >>> 0;
-      const mc = { x: c.x, y: c.y };
-      const oppWins = winPoints(board, opp, mc);
-      let ok = oppWins.length === 0;
-      if (ok) {
-        try {
-          ok = !threatWin(board, opp, 8, budget, h2, mc);  // 对方还能强制胜吗?
-        } catch (e) {
-          board[idx(c.x, c.y)] = EMPTY;
-          throw e;
-        }
-      }
-      board[idx(c.x, c.y)] = EMPTY;
-      if (ok) return { x: c.x, y: c.y };
-    }
-    return null;
-  }
-
-  // ---------- 全局模式评估 ----------
-  // 扫描棋盘上某色的所有棋段, 精确计数模式。
-  // 这是"局面评估"而非"落点评分" —— 捕捉多线经营、威胁密度等全局性质。
-  function patternCounts(board, color) {
-    const c = { five: 0, open4: 0, rush4: 0, live3: 0, jump3: 0, sleep3: 0, live2: 0 };
-    for (let y = 0; y < SIZE; y++) {
-      for (let x = 0; x < SIZE; x++) {
-        if (board[idx(x, y)] !== color) continue;
-        for (const [dx, dy] of DIRS) {
-          const px = x - dx, py = y - dy;
-          if (inB(px, py) && board[idx(px, py)] === color) continue; // 只从段起点扫
-          let n = 0, cx = x, cy = y;
-          while (inB(cx, cy) && board[idx(cx, cy)] === color) { n++; cx += dx; cy += dy; }
-          const o1 = inB(x - dx, y - dy) && board[idx(x - dx, y - dy)] === EMPTY;
-          const o2 = inB(cx, cy) && board[idx(cx, cy)] === EMPTY;
-          const open = (o1 ? 1 : 0) + (o2 ? 1 : 0);
-          const jump1 = o1 && inB(x - 2 * dx, y - 2 * dy) && board[idx(x - 2 * dx, y - 2 * dy)] === color;
-          const jump2 = o2 && inB(cx + dx, cy + dy) && board[idx(cx + dx, cy + dy)] === color;
-          if (n >= 5) c.five++;
-          else if (n === 4) { if (open === 2) c.open4++; else if (open === 1) c.rush4++; }
-          else if (n === 3) { if (open === 2) c.live3++; else if (open === 1) c.sleep3++; }
-          else if (n === 2) {
-            if (open === 2) c.live2++;
-            if (open >= 1 && (jump1 || jump2)) c.jump3++;   // XX_X / X_XX 跳三
-          }
-          // 注意: 孤子+隔一格有己方子 (X_X) 只是跳二, 不是跳三, 不计入 jump3
-        }
-      }
-    }
-    return c;
-  }
-
-  // 模式权重: 按威胁阶梯递减。防守侧略重(1.05), 因为漏防比漏攻致命。
-  const PW = { five: 1e9, open4: 5e8, rush4: 1e8, live3: 2e6, jump3: 3e5, sleep3: 3e4, live2: 8e3 };
-  function evalBoard(board, color) {
-    const mc = patternCounts(board, color);
-    const mo = patternCounts(board, other(color));
-    let s = 0;
-    for (const k in PW) s += PW[k] * (mc[k] - mo[k] * 1.05);
-    return s;
-  }
-
-  // 对手"落子即成活四/冲四"的点(必要防守的候选)
-  function oppOpenFourPoints(board, opp) {
-    const pts = new Set();
-    for (const [x, y] of nearCellsOf(board, opp)) {
-      for (const [dx, dy] of DIRS) {
-        const s = scanLine(board, x, y, dx, dy, opp);
-        if (s.n === 4 && s.open === 2) { pts.add(y * SIZE + x); break; }
-      }
-    }
-    return [...pts].map((i) => ({ x: i % SIZE, y: Math.floor(i / SIZE) }));
-  }
-
-  // 对手"落子即形成双威胁"(双活三/活三+冲四等)的点 —— 必争点。
-  // 对手在这里落子后, 我方只能堵一个方向, 必输; 必须自己占住或提前化解。
-  function oppDoubleThreatPoints(board, opp) {
-    const pts = [];
-    for (const m of threatMoves(board, opp, null)) {
-      if (m.dbl) pts.push({ x: m.x, y: m.y });
-    }
-    return pts;
-  }
-
-  // ---------- 启发式保底(全局模式评估) ----------
   function heuristicBest(board, color) {
     const opp = other(color);
-
-    // 硬性防守 1: 对手存在"落子即成活四"的点 → 必须堵, 否则对方下一手必胜
-    const urgent = oppOpenFourPoints(board, opp);
-    // 硬性防守 2: 对手存在"落子即形成双威胁"的点 → 必争(堵不住, 只能占住)
-    const double = oppDoubleThreatPoints(board, opp);
-    if (urgent.length || double.length) {
-      const cands = [...urgent, ...double];
-      let best = cands[0], bestScore = -Infinity;
-      for (const b of cands) {
-        const b2 = board.slice();
-        b2[idx(b.x, b.y)] = color;
-        let s = evalBoard(b2, color);
-        if (s > bestScore) { bestScore = s; best = b; }
-      }
-      return { x: best.x, y: best.y };
-    }
-
-    // 对手活三 → 必要防守, 只在堵点里选(带自己威胁的堵点优先)
-    const oppLive3 = liveThreeBlocks(board, opp);
-    const cands = oppLive3.length ? oppLive3 : nearCells(board);
+    const cands = nearCells(board);
 
     let best = null, bestScore = -Infinity;
     for (const [x, y] of cands) {
       const b2 = board.slice();
       b2[idx(x, y)] = color;
-      let s = evalBoard(b2, color);
+      let s = evalBoardConn(b2, color);
 
-      // 做势奖励: 落子后形成 >=2 个活二级方向, 是双活三的伏笔。
-      // 奖励弱于真活三(live3 权重 2e6): 双活二只是"潜在", 活三才是"必应"
-      let d2 = 0;
+      let conn = 0, d2 = 0;
       for (const [dx, dy] of DIRS) {
         const l = dirThreat(b2, x, y, dx, dy, color);
-        if (l >= 2) d2++;
+        if (l >= 2) { conn++; if (l === 2) d2++; }
       }
-      if (d2 >= 2 && s < PW.live3 * 4) s += 4e5;
-
-      // 落子后对手能直接成五 → 重罚(不下送死的棋)
+      if (conn >= 2) {
+        s += 6e5 * Math.min(conn, 3);
+      } else if (d2 >= 1) {
+        s += 1.5e5;
+      }
+      if (liveThreeBlocks(b2, color).length) s += 1e6; // 先手权
       if (winPoints(b2, opp).length) s -= 1e10;
 
-      // 中心偏好(弱, 只在稀疏局面起作用)
-      s += (7 - Math.max(Math.abs(x - 7), Math.abs(y - 7))) * 200;
+      s += (7 - Math.max(Math.abs(x - 7), Math.abs(y - 7))) * 20;
 
       if (s > bestScore) { bestScore = s; best = { x, y }; }
     }
@@ -611,62 +650,73 @@
       for (const b of oppWins) {
         const b2 = board.slice();
         b2[idx(b.x, b.y)] = color;
-        const s = evalBoard(b2, color);
+        const s = evalBoardConn(b2, color);
         if (s > bestScore) { bestScore = s; best = b; }
       }
       return { x: best.x, y: best.y };
     }
 
-    const rootHash = boardHash(board);
-    const t0 = performance.now();
-
-    // 只有存在"高水平威胁"(成四/双威胁)候选时才值得全深度强制搜索;
-    // 全是活三级候选的局面, 深度搜索大概率烧预算却找不到必胜手。
-    // VCF(有冲四候选, 分支小, 强制链可全深度)与 VCT(双威胁试探)分开预算:
-    // VCT 试探预算小, 快速失败回到启发式 —— 提示引擎要快。
-    const myThreats = threatMoves(board, color, null);
-    const oppThreats = threatMoves(board, opp, null);
-    const myHasFour = myThreats.some((m) => m.level >= 4);
-    const oppHasFour = oppThreats.some((m) => m.level >= 4);
-    const hasHighThreat = (arr) => arr.some((m) => m.level >= 4 || m.dbl);
-    const cheap = !hasHighThreat(myThreats) && !hasHighThreat(oppThreats);
-
-    // 3. 我方强制胜搜索
-    if (!cheap && (myHasFour || hasHighThreat(myThreats))) {
-      try {
-        const budget = {
-          nodes: 0,
-          maxNodes: myHasFour ? 90000 : 40000,
-          t0: performance.now(),
-          maxMs: myHasFour ? 120 : 70,
-          visited: new Map(),
-        };
-        const fm = forcingMove(board, color, budget, rootHash);
-        if (fm) return fm;
-      } catch (e) {
-        if (e !== BUDGET) throw e;
+    // 2b. 硬性防守: 对手落子即成活四/双威胁/跳四的点 → 必堵或抢占
+    // (搜索会算到这些威胁, 但硬性规则更快更稳, 且搜索预算有限)
+    const urgent = oppOpenFourPoints(board, opp);
+    const double = oppDoubleThreatPoints(board, opp);
+    const rush = oppRushFourPoints(board, opp);
+    const line = oppLineBlocks(board, opp);
+    if (urgent.length || double.length || rush.length || line.length) {
+      const cands = [...urgent, ...double, ...rush, ...line];
+      // 紧迫度: 活四(对手下一手必胜) > 双威胁 > 跳四 > 聚子
+      const urgency = new Map();
+      for (const p of urgent) urgency.set(p.y * SIZE + p.x, 3);
+      for (const p of double) {
+        const k = p.y * SIZE + p.x;
+        if (!urgency.has(k) || urgency.get(k) < 2) urgency.set(k, 2);
       }
-    }
-
-    // 4. 对方强制胜 → 防守(化解其威胁)
-    if (!cheap && oppHasFour) {
-      try {
-        const budget = { nodes: 0, maxNodes: 60000, t0: performance.now(), maxMs: 90, visited: new Map() };
-        const oppFm = forcingMove(board, opp, budget, rootHash);
-        if (oppFm) {
-          const pb = { nodes: 0, maxNodes: 40000, t0: performance.now(), maxMs: 80, visited: new Map() };
-          const d = parry(board, color, opp, pb, rootHash);
-          if (d) return d;
-          // 找不到完美防守, 至少堵住对方强制胜的第一手威胁
-          const firstThreat = threatMoves(board, opp)[0];
-          if (firstThreat) return { x: firstThreat.x, y: firstThreat.y };
+      for (const p of rush) {
+        const k = p.y * SIZE + p.x;
+        if (!urgency.has(k)) urgency.set(k, 1);
+      }
+      for (const p of line) {
+        const k = p.y * SIZE + p.x;
+        if (!urgency.has(k)) urgency.set(k, 0);
+      }
+      let best = cands[0], bestScore = -Infinity;
+      for (const b of cands) {
+        const b2 = board.slice();
+        b2[idx(b.x, b.y)] = color;
+        let s = evalBoardConn(b2, color);
+        // 必堵活四的点: 大额加权 —— 对手下一手必胜, 优先于一切
+        const u = urgency.get(b.y * SIZE + b.x) || 0;
+        s += u * 8e6;
+        // v6 反击: 防守点若同时形成自己的活三/双活二(先手), 加权
+        // 高手棋理"攻守兼备": 堵对手的同时自己发展, 不被牵着走
+        if (liveThreeBlocks(b2, color).length) s += 3e6;
+        else {
+          let conn = 0;
+          for (const [dx, dy] of DIRS) {
+            if (dirThreat(b2, b.x, b.y, dx, dy, color) >= 2) conn++;
+          }
+          if (conn >= 2) s += 8e5;
         }
-      } catch (e) {
-        if (e !== BUDGET) throw e;
+        if (s > bestScore) { bestScore = s; best = b; }
       }
+      return { x: best.x, y: best.y };
     }
 
-    // 5. 启发式保底(全局模式评估)
+    // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
+    // gobang 默认 depth 4 + VCT(depth+8); 这里 depth 4, VCT 深 12。
+    // 预算: 350ms —— 深度够到"先手进攻"的收益(浅搜索天然偏保守防守)。
+    const searchBoard = board.slice();
+    const evaluator = createEvaluator(searchBoard);
+    evaluator.init();
+    try {
+      const budget = { nodes: 0, maxNodes: 150000, t0: performance.now(), maxMs: 350, visited: null };
+      const res = minmaxSearch(evaluator, searchBoard, color, 4, budget);
+      if (res && res.move) return { x: res.move[0], y: res.move[1] };
+    } catch (e) {
+      if (e !== BUDGET) throw e;
+    }
+
+    // 4. 启发式保底(做棋/防守, 预算超时或搜索无结果)
     return heuristicBest(board, color);
   }
 
