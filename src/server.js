@@ -96,16 +96,24 @@ const server = http.createServer((req, res) => {
       return res.end('ok');
     }
 
-    // 专属链接兑换: ?claim=<HINT_KEY> → 把当前浏览器身份升级为特权
+    // 专属链接兑换: ?claim=<HINT_KEY>&token=<现有token> → 把当前浏览器身份升级为特权。
+    // 幂等: 已有合法 token 时原地升级(身份不变, 棋局座位不丢);
+    // 无 token 时才生成新的。换电脑/清缓存后重新打开专属链接即可恢复。
     if (pathname === '/claim') {
       const key = url.searchParams.get('key') || '';
       if (!CLAIM_KEY || key !== CLAIM_KEY) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: '密钥无效' }));
       }
-      const token = Array.from(crypto.randomBytes(16))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
+      const existing = url.searchParams.get('token') || '';
+      let token;
+      if (/^[A-Za-z0-9_-]{8,64}$/.test(existing) && !/^hint_/.test(existing)) {
+        token = existing; // 原地升级, 保持身份稳定
+      } else {
+        token = Array.from(crypto.randomBytes(16))
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
+      }
       PRIVILEGED_TOKENS.add(token);
       saveHintToken(token);
       res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -31,11 +31,14 @@ let TOKEN = getToken();
   const claim = new URLSearchParams(location.search).get('claim');
   if (!claim) return;
   try {
-    const resp = await fetch('/claim?key=' + encodeURIComponent(claim));
+    // 带上现有 token: 服务器原地升级特权, 身份/棋局座位不丢
+    const resp = await fetch('/claim?key=' + encodeURIComponent(claim) + '&token=' + encodeURIComponent(TOKEN));
     const data = await resp.json();
     if (data.ok && data.token) {
-      localStorage.setItem('gomoku.token', data.token);
-      TOKEN = data.token;
+      if (data.token !== TOKEN) {
+        localStorage.setItem('gomoku.token', data.token);
+        TOKEN = data.token;
+      }
       toast('已激活专属 AI 提示');
     } else {
       toast('专属链接无效', 3000);
@@ -716,7 +719,7 @@ function loadHintEngine() {
   return new Promise((resolve, reject) => {
     if (self.GomokuHint) return resolve();
     const s = document.createElement('script');
-    s.src = '/hint.js?v=6';
+    s.src = '/hint.js?v=7';
     s.onload = () => resolve();
     s.onerror = () => reject(new Error('引擎加载失败'));
     document.head.appendChild(s);
