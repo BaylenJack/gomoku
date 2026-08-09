@@ -122,6 +122,46 @@ const SFX = {
   err()   { tone({ freq: 180, dur: 0.14, type: 'sawtooth', vol: 0.16 }); },
 };
 
+// ================= 胜利特效(粒子) =================
+function spawnVictory() {
+  // 创建覆盖层
+  const layer = document.createElement('div');
+  layer.className = 'victory-layer';
+  document.body.appendChild(layer);
+  // 60 颗暖金粒子, 2.5 秒后清掉
+  const colors = ['#d8a657', '#f3dca6', '#b07a36', '#e8be7a', '#fff'];
+  for (let i = 0; i < 60; i++) {
+    const p = document.createElement('div');
+    p.className = 'victory-particle';
+    p.style.background = colors[i % colors.length];
+    p.style.left = (Math.random() * 100) + 'vw';
+    p.style.top = '-10px';
+    p.style.animationDelay = (Math.random() * 0.8) + 's';
+    p.style.animationDuration = (1.8 + Math.random() * 1.2) + 's';
+    p.style.boxShadow = `0 0 6px ${colors[i % colors.length]}`;
+    layer.appendChild(p);
+  }
+  setTimeout(() => layer.remove(), 3500);
+}
+
+// 落子高光: 在 (x,y) 棋盘坐标位置闪一道金色脉冲
+function flashMove(x, y) {
+  const wrap = document.getElementById('board')?.parentElement;
+  if (!wrap) return;
+  const SIZE = 15, rect = wrap.getBoundingClientRect();
+  const cell = rect.width / (SIZE - 1 + 2 * 0.04);
+  // 棋盘 padding: 与 draw 里的 pad 等比
+  const pad = rect.width * 0.04;
+  const px = (rect.left + pad + x * (rect.width - 2 * pad) / (SIZE - 1)) - rect.left;
+  const py = (rect.top + pad + y * (rect.width - 2 * pad) / (SIZE - 1)) - rect.top;
+  const g = document.createElement('div');
+  g.className = 'move-glow';
+  g.style.left = (px / rect.width * 100) + '%';
+  g.style.top = (py / rect.height * 100) + '%';
+  wrap.appendChild(g);
+  setTimeout(() => g.remove(), 850);
+}
+
 // ================= 提示 =================
 let toastTimer = null;
 function toast(msg, ms = 2000) {
@@ -514,6 +554,7 @@ function handle(m) {
       if (m.event === 'move' && m.at) {
         placeAnim = { x: m.at.x, y: m.at.y, start: performance.now() };
         SFX.place();
+        flashMove(m.at.x, m.at.y); // 落子高光
         // 对方落子后, 如果提示还开着, 自动刷新建议
         autoRefreshHint();
       }
@@ -533,7 +574,10 @@ function handle(m) {
       if (justEnded) {
         winAnim = { start: performance.now() };
         showOver();
-        if (state.status === 'won') state.winner === myColor ? SFX.win() : SFX.lose();
+        if (state.status === 'won') {
+          state.winner === myColor ? SFX.win() : SFX.lose();
+          spawnVictory(); // 胜利粒子
+        }
         // 胜负已分, 提示清除
         resetHint();
       }
