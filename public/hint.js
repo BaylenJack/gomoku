@@ -766,7 +766,10 @@
    * @param {number} color BLACK=1 | WHITE=2
    * @returns {{x:number, y:number}}
    */
-  function computeBest(board, color) {
+  // v11: opts.skipHardRules —— 深度版跳过硬性规则直接深搜
+  // (普通版保留规则秒答, 深度版用满预算算透威胁)
+  function computeBest(board, color, opts) {
+    const skipHard = opts && opts.skipHardRules === true;
     const opp = other(color);
 
     // 1. 直接成五
@@ -788,6 +791,8 @@
 
     // 2b. 硬性防守: 对手落子即成活四/双威胁的点 → 必堵或抢占
     // (搜索会算到这些威胁, 但硬性规则更快更稳, 且搜索预算有限)
+    // v11: 深度版(skipHardRules)跳过硬性防守, 用深搜算透威胁后续
+    if (!skipHard) {
     // v7: 跳三缺口(非活四)不再硬性必堵 —— 交给搜索评估。
     // gobang_AI 攻防系数 0.1: 下棋优先于堵棋, 跳三可晚一步堵。
     const urgent = oppOpenFourPoints(board, opp);
@@ -840,6 +845,7 @@
     if (oppBest.score > myBest.score + 4000 && oppBest.score !== -Infinity) {
       return { x: oppBest.x, y: oppBest.y };
     }
+    } // end skipHard
 
     // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
     // v9: Web Worker 后台跑 — 预算 3 秒 / 80 万节点, 深度中盘 8。
