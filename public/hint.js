@@ -845,6 +845,10 @@
     if (oppBest.score > myBest.score + 4000 && oppBest.score !== -Infinity) {
       return { x: oppBest.x, y: oppBest.y };
     }
+    // 启发式已找到双活三/冲四活三级大招 → 直接采用, 不再进浅搜(浅搜会低估兑现价值)
+    if (myBest.score > 5e6 && myBest.score !== -Infinity) {
+      return { x: myBest.x, y: myBest.y };
+    }
     } // end skipHard
 
     // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
@@ -887,10 +891,10 @@
         if (board[idx(x, y)] !== EMPTY) { lastMove = [x, y]; break; }
       }
     }
+    // v9: Web Worker 后台跑 — 3 秒 / 80 万节点(主线程同步调用时仍会回退)
+    // v11: budget.best 记录最优-so-far —— 超时也能返回部分搜索的最佳结果
+    const budget = { nodes: 0, maxNodes: 400000, t0: performance.now(), maxMs: 1500, visited: null, best: null };
     try {
-      // v9: Web Worker 后台跑 — 3 秒 / 80 万节点(主线程同步调用时仍会回退)
-      // v11: budget.best 记录最优-so-far —— 超时也能返回部分搜索的最佳结果
-      const budget = { nodes: 0, maxNodes: 400000, t0: performance.now(), maxMs: 1500, visited: null, best: null };
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
     } catch (e) {
