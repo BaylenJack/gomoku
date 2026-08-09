@@ -691,24 +691,53 @@ function createHintButton() {
   btn.id = 'hintBtn';
   btn.className = 'btn-hint';
   btn.textContent = '💡 提示';
-  btn.title = 'AI 建议下一步';
-  btn.onclick = () => {
-    if (!hintOn) {
-      hintOn = true;
-      btn.classList.add('active');
-      btn.textContent = '💡 提示 开';
+  btn.title = '点击: 普通提示(快) · 长按: 深度提示(最强)';
+
+  // 长按 600ms → 深度提示; 松开早于 600ms → 普通提示
+  let pressTimer = null;
+  let longPressFired = false;
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    longPressFired = false;
+    pressTimer = setTimeout(() => {
+      longPressFired = true;
+      btn.classList.add('deep-press');
+      btn.textContent = '🧠 深度计算中…';
+      showHint(true);
+    }, 600);
+  });
+  btn.addEventListener('pointerup', () => {
+    clearTimeout(pressTimer);
+    if (!longPressFired) {
+      // 单击 → 开关/普通提示
+      if (!hintOn) {
+        hintOn = true;
+        btn.classList.add('active');
+        btn.textContent = '💡 提示 开';
+      } else {
+        hintOn = false;
+        btn.classList.remove('active');
+        btn.textContent = '💡 提示';
+        hintMark = null;
+        hintHighlightUntil = 0;
+        draw();
+        return;
+      }
+      showHint(false);
     } else {
-      // 再点一次: 关闭提示
-      hintOn = false;
-      btn.classList.remove('active');
-      btn.textContent = '💡 提示';
-      hintMark = null;
-      hintHighlightUntil = 0;
-      draw();
-      return;
+      btn.classList.remove('deep-press');
+      btn.textContent = hintOn ? '💡 提示 开' : '💡 提示';
     }
-    showHint();
-  };
+  });
+  btn.addEventListener('pointerleave', () => {
+    clearTimeout(pressTimer);
+    btn.classList.remove('deep-press');
+    if (!longPressFired && !hintOn) btn.textContent = '💡 提示';
+  });
+  btn.addEventListener('pointercancel', () => {
+    clearTimeout(pressTimer);
+    btn.classList.remove('deep-press');
+  });
   row.appendChild(btn);
   document.querySelector('.toolbar').after(row);
   return btn;
@@ -761,15 +790,16 @@ function loadHintEngine() {
   });
 }
 
-// 计算最佳落点: 服务器端 AI 优先(3s 深搜), 失败/超时回退本地 Worker
-function computeHintAsync(board, color) {
-  // 5 秒超时 → 回退本地
-  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('hint timeout')), 5000));
+// 计算最佳落点: 服务器端 AI 优先(3s 普通 / 15s 深度), 失败/超时回退本地 Worker
+function computeHintAsync(board, color, deep) {
+  // 超时: 普通 8s, 深度 30s → 回退本地
+  const timeoutMs = deep ? 30000 : 8000;
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('hint timeout')), timeoutMs));
   return Promise.race([
     fetch('/hint', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ board, color, token: TOKEN }),
+      body: JSON.stringify({ board, color, token: TOKEN, deep: deep === true }),
     })
       .then((resp) => {
         if (!resp.ok) throw new Error('hint ' + resp.status);
@@ -777,7 +807,7 @@ function computeHintAsync(board, color) {
       })
       .then((data) => {
         if (!data.ok || typeof data.x !== 'number' || typeof data.y !== 'number') throw new Error('hint bad');
-        return { x: data.x, y: data.y, server: true };
+        return { x: data.x, y: data.y, server: true, deep: data.deep === true };
       }),
     timeout,
   ])
@@ -805,19 +835,20 @@ function computeHintLocal(board, color) {
   });
 }
 
-// 显示提示: 纯本地, 不发网络
-async function showHint() {
+// 显示提示: 服务器优先, 本地回退
+async function showHint(deep) {
   if (!hintEnabled) return;
   if (!state || state.status !== 'playing') {
     toast('对局未开始'); return;
   }
   try {
     await loadHintEngine();
-    const { x, y, server } = await computeHintAsync(state.board, state.turn);
+    const { x, y, server, deep: isDeep } = await computeHintAsync(state.board, state.turn, deep);
     if (state.board[y * SIZE + x] !== EMPTY) { toast('提示暂不可用'); return; }
     hintMark = { x, y };
     hintHighlightUntil = performance.now() + 8000;
-    toast(`${server ? '🤖' : '📱'} 建议 (${x + 1}, ${y + 1})`, 2500);
+    const tag = server ? (isDeep ? '🧠 深度' : '🤖 普通') : '📱 本地';
+    toast(`${tag} 建议 (${x + 1}, ${y + 1})`, 2500);
     draw();
     loop();
   } catch {

@@ -88,15 +88,17 @@ const MIME = {
 };
 
 // ---------- 服务器端 AI 提示引擎 ----------
-// 用 vm 沙箱加载 hint.js(浏览器同款引擎), 预算提到 3s/100万节点,
-// 比浏览器 Worker 的 1.5s/40万节点 深 2-3 层, 棋力更强。
+// 用 vm 沙箱加载 hint.js(浏览器同款引擎)。
+// 普通版: 3s/100万节点; 深度版: 15s/1000万节点(deep:true 时)。
 // 特权 token 才允许调用(沿用 HINT_TOKEN / claim 兑换机制)。
 
 let hintModule = null; // 缓存编译结果, 避免每次请求都重编译
+let hintDeepModule = null; // 深度版(预算大)单独缓存
 let hintLoadError = null;
 
-function loadHintEngine() {
-  if (hintModule) return hintModule;
+function loadHintEngine(deep) {
+  if (deep && hintDeepModule) return hintDeepModule;
+  if (!deep && hintModule) return hintModule;
   const hintPath = path.join(PUBLIC_DIR, 'hint.js');
   let src;
   try {
@@ -105,10 +107,11 @@ function loadHintEngine() {
     hintLoadError = '引擎文件读取失败';
     return null;
   }
-  // 预算替换: 浏览器 1.5s/40万节点 → 服务器 3s/100万节点
-  src = src
-    .replace('maxNodes: 400000', 'maxNodes: 1000000')
-    .replace('maxMs: 1500', 'maxMs: 3000');
+  // 预算替换: 普通 3s/100万节点, 深度 15s/1000万节点
+  const budget = deep
+    ? ['maxNodes: 400000', 'maxNodes: 10000000', 'maxMs: 1500', 'maxMs: 15000']
+    : ['maxNodes: 400000', 'maxNodes: 1000000', 'maxMs: 1500', 'maxMs: 3000'];
+  src = src.replace(budget[0], budget[1]).replace(budget[2], budget[3]);
   const sandbox = {
     module: { exports: {} },
     exports: {},
@@ -120,13 +123,16 @@ function loadHintEngine() {
   sandbox.globalThis = sandbox;
   try {
     vm.createContext(sandbox);
-    vm.runInContext(src, sandbox, { timeout: 10000 });
-    hintModule = sandbox.module.exports;
-    if (!hintModule || typeof hintModule.computeBest !== 'function') {
+    // 深度版给更长编译时间
+    vm.runInContext(src, sandbox, { timeout: deep ? 30000 : 10000 });
+    const mod = sandbox.module.exports;
+    if (!mod || typeof mod.computeBest !== 'function') {
       hintLoadError = '引擎加载异常';
       return null;
     }
-    return hintModule;
+    if (deep) hintDeepModule = mod;
+    else hintModule = mod;
+    return mod;
   } catch (e) {
     hintLoadError = '引擎编译失败: ' + e.message;
     return null;
@@ -161,7 +167,7 @@ function handleHint(req, res) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: '参数不合法' }));
       }
-      const engine = loadHintEngine();
+      const engine = loadHintEngine(body.deep === true);
       if (!engine) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: hintLoadError || '引擎不可用' }));
@@ -170,7 +176,7 @@ function handleHint(req, res) {
       const r = engine.computeBest(board, color);
       const ms = Date.now() - t0;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, x: r.x, y: r.y, ms }));
+      res.end(JSON.stringify({ ok: true, x: r.x, y: r.y, ms, deep: body.deep === true }));
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: '计算失败: ' + e.message }));
