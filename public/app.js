@@ -80,6 +80,7 @@ let dpr = 1, cell = 0, pad = 0, boardPx = 0;
 let hintOn = false;          // 提示开关
 let hintMark = null;         // { x, y }  本地计算的推荐落点, 仅本地渲染
 let hintHighlightUntil = 0;  // 显示持续到某时刻(给"闪烁"留时间)
+let hintDeep = false;        // 深度模式(长按触发, 常驻直到关闭/落子)
 
 // 计时
 let timerDeadline = null;
@@ -522,7 +523,7 @@ function handle(m) {
       }
       if (m.event === 'undo-accepted') toast('悔棋已生效');
       if (m.event === 'undo-rejected') toast('对方不同意悔棋');
-      if (m.event === 'new-game') { winAnim = null; toast('新的一局，先手已交换'); hintMark = null; hintHighlightUntil = 0; autoRefreshHint(); }
+      if (m.event === 'new-game') { winAnim = null; toast('新的一局，先手已交换'); resetHint(); autoRefreshHint(); }
       if (m.event === 'new-game-vote') toast('等待对方确认开新局…');
       if (m.event === 'timeout') toast('超时判负');
 
@@ -534,7 +535,7 @@ function handle(m) {
         showOver();
         if (state.status === 'won') state.winner === myColor ? SFX.win() : SFX.lose();
         // 胜负已分, 提示清除
-        hintMark = null; hintHighlightUntil = 0;
+        resetHint();
       }
       resetTurnTimer();
       render();
@@ -693,6 +694,11 @@ function createHintButton() {
   btn.textContent = '💡 提示';
   btn.title = '点击: 普通提示(快) · 长按: 深度提示(最强)';
 
+  function setDeepUI(on) {
+    btn.classList.toggle('deep', on);
+    btn.textContent = on ? '🧠 深度 开' : (hintOn ? '💡 提示 开' : '💡 提示');
+  }
+
   // 长按 600ms → 深度提示; 松开早于 600ms → 普通提示
   let pressTimer = null;
   let longPressFired = false;
@@ -710,6 +716,17 @@ function createHintButton() {
     clearTimeout(pressTimer);
     if (!longPressFired) {
       // 单击 → 开关/普通提示
+      if (hintDeep) {
+        // 深度模式开着, 单击关闭
+        hintDeep = false;
+        hintOn = false;
+        btn.classList.remove('active');
+        setDeepUI(false);
+        hintMark = null;
+        hintHighlightUntil = 0;
+        draw();
+        return;
+      }
       if (!hintOn) {
         hintOn = true;
         btn.classList.add('active');
@@ -726,13 +743,14 @@ function createHintButton() {
       showHint(false);
     } else {
       btn.classList.remove('deep-press');
-      btn.textContent = hintOn ? '💡 提示 开' : '💡 提示';
+      // 深度计算成功后由 showHint 设置常驻 UI, 这里只清掉"计算中"临时态
+      if (!hintDeep) setDeepUI(false);
     }
   });
   btn.addEventListener('pointerleave', () => {
     clearTimeout(pressTimer);
     btn.classList.remove('deep-press');
-    if (!longPressFired && !hintOn) btn.textContent = '💡 提示';
+    if (!longPressFired && !hintDeep && !hintOn) btn.textContent = '💡 提示';
   });
   btn.addEventListener('pointercancel', () => {
     clearTimeout(pressTimer);
@@ -835,6 +853,19 @@ function computeHintLocal(board, color) {
   });
 }
 
+// 重置提示状态(落子/新对局/胜负/关闭时调用)
+function resetHint() {
+  hintMark = null;
+  hintHighlightUntil = 0;
+  hintDeep = false;
+  hintOn = false;
+  const btn = document.getElementById('hintBtn');
+  if (btn) {
+    btn.classList.remove('active', 'deep', 'deep-press');
+    btn.textContent = '💡 提示';
+  }
+}
+
 // 显示提示: 服务器优先, 本地回退
 async function showHint(deep) {
   if (!hintEnabled) return;
@@ -846,7 +877,19 @@ async function showHint(deep) {
     const { x, y, server, deep: isDeep } = await computeHintAsync(state.board, state.turn, deep);
     if (state.board[y * SIZE + x] !== EMPTY) { toast('提示暂不可用'); return; }
     hintMark = { x, y };
-    hintHighlightUntil = performance.now() + 8000;
+    if (isDeep) {
+      // 深度模式: 提示常驻显示(不自动消失), 按钮切到"深度 开"
+      hintDeep = true;
+      hintHighlightUntil = Infinity;
+      const btn = document.getElementById('hintBtn');
+      if (btn) {
+        btn.classList.remove('deep-press');
+        btn.classList.add('active', 'deep');
+        btn.textContent = '🧠 深度 开';
+      }
+    } else {
+      hintHighlightUntil = performance.now() + 8000;
+    }
     const tag = server ? (isDeep ? '🧠 深度' : '🤖 普通') : '📱 本地';
     toast(`${tag} 建议 (${x + 1}, ${y + 1})`, 2500);
     draw();
@@ -858,7 +901,10 @@ async function showHint(deep) {
 
 // 每次 state 更新后, 若提示开着则自动刷新
 function autoRefreshHint() {
-  if (hintEnabled && hintOn && state && state.status === 'playing') showHint();
+  // 提示开着才自动刷新(落子后)
+  if (!hintEnabled || !(hintOn || hintDeep) || !state || state.status !== 'playing') return;
+  // 深度模式: 每次落子自动重新深算(常驻, 不重置按钮)
+  showHint(hintDeep);
 }
 
 // ================= 表情 =================
