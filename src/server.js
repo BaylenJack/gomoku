@@ -12,7 +12,6 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { Store } from './store.js';
@@ -88,55 +87,57 @@ const MIME = {
 };
 
 // ---------- 服务器端 AI 提示引擎 ----------
-// 用 vm 沙箱加载 hint.js(浏览器同款引擎)。
+// 用 worker_threads 跑引擎(独立线程), 主进程事件循环不被阻塞。
 // 普通版: 3s/100万节点; 深度版: 15s/1000万节点(deep:true 时)。
 // 特权 token 才允许调用(沿用 HINT_TOKEN / claim 兑换机制)。
 
-let hintModule = null; // 缓存编译结果, 避免每次请求都重编译
-let hintDeepModule = null; // 深度版(预算大)单独缓存
-let hintLoadError = null;
+import { Worker } from 'node:worker_threads';
 
-function loadHintEngine(deep) {
-  if (deep && hintDeepModule) return hintDeepModule;
-  if (!deep && hintModule) return hintModule;
-  const hintPath = path.join(PUBLIC_DIR, 'hint.js');
-  let src;
-  try {
-    src = fs.readFileSync(hintPath, 'utf8');
-  } catch (e) {
-    hintLoadError = '引擎文件读取失败';
-    return null;
-  }
-  // 预算替换: 普通 3s/100万节点, 深度 15s/1000万节点
-  const budget = deep
-    ? ['maxNodes: 400000', 'maxNodes: 10000000', 'maxMs: 1500', 'maxMs: 15000']
-    : ['maxNodes: 400000', 'maxNodes: 1000000', 'maxMs: 1500', 'maxMs: 3000'];
-  src = src.replace(budget[0], budget[1]).replace(budget[2], budget[3]);
-  const sandbox = {
-    module: { exports: {} },
-    exports: {},
-    global: {},
-    self: undefined,
-    performance: { now: () => Date.now() },
-    console,
-  };
-  sandbox.globalThis = sandbox;
-  try {
-    vm.createContext(sandbox);
-    // 深度版给更长编译时间
-    vm.runInContext(src, sandbox, { timeout: deep ? 30000 : 10000 });
-    const mod = sandbox.module.exports;
-    if (!mod || typeof mod.computeBest !== 'function') {
-      hintLoadError = '引擎加载异常';
-      return null;
-    }
-    if (deep) hintDeepModule = mod;
-    else hintModule = mod;
-    return mod;
-  } catch (e) {
-    hintLoadError = '引擎编译失败: ' + e.message;
-    return null;
-  }
+const HINT_WORKER_COUNT = 2; // 2 个 worker: 一个常驻普通, 一个深度(避免互抢)
+const hintWorkers = []; // { worker, busy, queue }
+
+function spawnHintWorker() {
+  const worker = new Worker(new URL('./hint-worker.cjs', import.meta.url), {
+    workerData: { publicDir: PUBLIC_DIR },
+  });
+  const entry = { worker, busy: false, queue: [] };
+  worker.on('message', (m) => {
+    const q = entry.queue.shift();
+    entry.busy = false;
+    if (q) q.resolve(m);
+    else processHintQueue(entry);
+  });
+  worker.on('error', (e) => {
+    // worker 崩溃: 拒绝所有排队请求, 重建
+    console.error('[hint] worker 错误:', e.message);
+    for (const q of entry.queue) q.reject(new Error('引擎崩溃'));
+    entry.queue = [];
+    entry.busy = false;
+    spawnHintWorker();
+    // 替换自己
+    const i = hintWorkers.indexOf(entry);
+    if (i >= 0) hintWorkers.splice(i, 1);
+  });
+  return entry;
+}
+
+for (let i = 0; i < HINT_WORKER_COUNT; i++) hintWorkers.push(spawnHintWorker());
+
+function processHintQueue(entry) {
+  if (entry.busy || entry.queue.length === 0) return;
+  const q = entry.queue[0];
+  entry.busy = true;
+  entry.worker.postMessage({ id: q.id, board: q.board, color: q.color, deep: q.deep });
+}
+
+function requestHint(board, color, deep) {
+  return new Promise((resolve, reject) => {
+    // 深度请求优先找空闲的深度 worker; 否则轮询
+    const entry = hintWorkers.find((w) => !w.busy && w.queue.length === 0) || hintWorkers[0];
+    const id = Math.random().toString(36).slice(2);
+    entry.queue.push({ id, board, color, deep, resolve, reject });
+    processHintQueue(entry);
+  });
 }
 
 function handleHint(req, res) {
@@ -167,16 +168,22 @@ function handleHint(req, res) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: '参数不合法' }));
       }
-      const engine = loadHintEngine(body.deep === true);
-      if (!engine) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ ok: false, error: hintLoadError || '引擎不可用' }));
-      }
+      const deep = body.deep === true;
       const t0 = Date.now();
-      const r = engine.computeBest(board, color);
-      const ms = Date.now() - t0;
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, x: r.x, y: r.y, ms, deep: body.deep === true }));
+      requestHint(board, color, deep)
+        .then((r) => {
+          const ms = Date.now() - t0;
+          if (r.error) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: false, error: r.error }));
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, x: r.x, y: r.y, ms, deep }));
+        })
+        .catch((e) => {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '计算失败: ' + e.message }));
+        });
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: '计算失败: ' + e.message }));
