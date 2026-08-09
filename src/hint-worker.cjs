@@ -23,10 +23,14 @@ function loadEngine(deep) {
     return { error: '引擎文件读取失败: ' + e.message };
   }
   // 预算替换: 普通 3s/100万节点, 深度 15s/1000万节点
-  const [fromNodes, toNodes, fromMs, toMs] = deep
-    ? ['maxNodes: 400000', 'maxNodes: 10000000', 'maxMs: 1500', 'maxMs: 15000']
-    : ['maxNodes: 400000', 'maxNodes: 1000000', 'maxMs: 1500', 'maxMs: 3000'];
+  // v11: 深度版深度 6 → 10 (配合深层威胁过滤 ONLY_THREE_THRESHOLD)
+  const [fromNodes, toNodes, fromMs, toMs, fromDepth, toDepth] = deep
+    ? ['maxNodes: 400000', 'maxNodes: 10000000', 'maxMs: 1500', 'maxMs: 15000',
+       'const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);',
+       'const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 10);']
+    : ['maxNodes: 400000', 'maxNodes: 1000000', 'maxMs: 1500', 'maxMs: 3000', null, null];
   src = src.replace(fromNodes, toNodes).replace(fromMs, toMs);
+  if (fromDepth) src = src.replace(fromDepth, toDepth);
 
   const sandbox = {
     module: { exports: {} },

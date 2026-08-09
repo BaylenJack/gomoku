@@ -14,10 +14,13 @@
 // 预算: 节点 + 时间双重上限, 超时回退启发式 —— 手机上不卡。
 // 隐私: 纯本地计算, 结果只画在本地 canvas, 不经 WebSocket。
 
+// UMD: 浏览器挂 global, CommonJS 挂 module.exports, ESM 场景也兼容
 (function (global, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
-  else global.GomokuHint = factory();
-})(typeof self !== 'undefined' ? self : this, function () {
+  else if (typeof exports === 'object' && exports !== null) exports.default = factory();
+  else if (typeof self !== 'undefined') self.GomokuHint = factory();
+  else if (typeof globalThis !== 'undefined') globalThis.GomokuHint = factory();
+})(typeof self !== 'undefined' ? self : typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
   const SIZE = 15;
@@ -62,17 +65,21 @@
   const PAT = {
     five: /11111/,
     blockfive: /211111|111112/,
-    four: /011110/,
-    blockFour: /10111|11011|11101|211110|211101|211011|210111|011112|101112|110112|111012/,
-    three: /011100|011010|010110|001110/,
-    blockThree: /211100|211010|210110|001112|010112|011012/,
-    two: /001100|011000|000110|010100|001010/,
+    four: /011110|01110110/,
+    // 跳四: 单跳(已有) + 双跳(101101/110101)
+    blockFour: /10111|11011|11101|101101|110101|211110|211101|211011|210111|011112|101112|110112|111012/,
+    // 活三: 连续 + 单跳 + 双跳(1010101)
+    three: /011100|011010|010110|001110|0101010|0101001|1001010/,
+    blockThree: /211100|211010|210110|001112|010112|011012|210101|101012/,
+    // 活二: 连续 + 单跳 + 双跳(10001/10101)
+    two: /001100|011000|000110|010100|001010|1001001|1000100|0010001|0101001|0010100|100101|101001/,
   };
 
   // 在 (x,y) 放 role 后沿 (dx,dy) 方向的棋形
+  // v11: 扫描窗口扩到 6(双侧), 覆盖双跳棋形
   function getShape(board, x, y, dx, dy, role) {
     let s = '1';
-    for (let i = 1; i <= 5; i++) {
+    for (let i = 1; i <= 6; i++) {
       const nx = x + dx * i, ny = y + dy * i;
       if (!inB(nx, ny)) { s += '2'; break; }
       const v = board[idx(nx, ny)];
@@ -80,7 +87,7 @@
       else if (v === role) s += '1';
       else { s += '2'; break; }
     }
-    for (let i = 1; i <= 5; i++) {
+    for (let i = 1; i <= 6; i++) {
       const nx = x - dx * i, ny = y - dy * i;
       if (!inB(nx, ny)) { s = '2' + s; break; }
       const v = board[idx(nx, ny)];
@@ -169,10 +176,10 @@
     }
 
     function refresh(x, y) {
-      // 落子点影响周围 5 格内的所有空位
+      // 落子点影响周围 6 格内的所有空位 (v11: 窗口扩到 6 配合双跳识别)
       for (const [dx, dy] of DIRS) {
         for (const sign of [1, -1]) {
-          for (let step = 1; step <= 5; step++) {
+          for (let step = 1; step <= 6; step++) {
             const nx = x + sign * step * dx, ny = y + sign * step * dy;
             if (!inB(nx, ny)) break;
             if (board[idx(nx, ny)] !== EMPTY) continue;
@@ -399,13 +406,15 @@
           cv = -cv;
           evaluator.undo(x, y);
 
-          if (cv >= FIVE || d === depth) {
-            // 必输的棋也挣扎: 选最长路径
-            if (cv > value || (cv <= -FIVE && value <= -FIVE && cp.length > bestDepth)) {
-              value = cv;
-              move = [x, y];
-              bestPath = cp;
-              bestDepth = cp.length;
+          // v11: 每层每个走法都更新 best(不只是胜或到底) —— 超时也有可用结果
+          if (cv > value || (cv <= -FIVE && value <= -FIVE && cp.length > bestDepth)) {
+            value = cv;
+            move = [x, y];
+            bestPath = cp;
+            bestDepth = cp.length;
+            if (budget && (!budget.best || cv > budget.best.value ||
+                (cv <= -FIVE && budget.best.value <= -FIVE && cp.length > budget.best.depth))) {
+              budget.best = { value: cv, move: [x, y], path: cp, depth: cp.length };
             }
           }
           alpha = Math.max(alpha, value);
@@ -713,7 +722,8 @@
     return [...blocks].map((i) => ({ x: i % SIZE, y: Math.floor(i / SIZE) }));
   }
 
-  function heuristicBest(board, color) {
+  // v11: 返回带 score 的启发式最优(供 heuristicBest 和反推防守共用)
+  function bestByEval(board, color) {
     const opp = other(color);
     const cands = nearCells(board);
 
@@ -740,9 +750,13 @@
 
       s += (7 - Math.max(Math.abs(x - 7), Math.abs(y - 7))) * 20;
 
-      if (s > bestScore) { bestScore = s; best = { x, y }; }
+      if (s > bestScore) { bestScore = s; best = { x, y, score: s }; }
     }
-    return best || { x: 7, y: 7 };
+    return best || { x: 7, y: 7, score: -Infinity };
+  }
+
+  function heuristicBest(board, color) {
+    return bestByEval(board, color);
   }
 
   // ---------- 入口 ----------
@@ -818,11 +832,21 @@
       return { x: best.x, y: best.y };
     }
 
+    // 2c. 一步反推防守 (mumuy gobang 法):
+    // 对手下步最优点如果威胁远超我方可选点 → 直接抢对手的点
+    // (堵"潜在双威胁"比搜索更直接 —— 搜索预算内未必看到这个点)
+    const myBest = bestByEval(board, color);
+    const oppBest = bestByEval(board, opp);
+    if (oppBest.score > myBest.score + 4000 && oppBest.score !== -Infinity) {
+      return { x: oppBest.x, y: oppBest.y };
+    }
+
     // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
     // v9: Web Worker 后台跑 — 预算 3 秒 / 80 万节点, 深度中盘 8。
     // 开局(<8 子)深度 2, 中盘 8, 残局(>190 子)深度 4。
     let stoneCount = 0;
     for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
+    // v11: 深度参数化 —— 服务器端通过替换把 6 提到 10-12(深度版)
     const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);
 
     // 开局定式: 仅黑第 3 手(天元 + 白 1 子)用严格定式 ——
@@ -859,11 +883,14 @@
     }
     try {
       // v9: Web Worker 后台跑 — 3 秒 / 80 万节点(主线程同步调用时仍会回退)
-      const budget = { nodes: 0, maxNodes: 400000, t0: performance.now(), maxMs: 1500, visited: null };
+      // v11: budget.best 记录最优-so-far —— 超时也能返回部分搜索的最佳结果
+      const budget = { nodes: 0, maxNodes: 400000, t0: performance.now(), maxMs: 1500, visited: null, best: null };
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
     } catch (e) {
       if (e !== BUDGET) throw e;
+      // v11: 预算超时但已有部分搜索 best → 用它(而非直接跳启发式)
+      if (budget.best && budget.best.move) return { x: budget.best.move[0], y: budget.best.move[1] };
     }
 
     // 4. 启发式保底(做棋/防守, 预算超时或搜索无结果)
