@@ -64,7 +64,9 @@ parentPort.on('message', (msg) => {
   const t0 = Date.now();
   let r;
   try {
-    r = engine.computeBest(msg.board, msg.color);
+    // v11.1: 深度版跳过硬性规则, 用满预算深算威胁后续
+    r = engine.computeBest(msg.board, msg.color,
+      msg.deep === true ? { skipHardRules: true } : undefined);
   } catch (e) {
     parentPort.postMessage({ id: msg.id, error: '计算失败: ' + e.message });
     return;
