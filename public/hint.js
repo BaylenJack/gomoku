@@ -55,13 +55,26 @@
     for (let i = 0; i < t.length; i++) t[i] = (rnd() * 4294967296) >>> 0;
     return t;
   })();
+  // v11.5: 第二个独立 Zobrist 表 —— 缓存 key 由 32 位扩到 53 位。
+  // 原 32 位 key 在几万节点的搜索树里碰撞概率 ~1-5%: 碰撞 → 缓存误命中 →
+  // 偶发错误评估("蠢棋"的来源之一)。双表拼接后碰撞概率 ~2^-53, 可忽略。
+  const ZB2 = (() => {
+    const rnd = mulberry32(0x243F6A88);
+    const t = new Uint32Array(SIZE * SIZE * 2 + 2);
+    for (let i = 0; i < t.length; i++) t[i] = (rnd() * 4294967296) >>> 0;
+    return t;
+  })();
   const zOf = (cell, color) => ZB[cell * 2 + (color - 1)];
   function boardHash(board) {
-    let h = 0;
+    let h1 = 0, h2 = 0;
     for (let i = 0; i < board.length; i++) {
-      if (board[i] !== EMPTY) h = (h ^ zOf(i, board[i])) >>> 0;
+      if (board[i] !== EMPTY) {
+        const c = board[i];
+        h1 = (h1 ^ ZB[i * 2 + (c - 1)]) >>> 0;
+        h2 = (h2 ^ ZB2[i * 2 + (c - 1)]) >>> 0;
+      }
     }
-    return h;
+    return [h1, h2];
   }
 
   // ---------- 棋形识别 (gobang shape.js 字符串法) ----------
@@ -402,10 +415,13 @@
         }
       }
 
-      const hash = boardHash(board);
+      const [h1, h2] = boardHash(board);
       // v8: 缓存 key 含变体标志 —— VCT/VCF 与常规搜索的缓存不通用(gobang)
-      const key = (hash + role * 2654435761 + (depth - cDepth) * 4101842887 +
-        (onlyThree ? 1 : 0) * 7919 + (onlyFour ? 1 : 0) * 104729) >>> 0;
+      // v11.5: 53 位 key —— 高 32 位 h2 纯位段(<<21) + 低 21 位 mix
+      // (mix 把 role/深度/变体混合进 h1), 位段无重叠 → 无进位歧义。
+      // 原 32 位 key 在几万节点的树里碰撞 ~1-5%, 误命中产生偶发错棋。
+      const mix = (h1 ^ Math.imul(role + (depth - cDepth) * 4 + (onlyThree ? 2 : 0) + (onlyFour ? 1 : 0), 0x9E3779B1)) >>> 0;
+      const key = h2 * 2097152 + (mix >>> 11);
       const prev = cache.get(key);
       if (prev && (Math.abs(prev.value) >= FIVE || prev.depth >= depth - cDepth) &&
           prev.onlyThree === onlyThree && prev.onlyFour === onlyFour) {
@@ -551,7 +567,13 @@
     }
     if (!move) return null;
 
-    // 阶段 3: 防守校验(预算 25%)
+    // 阶段 3: 防守校验(预算 25%) —— 我落 move 后对手能否 VCT 杀?
+    // 能且己方无必胜 → 改堵对方杀棋起点(防守妙手, 补 2b 的盲区:
+    // 2b 只拦 1-2 步的盘面威胁, 搜索级的强制杀链由这里拦截)。
+    // v11.5: 删第二次"确认"调用 —— 第一次 vct 已耗尽 b3, 第二次共享同一
+    // 预算必然立即超时, 让 path3.length 抛 TypeError(undefined.length) 沿
+    // catch 链上抛, computeBest 整个崩溃; 且 VCT 的 onlyThree 门控保证
+    // value2 >= FIVE 只在真找到杀时成立(中间迭代非胜值不提交), 无需确认。
     const b3 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25), t0: performance.now(), maxMs: budget.maxMs * 0.25 };
     try {
       const sBoard = board.slice();
@@ -560,11 +582,11 @@
       sEval.move(move[0], move[1], role);
       let [value2, move2, path2] = vct(sEval, sBoard, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
       sEval.undo(move[0], move[1]);
-      if (value < FIVE && value2 >= FIVE && move2 && path2.length > bestPath.length) {
-        let [value3, , path3] = vct(sEval, sBoard, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
-        if (path2.length <= path3.length) {
-          return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
-        }
+      // 黑 value < FIVE(未确认必胜) + 白 value2 >= FIVE(确认必胜) → 必堵。
+      // 路径比较是多余的: "黑快五"的场景(活三/活四延伸)在偶数层搜索内已确认
+      // value >= FIVE, 条件已排除; 黑未确认必胜时, 白的强制杀链必然先到。
+      if (value < FIVE && value2 >= FIVE && move2) {
+        return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
       }
     } catch (e) {
       if (e !== BUDGET) throw e;
@@ -637,6 +659,45 @@
       }
     }
     return out;
+  }
+
+  // v11.5: 一步杀扫描 —— 落子即成活四/双活三/冲四活三/双四 → 对手一步堵不完, 直接杀。
+  // 原放在 2b 内(对手活三/双威胁时才查), 且"堵对手成五"在它之前 —— 对手只有
+  // 冲四时先被迫堵棋, 漏掉必胜杀(杀棋链迫使对手全程应挡, 其冲四永远走不完)。
+  function killInOne(board, color) {
+    for (const [x, y] of nearCells(board)) {
+      const b2 = board.slice();
+      b2[idx(x, y)] = color;
+      let fourCnt = 0, threeCnt = 0, liveFour = false;
+      for (const [dx, dy] of DIRS) {
+        const l = dirThreat(b2, x, y, dx, dy, color);
+        if (l >= 4) {
+          fourCnt++;
+          // dirThreat 的 4 不区分活四/冲四 —— scanLine 精确确认活四(双开口)
+          if (l === 4) { const s = scanLine(b2, x, y, dx, dy, color); if (s.n === 4 && s.open === 2) liveFour = true; }
+        }
+        else if (l >= 3) threeCnt++;
+      }
+      // 活四 / 双四 / 冲四活三 / 双活三 → 对手一步堵不完
+      if (liveFour || fourCnt >= 2 || (fourCnt >= 1 && threeCnt >= 1) || threeCnt >= 2) {
+        return { x, y };
+      }
+    }
+    return null;
+  }
+
+  // 两个成五点是否同一活四的两端(相距 5、中间 4 子连续)。
+  // 活四下一手必胜, 己方杀来不及; 双冲四(两个独立成五点)不是一步杀,
+  // 己方一步杀先手必胜, 仍应优先杀。
+  function sameLiveFour(board, opp, a, b) {
+    const dx = Math.abs(a.x - b.x), dy = Math.abs(a.y - b.y);
+    if (!((dx === 5 && dy === 0) || (dx === 0 && dy === 5) || (dx === 5 && dy === 5))) return false;
+    const sx = dx === 0 ? 0 : (b.x - a.x) / dx;
+    const sy = dy === 0 ? 0 : (b.y - a.y) / dy;
+    for (let i = 1; i <= 4; i++) {
+      if (board[idx(a.x + sx * i, a.y + sy * i)] !== opp) return false;
+    }
+    return true;
   }
 
   // 对手"落子即成活四/冲四"的点(必要防守的候选)
@@ -860,8 +921,20 @@
     const wins = winPoints(board, color);
     if (wins.length) return wins[0];
 
-    // 2. 对手下一手成五 → 必堵(选堵点中对自己最好的)
+    // 1.5 己方一步杀优先于堵棋 —— 杀是必胜: 对手冲四只需一步堵, 堵完己方威胁
+    // 还在, 继续杀; 先堵反而把先手让出去(对手双活三也同理)。
+    // 对手活四在盘(两个成五点同一四连两端)下一手必胜, 己方杀来不及, 不在此列;
+    // 双冲四(两个独立成五点)不是一步杀, 己方杀仍成立。
     const oppWins = winPoints(board, opp);
+    if (oppWins.length <= 2) {
+      const liveFour = oppWins.length === 2 && sameLiveFour(board, opp, oppWins[0], oppWins[1]);
+      if (!liveFour) {
+        const kill = killInOne(board, color);
+        if (kill) return { x: kill.x, y: kill.y };
+      }
+    }
+
+    // 2. 对手下一手成五 → 必堵(选堵点中对自己最好的)
     if (oppWins.length) {
       let best = oppWins[0], bestScore = -Infinity;
       for (const b of oppWins) {
@@ -883,32 +956,8 @@
     const double = oppDoubleThreatPoints(board, opp);
     const line = oppLineBlocks(board, opp);
     if (urgent.length || double.length || line.length) {
-      // v11.3: 对手活三/双威胁让位于己方强制杀 —— 杀棋链迫使对手全程应挡,
-      // 其慢威胁(活三端点/双威胁点)永远走不完; 对手活四在盘(一步必杀)不在此列:
-      // 活四没有"可堵点", 2b 不触发, 直接进搜索, 由阶段 2/3 处理。
-      // v11.4: 一步杀扫描取代 VCT 预检 —— 原深度 kDepth+8=14 的 VCT 在
-      // 400ms/2 万节点内几乎必然超时(每请求白耗预算), 一步杀是 O(附近格子) 的
-      // 确定性检查: 落子即成活四/双活三/冲四活三 → 对手一步堵不完, 直接杀。
-      {
-        let kill = null;
-        for (const [x, y] of nearCells(board)) {
-          const b2 = board.slice();
-          b2[idx(x, y)] = color;
-          let fourCnt = 0, threeCnt = 0, liveFour = false;
-          for (const [dx, dy] of DIRS) {
-            const l = dirThreat(b2, x, y, dx, dy, color);
-            if (l >= 4) {
-              fourCnt++;
-              // dirThreat 的 4 不区分活四/冲四 —— 用 scanLine 精确确认活四(双开口)
-              if (l === 4) { const s = scanLine(b2, x, y, dx, dy, color); if (s.n === 4 && s.open === 2) liveFour = true; }
-            }
-            else if (l >= 3) threeCnt++;
-          }
-          // 活四 / 双四 / 冲四活三 / 双活三 → 对手一步堵不完
-          if (liveFour || fourCnt >= 2 || (fourCnt >= 1 && threeCnt >= 1) || threeCnt >= 2) { kill = { x, y }; break; }
-        }
-        if (kill) return { x: kill.x, y: kill.y };
-      }
+      // v11.5: 一步杀已在 1.5 优先处理(对手无活四时无条件查) ——
+      // 到这里仍是"该堵"(说明己方无一步杀或对手活四在盘)。
       const cands = [...urgent, ...double, ...line];
       // 紧迫度: 对手活三/四(必堵) > 对手双威胁 > 己方活四机会 > 聚子
       // v8 修正: 堵对手活三的端点必须优先于己方活四机会 ——
