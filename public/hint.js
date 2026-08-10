@@ -132,7 +132,7 @@
     switch (shape) {
       case SH.FIVE: return FIVE; // v11.2: 成五点按满值计 —— 修复 FIVE 阈值不可达(原返回 FOUR=1e5, 永远够不到 1e7 获胜判定)
       case SH.BLOCK_FIVE: return BLOCK_FOUR;
-      case SH.FOUR: return THREE;
+      case SH.FOUR: return FOUR; // v11.4: 活四点按 100000 计 —— 原返回 THREE(1000), 活四比双三(20000)还低 20 倍
       case SH.FOUR_FOUR: return THREE;
       case SH.FOUR_THREE: return THREE;
       case SH.BLOCK_FOUR: return BLOCK_THREE;
@@ -169,7 +169,8 @@
         total += shapeScore(sh);
       }
       // 复合棋形: 双四/冲四活三/双三/双活二
-      if (fourCnt >= 2 || (fourCnt && blockFourCnt >= 2)) {
+      // v11.4: 活四+1 冲四也算双四(对手一步堵不完), 与 getValuableMoves 分类一致
+      if (fourCnt >= 2 || (fourCnt && blockFourCnt >= 1)) {
         // 双冲四或活四+冲四 → 极高
         total += FOUR_FOUR * 0.6;
       } else if (blockFourCnt >= 2) {
@@ -381,7 +382,10 @@
   function makeMinmax(onlyThree = false, onlyFour = false) {
     // 杀手走法表: killers[深度][0/1] —— 记录剪枝成功的走法, 同深度优先试
     const killers = [];
-    return function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove, bestSlot) {
+    // v11.4: 跨请求重置 —— worker 缓存引擎模块, killers 不重置会把上一请求的
+    // 剪枝记录泄漏进下一请求的走法排序, 预算截断时结果随请求历史漂移。
+    function resetKillers() { killers.length = 0; }
+    function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove, bestSlot) {
       if (++budget.nodes > budget.maxNodes) throw BUDGET;
       if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
 
@@ -473,9 +477,11 @@
           bestPath = iterPath;
           bestDepth = iterDepth;
           // v11.2: budget.best 只从根层写入 —— 预算超时时返回部分搜索结果
-          // v11.3 (gobang V3): 非胜值只在最终迭代提交 —— 中间迭代(如 d=2)的"没输"是假象,
-          // 预算耗尽宁回退启发式也不拿浅层乐观值当结果。
-          if (bestSlot && cDepth === 0 && (d === depth || iterBest >= FIVE) &&
+          // v11.3 (gobang V3): VCT 变体(onlyThree)非胜值只在最终迭代提交 ——
+          // 浅层"没杀"证明不了任何事; v11.4: 常规变体逐迭代写入 —— 浅层完整
+          // 迭代(d=2/4)结果远好于纯启发式, 最终迭代超时也有真结果可用,
+          // 不再整个搜索白跑后退化回启发式。
+          if (bestSlot && cDepth === 0 && (!onlyThree || d === depth || iterBest >= FIVE) &&
               (!bestSlot.best || iterBest > bestSlot.best.value ||
                (iterBest <= -FIVE && bestSlot.best.value <= -FIVE && iterPath.length > bestSlot.best.depth))) {
             bestSlot.best = { value: iterBest, move: iterMove, path: iterPath, depth: iterPath.length };
@@ -496,12 +502,13 @@
         });
       }
       return [value, move, bestPath];
-    };
+    }
+    helper.resetKillers = resetKillers;
+    return helper;
   }
 
   const _minmax = makeMinmax();
   const vct = makeMinmax(true);
-  const vcf = makeMinmax(false, true);
 
   // 主搜索: VCT 找杀 → 常规 minmax → 防守校验(对方杀棋路径是否变长)
   // v8: 常规深度 6(动态深度降级后深层只搜威胁, 分支可控),
@@ -516,10 +523,16 @@
     const vctDepth = depth + 8;
 
     // 阶段 1: VCT 找杀(预算 35%)
+    // v11.4: 各阶段用独立 evaluator 副本 —— BUDGET 超时是异常抛出, 搜索树上
+    // move/undo 不平衡, 共享 evaluator 会让下一阶段在残留棋子上搜索,
+    // 误判假五连/假分数, 结果随超时点漂移(同一棋盘每次不同)。
     const b1 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35), t0: performance.now(), maxMs: budget.maxMs * 0.35 };
     let value, move, bestPath;
     try {
-      [value, move, bestPath] = vct(evaluator, board, role, vctDepth, 0, [], -MAX, MAX, b1, cache, lastMove, budget);
+      const vBoard = board.slice();
+      const vctEval = createEvaluator(vBoard);
+      vctEval.init();
+      [value, move, bestPath] = vct(vctEval, vBoard, role, vctDepth, 0, [], -MAX, MAX, b1, cache, lastMove, budget);
       if (value >= FIVE && move) return { move, value, path: bestPath };
     } catch (e) {
       if (e !== BUDGET) throw e;
@@ -529,7 +542,10 @@
     // 阶段 2: 常规 minmax(预算 40%)
     const b2 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.4), t0: performance.now(), maxMs: budget.maxMs * 0.4 };
     try {
-      [value, move, bestPath] = _minmax(evaluator, board, role, depth, 0, [], -MAX, MAX, b2, cache, lastMove, budget);
+      const mBoard = board.slice();
+      const minEval = createEvaluator(mBoard);
+      minEval.init();
+      [value, move, bestPath] = _minmax(minEval, mBoard, role, depth, 0, [], -MAX, MAX, b2, cache, lastMove, budget);
     } catch (e) {
       if (e !== BUDGET) throw e;
     }
@@ -538,11 +554,14 @@
     // 阶段 3: 防守校验(预算 25%)
     const b3 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25), t0: performance.now(), maxMs: budget.maxMs * 0.25 };
     try {
-      evaluator.move(move[0], move[1], role);
-      let [value2, move2, path2] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
-      evaluator.undo(move[0], move[1]);
+      const sBoard = board.slice();
+      const sEval = createEvaluator(sBoard);
+      sEval.init();
+      sEval.move(move[0], move[1], role);
+      let [value2, move2, path2] = vct(sEval, sBoard, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
+      sEval.undo(move[0], move[1]);
       if (value < FIVE && value2 >= FIVE && move2 && path2.length > bestPath.length) {
-        let [value3, , path3] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
+        let [value3, , path3] = vct(sEval, sBoard, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
         if (path2.length <= path3.length) {
           return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
         }
@@ -647,19 +666,6 @@
     return pts;
   }
 
-  // 对手"落子即成跳四/冲四"的点(跳三缺口) —— 次紧急
-  function oppRushFourPoints(board, opp) {
-    const pts = new Set();
-    for (const [x, y] of nearCells(board)) {
-      for (const [dx, dy] of DIRS) {
-        const s = scanLine(board, x, y, dx, dy, opp);
-        if (s.n === 4 && s.open >= 1) { pts.add(y * SIZE + x); break; }
-        if (s.n === 3 && s.jump >= 1 && s.open >= 1) { pts.add(y * SIZE + x); break; }
-      }
-    }
-    return [...pts].map((i) => ({ x: i % SIZE, y: Math.floor(i / SIZE) }));
-  }
-
   // 对手同线聚子(连续 3 子) → 堵端点防成杀
   function oppLineBlocks(board, opp) {
     const blocks = new Set();
@@ -674,6 +680,10 @@
           if (n < 3) continue;
           const o1 = inB(x - dx, y - dy) && board[idx(x - dx, y - dy)] === EMPTY;
           const o2 = inB(cx, cy) && board[idx(cx, cy)] === EMPTY;
+          // v11.4: 眠三(单开口)端点不再硬性必堵 —— 不堵不会立刻输, 却会把 2b
+          // 提前截断, 让引擎只顾防守放弃进攻(搜索被架空)。保留活三(双开口)
+          // 与冲四/活四(n=4)端点 —— 这两类不堵就输。
+          if (n === 3 && !(o1 && o2)) continue;
           if (o1) blocks.add((y - dy) * SIZE + (x - dx));
           if (o2) blocks.add(cy * SIZE + cx);
         }
@@ -839,6 +849,10 @@
   // v11: opts.skipHardRules —— 深度版跳过可选反推(2c)直接深搜
   // v11.2: 硬性防守(2b)无条件执行, 深度版只跳过反推启发式
   function computeBest(board, color, opts) {
+    // v11.4: 跨请求重置杀手走法表 —— 引擎模块在 worker 里被缓存复用,
+    // killers 不重置会让结果依赖请求历史(同一棋盘不同答案)。
+    vct.resetKillers();
+    _minmax.resetKillers();
     const skipHard = opts && opts.skipHardRules === true;
     const opp = other(color);
 
@@ -872,21 +886,28 @@
       // v11.3: 对手活三/双威胁让位于己方强制杀 —— 杀棋链迫使对手全程应挡,
       // 其慢威胁(活三端点/双威胁点)永远走不完; 对手活四在盘(一步必杀)不在此列:
       // 活四没有"可堵点", 2b 不触发, 直接进搜索, 由阶段 2/3 处理。
-      // 预算: 查杀链是窄树(~1000 节点/400ms, 沙箱解释执行), 超时走原堵点逻辑。
+      // v11.4: 一步杀扫描取代 VCT 预检 —— 原深度 kDepth+8=14 的 VCT 在
+      // 400ms/2 万节点内几乎必然超时(每请求白耗预算), 一步杀是 O(附近格子) 的
+      // 确定性检查: 落子即成活四/双活三/冲四活三 → 对手一步堵不完, 直接杀。
       {
-        let sc = 0;
-        for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) sc++;
-        const kDepth = sc < 8 ? 2 : (sc > 190 ? 4 : 6);
-        const kBoard = board.slice();
-        const kEval = createEvaluator(kBoard);
-        kEval.init();
-        const kb = { nodes: 0, maxNodes: 20000, t0: performance.now(), maxMs: 400 };
-        try {
-          const [kval, kmove] = vct(kEval, kBoard, color, kDepth + 8, 0, [], -MAX, MAX, kb, new Map(), null, null);
-          if (kval >= FIVE && kmove) return { x: kmove[0], y: kmove[1] };
-        } catch (e) {
-          if (e !== BUDGET) throw e;
+        let kill = null;
+        for (const [x, y] of nearCells(board)) {
+          const b2 = board.slice();
+          b2[idx(x, y)] = color;
+          let fourCnt = 0, threeCnt = 0, liveFour = false;
+          for (const [dx, dy] of DIRS) {
+            const l = dirThreat(b2, x, y, dx, dy, color);
+            if (l >= 4) {
+              fourCnt++;
+              // dirThreat 的 4 不区分活四/冲四 —— 用 scanLine 精确确认活四(双开口)
+              if (l === 4) { const s = scanLine(b2, x, y, dx, dy, color); if (s.n === 4 && s.open === 2) liveFour = true; }
+            }
+            else if (l >= 3) threeCnt++;
+          }
+          // 活四 / 双四 / 冲四活三 / 双活三 → 对手一步堵不完
+          if (liveFour || fourCnt >= 2 || (fourCnt >= 1 && threeCnt >= 1) || threeCnt >= 2) { kill = { x, y }; break; }
         }
+        if (kill) return { x: kill.x, y: kill.y };
       }
       const cands = [...urgent, ...double, ...line];
       // 紧迫度: 对手活三/四(必堵) > 对手双威胁 > 己方活四机会 > 聚子

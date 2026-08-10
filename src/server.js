@@ -37,6 +37,21 @@ const ROOM_TTL = 30 * 24 * 60 * 60 * 1000; // 30 天无活动的房间清理掉
 
 const store = new Store(DATA_FILE);
 
+// ---------- 对局落子日志 ----------
+// 每局全部落子追加到 data/games/<roomId>.jsonl —— 重开/悔棋不会覆盖历史,
+// 对局结束后可完整复盘 (review-game.js)。行: { ts, type: move|new-game|undo|end, ... }
+const GAME_LOG_DIR = path.join(__dirname, '..', 'data', 'games');
+function logGameEvent(roomId, ev) {
+  try {
+    fs.mkdirSync(GAME_LOG_DIR, { recursive: true });
+    const safe = String(roomId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    fs.appendFileSync(path.join(GAME_LOG_DIR, safe + '.jsonl'),
+      JSON.stringify({ ts: Date.now(), roomId, ...ev }) + '\n');
+  } catch (e) {
+    console.error('[server] 落子日志失败:', e.message);
+  }
+}
+
 // 特权白名单 —— 仅 HINT_TOKEN 环境变量中列出的 token 能看到 AI 提示按钮
 // (你专用, 从环境变量注入, 代码里不写死)
 const PRIVILEGED_TOKENS = new Set(
@@ -93,7 +108,8 @@ const MIME = {
 
 import { Worker } from 'node:worker_threads';
 
-const HINT_WORKER_COUNT = 2; // 2 个 worker: 一个常驻普通, 一个深度(避免互抢)
+const HINT_WORKER_COUNT = 4; // 4 个 worker 分担并发; 深度档单请求 5-15s, 太少会积压
+const QUEUE_TIMEOUT_MS = 10000; // 排队超过 10s 直接放弃(返回"引擎忙")—— 排队几分钟的响应早已过时
 const hintWorkers = []; // { worker, busy, queue }
 
 function spawnHintWorker() {
@@ -104,7 +120,7 @@ function spawnHintWorker() {
   worker.on('message', (m) => {
     const q = entry.queue.shift();
     entry.busy = false;
-    if (q) q.resolve(m);
+    if (q) { clearTimeout(q.timer); q.resolve(m); }
     else processHintQueue(entry);
   });
   worker.on('error', (e) => respawnHintWorker(entry, `错误: ${e.message}`));
@@ -117,7 +133,7 @@ function spawnHintWorker() {
 // 崩 2 次后 /hint 全部 500)
 function respawnHintWorker(entry, reason) {
   console.error(`[hint] worker ${reason}: 重建中`);
-  for (const q of entry.queue) q.reject(new Error('引擎不可用'));
+  for (const q of entry.queue) { clearTimeout(q.timer); q.reject(new Error('引擎不可用')); }
   entry.queue = [];
   const i = hintWorkers.indexOf(entry);
   if (i < 0) return; // 已处理过(error 与 exit 可能先后触发)
@@ -136,10 +152,19 @@ function processHintQueue(entry) {
 
 function requestHint(board, color, deep) {
   return new Promise((resolve, reject) => {
-    // 深度请求优先找空闲的深度 worker; 否则轮询
+    // 深度请求优先找空闲的 worker; 否则轮询第一个
     const entry = hintWorkers.find((w) => !w.busy && w.queue.length === 0) || hintWorkers[0];
     const id = Math.random().toString(36).slice(2);
-    entry.queue.push({ id, board, color, deep, resolve, reject });
+    const q = { id, board, color, deep, resolve, reject, timer: null };
+    // 排队看门狗: 积压太久响应早已过时, 放弃比无限等更有用
+    q.timer = setTimeout(() => {
+      const i = entry.queue.indexOf(q);
+      if (i < 0) return; // 已被 worker 取走, 正常处理中
+      entry.queue.splice(i, 1);
+      console.log(`[hint] 排队超时: id=${id} 放弃 (队列还有 ${entry.queue.length} 个)`);
+      reject(new Error('引擎忙, 请稍后再试'));
+    }, QUEUE_TIMEOUT_MS);
+    entry.queue.push(q);
     processHintQueue(entry);
   });
 }
@@ -426,6 +451,13 @@ function handleMessage(ws, msg) {
       const r = tryMove(room, ws.token, msg.x, msg.y);
       if (!r.ok) return send(ws, 'error', { error: r.error });
       store.markDirty();
+      logGameEvent(room.id, {
+        type: 'move', n: room.moves.length,
+        color: colorOf(room, ws.token), x: msg.x, y: msg.y,
+      });
+      if (room.status === 'won') {
+        logGameEvent(room.id, { type: 'end', winner: room.winner, winLine: room.winLine });
+      }
       broadcastState(ws.roomId, { event: 'move', at: { x: msg.x, y: msg.y } });
       break;
     }
@@ -442,6 +474,7 @@ function handleMessage(ws, msg) {
       const r = resolveUndo(room, ws.token, !!msg.accept);
       if (!r.ok) return send(ws, 'error', { error: r.error });
       store.markDirty();
+      if (r.accepted) logGameEvent(room.id, { type: 'undo', by: r.by, n: r.undone });
       broadcastState(ws.roomId, {
         event: r.accepted ? 'undo-accepted' : 'undo-rejected',
       });
@@ -462,6 +495,7 @@ function handleMessage(ws, msg) {
         }
       }
       room.newGameVotes = {};
+      logGameEvent(room.id, { type: 'new-game' }); // 分段标记: 复盘脚本据此切局
       newGame(room);
       store.markDirty();
       broadcastState(ws.roomId, { event: 'new-game' });
@@ -490,6 +524,7 @@ function handleMessage(ws, msg) {
       room.winner = room.turn === 1 ? 2 : 1;
       room.winLine = null;
       room.updatedAt = Date.now();
+      logGameEvent(room.id, { type: 'end', winner: room.winner, winLine: null, reason: 'timeout' });
       store.markDirty();
       broadcastState(ws.roomId, { event: 'timeout' });
       break;
