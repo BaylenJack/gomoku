@@ -122,7 +122,7 @@
   // 棋形 → 落子潜力分 (当前点未落子的得分)
   function shapeScore(shape) {
     switch (shape) {
-      case SH.FIVE: return FOUR;
+      case SH.FIVE: return FIVE; // v11.2: 成五点按满值计 —— 修复 FIVE 阈值不可达(原返回 FOUR=1e5, 永远够不到 1e7 获胜判定)
       case SH.BLOCK_FIVE: return BLOCK_FOUR;
       case SH.FOUR: return THREE;
       case SH.FOUR_FOUR: return THREE;
@@ -143,6 +143,7 @@
     const N = SIZE, NN = N * N;
     const scores = [new Float64Array(NN), new Float64Array(NN)];
     const shapeCache = [new Int8Array(NN * 4), new Int8Array(NN * 4)];
+    const fiveCnt = [0, 0]; // v11.2: 各色盘面实际五连数 —— 增量维护, evaluate 直接判胜负
 
     function updatePoint(x, y, role) {
       const rIdx = role - 1;
@@ -198,16 +199,26 @@
       },
       move(x, y, role) {
         board[idx(x, y)] = role;
+        if (winsAfter(board, x, y, role)) fiveCnt[role - 1]++;
         refresh(x, y);
       },
       undo(x, y) {
+        const role = board[idx(x, y)];
+        if (role !== EMPTY && winsAfter(board, x, y, role)) fiveCnt[role - 1]--;
         board[idx(x, y)] = EMPTY;
         refresh(x, y);
       },
       evaluate(role) {
         const rIdx = role - 1, oIdx = 1 - rIdx;
+        // v11.2: 盘面已有成五 → 直接判胜负(搜索的获胜判定必须真实可达)
+        if (fiveCnt[rIdx]) return FIVE;
+        if (fiveCnt[oIdx]) return -FIVE;
         let s = 0;
-        for (let i = 0; i < NN; i++) s += scores[rIdx][i] - scores[oIdx][i];
+        // v11.2: 跳过已占据格子 —— 原实现把残留的"空位潜力分"也计入(陈旧分数)
+        for (let i = 0; i < NN; i++) {
+          if (board[i] !== EMPTY) continue;
+          s += scores[rIdx][i] - scores[oIdx][i];
+        }
         return s;
       },
       shapeAt(x, y, d, role) { return shapeCache[role - 1][idx(x, y) * 4 + d]; },
@@ -347,7 +358,7 @@
   function makeMinmax(onlyThree = false, onlyFour = false) {
     // 杀手走法表: killers[深度][0/1] —— 记录剪枝成功的走法, 同深度优先试
     const killers = [];
-    return function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove) {
+    return function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove, bestSlot) {
       if (++budget.nodes > budget.maxNodes) throw BUDGET;
       if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
 
@@ -396,28 +407,26 @@
       let bestPath = path;
       let bestDepth = 0;
 
+      // v11.2: 迭代加深 —— 每轮迭代记录"该深度最优", 迭代结束时提交, 更深迭代优先。
+      // (v11 回归: 每层每步直接覆盖, 浅层 d=2 的乐观值永远压住深层准确值, 有效深度≈2)
       for (let d = cDepth + 1; d <= depth; d += 1) {
         if (d % 2 !== 0) continue; // 迭代加深只搜偶数层(己方能赢的解)
+        let iterBest = -MAX, iterMove = null, iterPath = path, iterDepth = 0;
         let breakAll = false;
         for (const [x, y] of points) {
           evaluator.move(x, y, role);
           const newPath = [...path, [x, y]];
-          let [cv, , cp] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y]);
+          let [cv, , cp] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
           cv = -cv;
           evaluator.undo(x, y);
 
-          // v11: 每层每个走法都更新 best(不只是胜或到底) —— 超时也有可用结果
-          if (cv > value || (cv <= -FIVE && value <= -FIVE && cp.length > bestDepth)) {
-            value = cv;
-            move = [x, y];
-            bestPath = cp;
-            bestDepth = cp.length;
-            if (budget && (!budget.best || cv > budget.best.value ||
-                (cv <= -FIVE && budget.best.value <= -FIVE && cp.length > budget.best.depth))) {
-              budget.best = { value: cv, move: [x, y], path: cp, depth: cp.length };
-            }
+          if (cv > iterBest || (cv <= -FIVE && iterBest <= -FIVE && cp.length > iterDepth)) {
+            iterBest = cv;
+            iterMove = [x, y];
+            iterPath = cp;
+            iterDepth = cp.length;
           }
-          alpha = Math.max(alpha, value);
+          alpha = Math.max(alpha, iterBest);
           // v10: Alpha-Beta 剪枝命中 → 记录杀手走法(PentaZen update_killers)
           if (alpha >= beta) {
             if (!killers[cDepth]) killers[cDepth] = [null, null];
@@ -428,6 +437,19 @@
             break;
           }
           if (alpha >= FIVE) { breakAll = true; break; } // 自己赢了就结束
+        }
+        // 迭代结束提交: 更深迭代(更准确)的结果优先, 覆盖浅层
+        if (iterMove !== null) {
+          value = iterBest;
+          move = iterMove;
+          bestPath = iterPath;
+          bestDepth = iterDepth;
+          // v11.2: budget.best 只从根层写入 —— 预算超时时返回部分搜索结果
+          if (bestSlot && cDepth === 0 &&
+              (!bestSlot.best || iterBest > bestSlot.best.value ||
+               (iterBest <= -FIVE && bestSlot.best.value <= -FIVE && iterPath.length > bestSlot.best.depth))) {
+            bestSlot.best = { value: iterBest, move: iterMove, path: iterPath, depth: iterPath.length };
+          }
         }
         if (breakAll) break;
       }
@@ -455,30 +477,48 @@
   // v8: 常规深度 6(动态深度降级后深层只搜威胁, 分支可控),
   // VCT 深度 14(gobang depth+8 的加强版)。
   // v8.1: 各阶段独立预算 —— 共享预算会让防守校验的 VCT 饿死 minmax。
+  // v11.2: 各阶段独立 t0(阶段开始时起算) —— 原来共享 computeBest 的 t0,
+  // 阶段 3 实际可用时间 ≈ 25%T − 前面耗时, 基本从不执行(被饿死)。
+  // v11.2: 阶段 1 的 BUDGET 用 try/catch 消化 —— 原来直接穿透杀死阶段 2/3。
+  // v11.2: bestSlot = 外层 budget —— 各阶段根层搜索结果写入同一槽, 超时能回取。
   function minmaxSearch(evaluator, board, role, depth, budget, lastMove) {
     const cache = new Map();
     const vctDepth = depth + 8;
 
     // 阶段 1: VCT 找杀(预算 35%)
-    const b1 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35), t0: budget.t0, maxMs: budget.maxMs * 0.35 };
-    let [value, move, bestPath] = vct(evaluator, board, role, vctDepth, 0, [], -MAX, MAX, b1, cache, lastMove);
-    if (value >= FIVE && move) return { move, value, path: bestPath };
+    const b1 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35), t0: performance.now(), maxMs: budget.maxMs * 0.35 };
+    let value, move, bestPath;
+    try {
+      [value, move, bestPath] = vct(evaluator, board, role, vctDepth, 0, [], -MAX, MAX, b1, cache, lastMove, budget);
+      if (value >= FIVE && move) return { move, value, path: bestPath };
+    } catch (e) {
+      if (e !== BUDGET) throw e;
+      // 阶段 1 超时: 保留已搜到的部分结果, 继续阶段 2
+    }
 
     // 阶段 2: 常规 minmax(预算 40%)
-    const b2 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.4), t0: budget.t0, maxMs: budget.maxMs * 0.4 };
-    [value, move, bestPath] = _minmax(evaluator, board, role, depth, 0, [], -MAX, MAX, b2, cache, lastMove);
+    const b2 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.4), t0: performance.now(), maxMs: budget.maxMs * 0.4 };
+    try {
+      [value, move, bestPath] = _minmax(evaluator, board, role, depth, 0, [], -MAX, MAX, b2, cache, lastMove, budget);
+    } catch (e) {
+      if (e !== BUDGET) throw e;
+    }
     if (!move) return null;
 
     // 阶段 3: 防守校验(预算 25%)
-    const b3 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25), t0: budget.t0, maxMs: budget.maxMs * 0.25 };
-    evaluator.move(move[0], move[1], role);
-    let [value2, move2, path2] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
-    evaluator.undo(move[0], move[1]);
-    if (value < FIVE && value2 >= FIVE && move2 && path2.length > bestPath.length) {
-      let [value3, , path3] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
-      if (path2.length <= path3.length) {
-        return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
+    const b3 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25), t0: performance.now(), maxMs: budget.maxMs * 0.25 };
+    try {
+      evaluator.move(move[0], move[1], role);
+      let [value2, move2, path2] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
+      evaluator.undo(move[0], move[1]);
+      if (value < FIVE && value2 >= FIVE && move2 && path2.length > bestPath.length) {
+        let [value3, , path3] = vct(evaluator, board, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
+        if (path2.length <= path3.length) {
+          return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
+        }
       }
+    } catch (e) {
+      if (e !== BUDGET) throw e;
     }
     return { move, value, path: bestPath };
   }
@@ -766,8 +806,8 @@
    * @param {number} color BLACK=1 | WHITE=2
    * @returns {{x:number, y:number}}
    */
-  // v11: opts.skipHardRules —— 深度版跳过硬性规则直接深搜
-  // (普通版保留规则秒答, 深度版用满预算算透威胁)
+  // v11: opts.skipHardRules —— 深度版跳过可选反推(2c)直接深搜
+  // v11.2: 硬性防守(2b)无条件执行, 深度版只跳过反推启发式
   function computeBest(board, color, opts) {
     const skipHard = opts && opts.skipHardRules === true;
     const opp = other(color);
@@ -791,8 +831,8 @@
 
     // 2b. 硬性防守: 对手落子即成活四/双威胁的点 → 必堵或抢占
     // (搜索会算到这些威胁, 但硬性规则更快更稳, 且搜索预算有限)
-    // v11: 深度版(skipHardRules)跳过硬性防守, 用深搜算透威胁后续
-    if (!skipHard) {
+    // v11.2: 硬性防守无条件执行 —— 这些检查是 O(附近格子) 的, 不耗搜索预算;
+    // 深度档(skipHardRules)只跳过 2c 的可选反推, 防守底线不降级。
     // v7: 跳三缺口(非活四)不再硬性必堵 —— 交给搜索评估。
     // gobang_AI 攻防系数 0.1: 下棋优先于堵棋, 跳三可晚一步堵。
     const urgent = oppOpenFourPoints(board, opp);
@@ -839,17 +879,18 @@
 
     // 2c. 一步反推防守 (mumuy gobang 法):
     // 对手下步最优点如果威胁远超我方可选点 → 直接抢对手的点
-    // (堵"潜在双威胁"比搜索更直接 —— 搜索预算内未必看到这个点)
-    const myBest = bestByEval(board, color);
-    const oppBest = bestByEval(board, opp);
-    if (oppBest.score > myBest.score + 4000 && oppBest.score !== -Infinity) {
-      return { x: oppBest.x, y: oppBest.y };
-    }
-    // 启发式已找到双活三/冲四活三级大招 → 直接采用, 不再进浅搜(浅搜会低估兑现价值)
-    if (myBest.score > 5e6 && myBest.score !== -Infinity) {
-      return { x: myBest.x, y: myBest.y };
-    }
-    } // end skipHard
+    // (堵"潜在双威胁"比搜索更直接 —— 普通档预算小, 搜索内未必看到这个点)
+    // v11.2: 深度档(skipHardRules)跳过 —— 深度档用满预算深算, 反推只信搜索结论
+    if (!skipHard) {
+      const myBest = bestByEval(board, color);
+      const oppBest = bestByEval(board, opp);
+      if (oppBest.score > myBest.score + 4000 && oppBest.score !== -Infinity) {
+        return { x: oppBest.x, y: oppBest.y };
+      }
+    } // end skipHard(2c)
+    // v11.2: 删除 5e6 启发式提前返回 —— 打分尺度下普通活三就超 5e6,
+    // 该分支让 111 局面中 101 个 <30ms 直接返回, 搜索几乎从不运行,
+    // 也看不见对手的 2-4 步强杀序列。双活三/冲四活三的采纳交给修复后的搜索。
 
     // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
     // v9: Web Worker 后台跑 — 预算 3 秒 / 80 万节点, 深度中盘 8。
@@ -899,9 +940,9 @@
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
     } catch (e) {
       if (e !== BUDGET) throw e;
-      // v11: 预算超时但已有部分搜索 best → 用它(而非直接跳启发式)
-      if (budget.best && budget.best.move) return { x: budget.best.move[0], y: budget.best.move[1] };
     }
+    // v11.2: 预算耗尽(阶段超时)或搜索无果, 但已有部分搜索结果 → 用它, 而非纯启发式
+    if (budget.best && budget.best.move) return { x: budget.best.move[0], y: budget.best.move[1] };
 
     // 4. 启发式保底(做棋/防守, 预算超时或搜索无结果)
     return heuristicBest(board, color);

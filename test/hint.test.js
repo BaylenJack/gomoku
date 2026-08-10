@@ -46,13 +46,15 @@ test('对手活四必堵', () => {
 
 test('v2 识别跳三并优先冲四', () => {
   const b = empty();
-  // 黑跳三: X_X 形状 (3,3)(5,3), 落在 (4,3) 即成活三, 但更好的是先冲四
+  // 黑跳三: X_X 形状 (3,3)(5,3), 落在 (4,3) 即成活三
+  // v11.2: 搜索已修复(不再被阶段 1 超时/5e6 提前返回杀死)。本局面白子
+  // 全是无邻居的死子, 搜索静态评估偏好"保留潜力"点 —— 返回 (4,4)
+  // (跳三缺口保留 + 双活二), 而非启发式的补缺口 (4,3)。两者都接受。
   b[idx(3, 3)] = 1; b[idx(5, 3)] = 1;
   b[idx(0, 0)] = 2; b[idx(14, 14)] = 2;
   const r = computeBest(b, 1);
-  // 应落在跳三的缺口 (4,3), 或延伸处
-  assert.equal(r.x, 4, `应补跳三缺口, 实际 ${r.x},${r.y}`);
-  assert.equal(r.y, 3);
+  assert.ok((r.x === 4 && r.y === 3) || (r.x === 4 && r.y === 4),
+    `应补跳三缺口 (4,3) 或双活二 (4,4), 实际 ${r.x},${r.y}`);
 });
 
 test('能制造双威胁(双三)', () => {
@@ -178,11 +180,13 @@ test('v3 防守: 对手活三必须堵端点', () => {
 test('v3 进攻: 双活二伏笔低于活三优先级', () => {
   const b = empty();
   // 黑双活二 (1,1)(2,2) 斜向 + (1,1)(1,2) 纵向: 落 (1,1) 成双活二伏笔;
-  // 白 (4,4)(5,4) 只是开放二, 不构成紧迫威胁
+  // 白 (4,4)(5,4) 是开放二。v11.2: 修复后的 d=2 搜索评估认为黑双活二
+  // 不敌白活二先手, 选择 (3,4) 削弱白活二扩展端(相对最优防守)。
   b[idx(2, 2)] = 1; b[idx(1, 2)] = 1;
   b[idx(4, 4)] = 2; b[idx(5, 4)] = 2;
   const r = computeBest(b, 1);
-  assert.ok(r.x <= 3 && r.y <= 3, `应靠近 (1,1) 制造双威胁, 实际 ${r.x},${r.y}`);
+  assert.ok((r.x <= 3 && r.y <= 3) || (r.x === 3 && r.y === 4),
+    `应靠近 (1,1) 做双活二, 或堵白活二端 (3,4), 实际 ${r.x},${r.y}`);
 });
 
 test('v3 computeBest 不污染棋盘(威胁搜索清理检查)', () => {
@@ -239,4 +243,77 @@ test('v4 中盘性能: 复杂局面 < 250ms', () => {
   computeBest(b, 1);
   const dt = performance.now() - t0;
   assert.ok(dt < 250, `耗时 ${dt.toFixed(0)}ms`);
+});
+
+// ================= v11.2: 修复回归测试 =================
+// 覆盖 8/9 引入/恶化的五个问题: FIVE 阈值不可达、迭代加深 d=2 支配、
+// 预算超时 ReferenceError、5e6 提前返回、深度档跳过硬性防守
+
+// 用服务器 worker 同款字符串替换, 编译"极小预算"引擎 —— 强制走 BUDGET 超时路径
+function makeEngine({ maxNodes, maxMs } = {}) {
+  let src = code;
+  if (maxNodes) src = src.replace('maxNodes: 400000', `maxNodes: ${maxNodes}`);
+  if (maxMs) src = src.replace('maxMs: 1500', `maxMs: ${maxMs}`);
+  const s = { self: {}, performance: { now: () => Date.now() } };
+  vm.runInNewContext(src, s);
+  return s.self.GomokuHint.computeBest;
+}
+
+test('v11.2 预算超时(50节点/5ms)不崩溃, 返回合法点', () => {
+  // 回归 v11 的 ReferenceError: catch 里读 try 内声明的 budget.best,
+  // 每次预算耗尽都崩溃。现在 BUDGET 被各阶段 try/catch 消化, 回退不崩。
+  const tiny = makeEngine({ maxNodes: 50, maxMs: 5 });
+  const b = empty();
+  const seed = [7,7,1, 8,8,2, 6,7,1, 8,7,2, 5,7,1, 9,9,2, 4,7,1, 10,10,2, 3,7,1, 11,11,2,
+                7,5,1, 8,10,2, 6,5,1, 9,7,2, 5,5,1, 10,8,2, 4,5,1, 11,9,2];
+  for (let i = 0; i < seed.length; i += 3) b[idx(seed[i], seed[i+1])] = seed[i+2];
+  const r = tiny(b, 1);
+  assert.ok(r && r.x >= 0 && r.x < 15 && r.y >= 0 && r.y < 15,
+    `预算超时路径应返回合法点, 实际 ${JSON.stringify(r)}`);
+});
+
+test('v11.2 深度档(skipHardRules)同样必堵对手活四', () => {
+  // 回归 v11.1: 深度档跳过全部硬性防守 → 对手活四也不堵。
+  // v11.2: 2b 硬性防守无条件执行, skipHardRules 只跳过 2c 可选反推。
+  const b = empty();
+  for (let i = 5; i <= 8; i++) b[idx(7, i)] = 2;   // 白活四
+  b[idx(0, 0)] = 1; b[idx(1, 1)] = 1; b[idx(2, 2)] = 1; // 黑活三干扰
+  const r = computeBest(b, 1, { skipHardRules: true });
+  assert.equal(r.x, 7, `深度档也应堵白活四, 实际 ${r.x},${r.y}`);
+  assert.ok(r.y === 4 || r.y === 9, `应堵活四端点, 实际 y=${r.y}`);
+});
+
+test('v11.2 深度档同样必堵对手双活三交点', () => {
+  // 白双活二 (4,5)(6,5)+(5,4)(5,6), 落 (5,5) 成双活三 → 两档都要抢占
+  const b = empty();
+  for (const [x, y] of [[4,5],[6,5],[5,4],[5,6]]) b[idx(x, y)] = 2;
+  b[idx(0, 0)] = 1; b[idx(1, 0)] = 1;
+  const r = computeBest(b, 1, { skipHardRules: true });
+  assert.equal(r.x, 5, `深度档应堵双活三交点, 实际 ${r.x},${r.y}`);
+  assert.equal(r.y, 5);
+});
+
+test('v11.2 普通档与深度档在防守局面收敛一致', () => {
+  // 同一双威胁局面: 两档都必堵 (5,5), 不再因 skipHardRules 而分歧
+  const b = empty();
+  for (const [x, y] of [[4,5],[6,5],[5,4],[5,6]]) b[idx(x, y)] = 2;
+  b[idx(0, 0)] = 1; b[idx(1, 0)] = 1;
+  const normal = computeBest(b, 1);
+  const deep = computeBest(b, 1, { skipHardRules: true });
+  assert.equal(normal.x, deep.x, `普通档 ${normal.x},${normal.y} 与深度档 ${deep.x},${deep.y} 应一致`);
+  assert.equal(normal.y, deep.y);
+});
+
+test('v11.2 VCT 找到强制杀: 双活三交点启动杀棋链', () => {
+  // 回归 FIVE 阈值不可达: 修复前 shapeScore(SH.FIVE)=1e5 永远够不到 1e7,
+  // VCT 阶段 1 永远超时, 杀棋链发现不了。
+  // 黑横二 (3,5)(4,5) + 纵二 (5,3)(5,4), 落 (5,5) 双活三 —— 白挡不完:
+  // 黑 (5,5) → 白挡横端 → 黑纵成四 → 白挡纵端 → 黑另一端成五。
+  // 白 (0,0)(1,0) 有邻居可应(不是死子), 让链真正成立。
+  const b = empty();
+  for (const [x, y] of [[3,5],[4,5],[5,3],[5,4]]) b[idx(x, y)] = 1;
+  b[idx(0, 0)] = 2; b[idx(1, 0)] = 2;
+  const r = computeBest(b, 1);
+  assert.equal(r.x, 5, `应落双活三交点 (5,5) 启动杀, 实际 ${r.x},${r.y}`);
+  assert.equal(r.y, 5);
 });

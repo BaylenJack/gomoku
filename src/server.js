@@ -107,18 +107,22 @@ function spawnHintWorker() {
     if (q) q.resolve(m);
     else processHintQueue(entry);
   });
-  worker.on('error', (e) => {
-    // worker 崩溃: 拒绝所有排队请求, 重建
-    console.error('[hint] worker 错误:', e.message);
-    for (const q of entry.queue) q.reject(new Error('引擎崩溃'));
-    entry.queue = [];
-    entry.busy = false;
-    spawnHintWorker();
-    // 替换自己
-    const i = hintWorkers.indexOf(entry);
-    if (i >= 0) hintWorkers.splice(i, 1);
-  });
+  worker.on('error', (e) => respawnHintWorker(entry, `错误: ${e.message}`));
+  worker.on('exit', (code) => respawnHintWorker(entry, code === 0 ? '正常退出' : `异常退出 code=${code}`));
   return entry;
+}
+
+// worker 崩溃/退出: 拒绝所有排队请求, 重建并回到池子。
+// (旧实现: 重建的 worker 没 push 回 hintWorkers —— 每崩一次池子永久缩水,
+// 崩 2 次后 /hint 全部 500)
+function respawnHintWorker(entry, reason) {
+  console.error(`[hint] worker ${reason}: 重建中`);
+  for (const q of entry.queue) q.reject(new Error('引擎不可用'));
+  entry.queue = [];
+  const i = hintWorkers.indexOf(entry);
+  if (i < 0) return; // 已处理过(error 与 exit 可能先后触发)
+  hintWorkers.splice(i, 1);
+  hintWorkers.push(spawnHintWorker());
 }
 
 for (let i = 0; i < HINT_WORKER_COUNT; i++) hintWorkers.push(spawnHintWorker());
@@ -140,6 +144,15 @@ function requestHint(board, color, deep) {
   });
 }
 
+// 棋面签名: 子数 + 散列 —— 日志里能认出是哪盘棋, 又不刷满 225 个数字
+function hintBoardSig(board) {
+  let n = 0, h = 0;
+  for (let i = 0; i < board.length; i++) {
+    if (board[i]) { n++; h = (h * 33 + i * 7 + board[i]) >>> 0; }
+  }
+  return `${n}子/${h.toString(16)}`;
+}
+
 function handleHint(req, res) {
   // 只接受小体积 JSON (225 数字)
   const chunks = [];
@@ -159,20 +172,28 @@ function handleHint(req, res) {
       const token = typeof body.token === 'string' ? body.token : '';
       // 特权校验: 只有白名单 token 能调用服务器 AI
       if (!PRIVILEGED_TOKENS.has(token)) {
+        // v11.2: /hint 请求日志 —— 之前完全无日志, 问题再发生无从追溯
+        console.log(`[hint] 拒绝: token=${token.slice(0, 8)}… 不在白名单`);
         res.writeHead(403, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: '无权限' }));
       }
       const board = Array.isArray(body.board) ? body.board : null;
       const color = body.color === 1 || body.color === 2 ? body.color : 0;
       if (!board || board.length !== 225 || color === 0) {
+        console.log(`[hint] 参数不合法: board=${Array.isArray(board) ? board.length + '格' : typeof board} color=${color}`);
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: '参数不合法' }));
       }
       const deep = body.deep === true;
+      const sig = hintBoardSig(board);
+      // v11.2: /hint 请求日志 —— 之前完全无日志, 问题再发生无从追溯
+      console.log(`[hint] 请求: token=${token.slice(0, 8)}… color=${color} deep=${deep} ${sig}`);
       const t0 = Date.now();
       requestHint(board, color, deep)
         .then((r) => {
           const ms = Date.now() - t0;
+          console.log(`[hint] 完成: ${sig} deep=${deep} ms=${ms} → ${
+            r.error ? '错误: ' + r.error : `(${r.x},${r.y})`}`);
           if (r.error) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok: false, error: r.error }));
@@ -181,6 +202,7 @@ function handleHint(req, res) {
           res.end(JSON.stringify({ ok: true, x: r.x, y: r.y, ms, deep }));
         })
         .catch((e) => {
+          console.log(`[hint] 失败: ${sig} deep=${deep} 错误: ${e.message}`);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: '计算失败: ' + e.message }));
         });
