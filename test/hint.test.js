@@ -317,3 +317,47 @@ test('v11.2 VCT 找到强制杀: 双活三交点启动杀棋链', () => {
   assert.equal(r.x, 5, `应落双活三交点 (5,5) 启动杀, 实际 ${r.x},${r.y}`);
   assert.equal(r.y, 5);
 });
+
+test('v11.3 杀棋链优先于堵对手活三: 对手活三干扰下仍先杀', () => {
+  // 回归: 2b 硬性防守在 VCT 之前无条件堵对手活三端点 —— 对手有活三而
+  // 己方有强制杀时会去堵 (4,7) 而错过杀。v11.3 在 2b 里加杀棋预检:
+  // 对手活三/双威胁是慢威胁, 强制杀链迫使对手全程应挡, 先杀后堵。
+  // 黑双二 (3,5)(4,5)+(5,3)(5,4) 有双活三杀, 白远距活三 (1,7)(2,7)(3,7)
+  // 端点 (0,7)/(4,7) 是堵点 —— 修复前返回 (4,7), 修复后应找杀。
+  const b = empty();
+  for (const [x, y] of [[3,5],[4,5],[5,3],[5,4]]) b[idx(x, y)] = 1;
+  b[idx(0, 0)] = 2; b[idx(1, 0)] = 2;
+  for (const [x, y] of [[1,7],[2,7],[3,7]]) b[idx(x, y)] = 2;
+  const r = computeBest(b, 1);
+  assert.notEqual(r.x, 4, `有强制杀时不应去堵活三端点 (4,7), 实际 ${r.x},${r.y}`);
+  assert.notEqual(r.y, 7);
+  assert.equal(b[idx(r.x, r.y)], 0, `返回点 (${r.x},${r.y}) 应是空位`);
+});
+
+test('v11.3 无强制杀时仍正常堵对手活三端点', () => {
+  // 杀棋预检不误伤防守: 对手活三、己方无杀 → 仍走原 2b 堵点逻辑。
+  const b = empty();
+  for (const [x, y] of [[1,7],[2,7],[3,7]]) b[idx(x, y)] = 2; // 白活三
+  b[idx(7, 7)] = 1; b[idx(6, 6)] = 2;
+  const r = computeBest(b, 1);
+  assert.equal(r.x, 4, `应堵活三端点 (4,7), 实际 ${r.x},${r.y}`);
+  assert.equal(r.y, 7);
+});
+
+test('v11.3 预算截断不提交浅层乐观值: 极小额预算回退启发式', () => {
+  // 回归 gobang V3 门控: 预算极小(50 节点)时 VCT 阶段 1 只完成 d=2,
+  // 浅层"没输"是假象 —— 旧引擎把 VCT d=2 的 -535 乐观值当结果提交
+  // ((4,8)); v11.3 非胜值只在最终迭代提交, 预算耗尽宁回退启发式。
+  // 用 200381 第 14 手局面(两局真棋之一的中盘起点, 启发式答案 (8,11))。
+  const rooms = JSON.parse(fs.readFileSync(new URL('../data/rooms.json', import.meta.url), 'utf8'));
+  const moves = rooms.rooms['200381'].moves;
+  const b = empty();
+  for (let i = 0; i < 14; i++) { const m = moves[i]; b[idx(m.x, m.y)] = m.color; }
+  const tiny = code.replace('maxNodes: 400000', 'maxNodes: 50');
+  const s = { self: {}, performance: { now: () => Date.now() } };
+  vm.runInNewContext(tiny, s);
+  const r = s.self.GomokuHint.computeBest(b, 1);
+  assert.equal(b[idx(r.x, r.y)], 0, `返回点 (${r.x},${r.y}) 应是空位`);
+  assert.notEqual(r.x, 4, `不应提交 VCT 浅层乐观值 (4,8), 实际 ${r.x},${r.y}`);
+  assert.notEqual(r.y, 8);
+});

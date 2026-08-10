@@ -11,6 +11,14 @@
 //   5. 防守妙手: 走一步后检查对方杀棋路径是否变长 —— 变长则防守有效,
 //      否则改堵对方杀棋起点。这解决"看不到对手经营意图"的盲区
 //
+// v11.3 (gobang V3 借鉴):
+//   - VCT 攻防角色分离: 杀棋链只搜进攻方活三+/对方冲四+, 防守方只搜挡点,
+//     根节点只进攻 —— 分支减半, 同样预算杀棋链更深 (V3 getPoints vct 分支)
+//   - VCT 非胜值只在最终迭代提交: 浅层"没杀"证明不了任何事(5步后输 ≠ 1步不输),
+//     中间迭代只接受"能赢" (V3 minmax)。常规搜索保持逐层提交(深度 10 下
+//     干净窗口实测超预算导致 18% 回退启发式, 得不偿失), 截断兜底由
+//     budget.best 的最终迭代门控负责: 预算耗尽宁回退启发式也不拿浅层乐观值。
+//
 // 预算: 节点 + 时间双重上限, 超时回退启发式 —— 手机上不卡。
 // 隐私: 纯本地计算, 结果只画在本地 canvas, 不经 WebSocket。
 
@@ -270,6 +278,21 @@
           if (deep && cat !== 'five' && cat !== 'blockFive' && cat !== 'four' &&
               cat !== 'blockFour' && cat !== 'fourFour' && cat !== 'fourThree' &&
               cat !== 'threeThree' && cat !== 'three') continue;
+          // v11.3: VCT 攻防角色分离 (gobang V3 getPoints vct 分支)
+          // 杀棋链只关心进攻方的活三+ 和"必须回应"的冲四档:
+          //   进攻方回合 = 自己的活三+ + 对手冲四+(不回应就输);
+          //   防守方回合 = 对手活三+(堵点) + 自己的冲四+(挡点);
+          //   根节点只进攻, 不防守。
+          // 防守方的活三(反攻)不进杀棋链 —— 分支减半, 同样预算能搜更深。
+          if (onlyThree) {
+            const isAttackMove = depth % 2 === 0; // 偶数层=进攻方回合(根即进攻方)
+            if (depth === 0 && r !== role) continue;
+            const fourPlus = cat === 'four' || cat === 'blockFour' || cat === 'fourFour' ||
+                             cat === 'five' || cat === 'blockFive';
+            const threePlus = cat === 'three' || cat === 'threeThree' || cat === 'fourThree' || fourPlus;
+            const keep = (r === role) === isAttackMove ? threePlus : fourPlus;
+            if (!keep) continue;
+          }
           sets[cat].push([x, y]);
         }
       }
@@ -420,7 +443,12 @@
           cv = -cv;
           evaluator.undo(x, y);
 
-          if (cv > iterBest || (cv <= -FIVE && iterBest <= -FIVE && cp.length > iterDepth)) {
+          // v11.3 (gobang V3): VCT 变体非胜值只在最终迭代提交 —— 中间迭代只接受"能赢",
+          // 浅层"没杀"证明不了任何事 (V3: 5步后输 ≠ 1步不输)。
+          // 常规变体保持逐层提交(深度 10 下干净窗口会超预算, 实测 18% 回退启发式),
+          // 预算截断时由 budget.best 的最终迭代门控兜底。
+          if ((!onlyThree || cv >= FIVE || d === depth) &&
+              (cv > iterBest || (cv <= -FIVE && iterBest <= -FIVE && cp.length > iterDepth))) {
             iterBest = cv;
             iterMove = [x, y];
             iterPath = cp;
@@ -445,7 +473,9 @@
           bestPath = iterPath;
           bestDepth = iterDepth;
           // v11.2: budget.best 只从根层写入 —— 预算超时时返回部分搜索结果
-          if (bestSlot && cDepth === 0 &&
+          // v11.3 (gobang V3): 非胜值只在最终迭代提交 —— 中间迭代(如 d=2)的"没输"是假象,
+          // 预算耗尽宁回退启发式也不拿浅层乐观值当结果。
+          if (bestSlot && cDepth === 0 && (d === depth || iterBest >= FIVE) &&
               (!bestSlot.best || iterBest > bestSlot.best.value ||
                (iterBest <= -FIVE && bestSlot.best.value <= -FIVE && iterPath.length > bestSlot.best.depth))) {
             bestSlot.best = { value: iterBest, move: iterMove, path: iterPath, depth: iterPath.length };
@@ -839,6 +869,25 @@
     const double = oppDoubleThreatPoints(board, opp);
     const line = oppLineBlocks(board, opp);
     if (urgent.length || double.length || line.length) {
+      // v11.3: 对手活三/双威胁让位于己方强制杀 —— 杀棋链迫使对手全程应挡,
+      // 其慢威胁(活三端点/双威胁点)永远走不完; 对手活四在盘(一步必杀)不在此列:
+      // 活四没有"可堵点", 2b 不触发, 直接进搜索, 由阶段 2/3 处理。
+      // 预算: 查杀链是窄树(~1000 节点/400ms, 沙箱解释执行), 超时走原堵点逻辑。
+      {
+        let sc = 0;
+        for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) sc++;
+        const kDepth = sc < 8 ? 2 : (sc > 190 ? 4 : 6);
+        const kBoard = board.slice();
+        const kEval = createEvaluator(kBoard);
+        kEval.init();
+        const kb = { nodes: 0, maxNodes: 20000, t0: performance.now(), maxMs: 400 };
+        try {
+          const [kval, kmove] = vct(kEval, kBoard, color, kDepth + 8, 0, [], -MAX, MAX, kb, new Map(), null, null);
+          if (kval >= FIVE && kmove) return { x: kmove[0], y: kmove[1] };
+        } catch (e) {
+          if (e !== BUDGET) throw e;
+        }
+      }
       const cands = [...urgent, ...double, ...line];
       // 紧迫度: 对手活三/四(必堵) > 对手双威胁 > 己方活四机会 > 聚子
       // v8 修正: 堵对手活三的端点必须优先于己方活四机会 ——
