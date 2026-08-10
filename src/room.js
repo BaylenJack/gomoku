@@ -107,11 +107,13 @@ export function resolveUndo(room, token, accept) {
     return { ok: true, accepted: false, by };
   }
 
-  // 若悔的是已判胜的那一手, 需把胜局数扣回去
+  // 若悔的是已判胜的那一手, 需把胜局数扣回去(但超时判负不回退 —— 超时是已发生
+  // 的事件, 悔棋只能回退棋盘, 不能撤销超时事实; 否则超时方可以无限悔棋刷分)。
   const wasWon = room.status === 'won';
+  const wasTimeoutWin = wasWon && !room.winLine; // winLine 仅在五连判胜时设置
   const winToken = wasWon ? tokenOf(room, room.winner) : null;
   const n = applyUndo(room, by);
-  if (wasWon && winToken && room.score[winToken] > 0) room.score[winToken]--;
+  if (wasWon && !wasTimeoutWin && winToken && room.score[winToken] > 0) room.score[winToken]--;
 
   room.updatedAt = Date.now();
   return { ok: true, accepted: true, by, undone: n };

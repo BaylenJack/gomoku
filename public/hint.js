@@ -926,6 +926,9 @@
     // 对手活四在盘(两个成五点同一四连两端)下一手必胜, 己方杀来不及, 不在此列;
     // 双冲四(两个独立成五点)不是一步杀, 己方杀仍成立。
     const oppWins = winPoints(board, opp);
+    // 白成五点多(≥3)时白多路必胜, 己方杀来不及(活四需 2 步, 白 1 步成五),
+    // 不再执行 killInOne, 直接进步骤 2 堵棋(至少拖延)。
+    // 1-2 个成五点(且非同一活四两端)时允许己方一步杀 —— 杀棋链迫使对手全程应挡。
     if (oppWins.length <= 2) {
       const liveFour = oppWins.length === 2 && sameLiveFour(board, opp, oppWins[0], oppWins[1]);
       if (!liveFour) {

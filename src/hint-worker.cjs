@@ -22,10 +22,10 @@ function loadEngine(deep) {
   } catch (e) {
     return { error: '引擎文件读取失败: ' + e.message };
   }
-  // 预算替换: 普通 3s/100万节点, 深度 15s/1000万节点
+  // 预算替换: 普通 3s/100万节点, 深度 30s/3000万节点
   // v11: 深度版深度 6 → 10 (配合深层威胁过滤 ONLY_THREE_THRESHOLD)
   const [fromNodes, toNodes, fromMs, toMs, fromDepth, toDepth] = deep
-    ? ['maxNodes: 400000', 'maxNodes: 10000000', 'maxMs: 1500', 'maxMs: 15000',
+    ? ['maxNodes: 400000', 'maxNodes: 30000000', 'maxMs: 1500', 'maxMs: 30000',
        'const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);',
        'const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 10);']
     : ['maxNodes: 400000', 'maxNodes: 1000000', 'maxMs: 1500', 'maxMs: 3000', null, null];
@@ -35,13 +35,16 @@ function loadEngine(deep) {
   // 预算替换命中检查 —— 替换静默失效会让"深度档"悄悄退回普通档。
   // 注意不能查 !src.includes(fromMs): 'maxMs: 15000' 包含子串 'maxMs: 1500',
   // 用替换前的原文判断 from 存在、替换后 to 已出现。
+  // actual 检查用词边界正则防止子串误判: 'maxMs: 3000' 是 'maxMs: 30000' 的子串。
+  const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const expected = [fromNodes, fromMs, ...(deep ? [fromDepth] : [])].filter(Boolean);
   const actual = deep ? [toNodes, toMs, toDepth] : [toNodes, toMs];
-  const hit = expected.every((f) => origSrc.includes(f)) && actual.every((t) => src.includes(t));
+  const hit = expected.every((f) => origSrc.includes(f))
+    && actual.every((t) => new RegExp('\\b' + escapeRe(t) + '\\b').test(src));
   if (!hit) {
     console.error(`[hint] 预算替换未命中: ${key} 档 —— 档位预算失效!`);
   } else {
-    console.log(`[hint] 引擎加载: ${key} 档 (${deep ? '15s/1000万节点/深度10' : '3s/100万节点/深度6'})`);
+    console.log(`[hint] 引擎加载: ${key} 档 (${deep ? '30s/3000万节点/深度10-12' : '3s/100万节点/深度6'})`);
   }
 
   const sandbox = {
@@ -55,7 +58,7 @@ function loadEngine(deep) {
   sandbox.globalThis = sandbox;
   try {
     vm.createContext(sandbox);
-    vm.runInContext(src, sandbox, { timeout: deep ? 30000 : 10000 });
+    vm.runInContext(src, sandbox, { timeout: deep ? 60000 : 10000 });
     const mod = sandbox.module.exports;
     if (!mod || typeof mod.computeBest !== 'function') {
       return { error: '引擎加载异常' };

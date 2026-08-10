@@ -109,7 +109,7 @@ const MIME = {
 import { Worker } from 'node:worker_threads';
 
 const HINT_WORKER_COUNT = 4; // 4 个 worker 分担并发; 深度档单请求 5-15s, 太少会积压
-const QUEUE_TIMEOUT_MS = 10000; // 排队超过 10s 直接放弃(返回"引擎忙")—— 排队几分钟的响应早已过时
+const QUEUE_TIMEOUT_MS = 40000; // 深度档最长 30s, 排队超过 40s 直接放弃(返回"引擎忙")—— 排队几分钟的响应早已过时
 const hintWorkers = []; // { worker, busy, queue }
 
 function spawnHintWorker() {
@@ -154,6 +154,7 @@ function requestHint(board, color, deep) {
   return new Promise((resolve, reject) => {
     // 深度请求优先找空闲的 worker; 否则轮询第一个
     const entry = hintWorkers.find((w) => !w.busy && w.queue.length === 0) || hintWorkers[0];
+    if (!entry) return reject(new Error('引擎暂不可用,请稍后重试'));
     const id = Math.random().toString(36).slice(2);
     const q = { id, board, color, deep, resolve, reject, timer: null };
     // 排队看门狗: 积压太久响应早已过时, 放弃比无限等更有用
