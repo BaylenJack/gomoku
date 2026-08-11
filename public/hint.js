@@ -664,7 +664,10 @@
   // v11.5: 一步杀扫描 —— 落子即成活四/双活三/冲四活三/双四 → 对手一步堵不完, 直接杀。
   // 原放在 2b 内(对手活三/双威胁时才查), 且"堵对手成五"在它之前 —— 对手只有
   // 冲四时先被迫堵棋, 漏掉必胜杀(杀棋链迫使对手全程应挡, 其冲四永远走不完)。
+  // v11.6: 多个一步杀点时选最优 —— 原实现返回扫描到的第一个, 可能不是
+  // 局面分最高的(比如一个成双活三、另一个成冲四活三, 前者通常更强)。
   function killInOne(board, color) {
+    let best = null, bestScore = -Infinity;
     for (const [x, y] of nearCells(board)) {
       const b2 = board.slice();
       b2[idx(x, y)] = color;
@@ -680,10 +683,11 @@
       }
       // 活四 / 双四 / 冲四活三 / 双活三 → 对手一步堵不完
       if (liveFour || fourCnt >= 2 || (fourCnt >= 1 && threeCnt >= 1) || threeCnt >= 2) {
-        return { x, y };
+        const s = evalBoardConn(b2, color);
+        if (s > bestScore) { bestScore = s; best = { x, y }; }
       }
     }
-    return null;
+    return best;
   }
 
   // 两个成五点是否同一活四的两端(相距 5、中间 4 子连续)。
