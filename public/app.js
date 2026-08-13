@@ -672,7 +672,11 @@ function resetTurnTimer() {
   cancelAnimationFrame(timerRaf);
   timerDeadline = null;
   if (!state || !state.timer || !state.timer.enabled || state.status !== 'playing') return;
-  timerDeadline = Date.now() + state.timer.perMoveSec * 1000;
+  // v11.5: 用服务端 turnStartedAt 作权威时钟 —— 本地 Date.now() 会漂移,
+  // 老 UI 从 '现在' 起算的偏差导致服务端先判负而客户端还以为没超时。
+  // 客户端仍可立即上报超时 (UX 更跟手), 服务端独立 5s 扫描兜底。
+  const base = typeof state.turnStartedAt === 'number' ? state.turnStartedAt : Date.now();
+  timerDeadline = base + state.timer.perMoveSec * 1000;
   tickTimer();
 }
 

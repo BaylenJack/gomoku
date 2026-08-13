@@ -1051,13 +1051,9 @@
     const searchBoard = board.slice();
     const evaluator = createEvaluator(searchBoard);
     evaluator.init();
-    // 找最后落子(用于搜索聚焦排序)
-    let lastMove = null;
-    for (let y = SIZE - 1; y >= 0 && !lastMove; y--) {
-      for (let x = SIZE - 1; x >= 0; x--) {
-        if (board[idx(x, y)] !== EMPTY) { lastMove = [x, y]; break; }
-      }
-    }
+    // lastMove 形参保留, 但当前 getValuableMoves.orderNear 实际用 distToNearestStone 排序
+    // (历史遗留接口, 暂保留以兼容 v11.4 阶段 3 的 move 传参, 不再盲扫右下角)
+    const lastMove = null;
     // v9: Web Worker 后台跑 — 3 秒 / 80 万节点(主线程同步调用时仍会回退)
     // v11: budget.best 记录最优-so-far —— 超时也能返回部分搜索的最佳结果
     const budget = { nodes: 0, maxNodes: 400000, t0: performance.now(), maxMs: 1500, visited: null, best: null };

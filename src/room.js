@@ -20,6 +20,10 @@ export function createRoom(id) {
     winner: null,
     winLine: null,
     lastMove: null,
+    // 服务端权威: 当前回合开始时间 (Date.now() 毫秒)。null = 对局未在计时
+    // (waiting/won/draw), 或计时器关闭。
+    // 老存档加载后此字段可能 undefined, 超时检查会跳过, 等下次落子时设置。
+    turnStartedAt: null,
     // 每局交换先手: 记录下一局谁执黑
     nextBlackToken: null,
     score: {}, // token -> 胜局数
@@ -59,9 +63,10 @@ export function claimSeat(room, token, name) {
   room.names[color] = name || (color === BLACK ? '黑方' : '白方');
   if (room.score[token] == null) room.score[token] = 0;
 
-  // 两人到齐, 开局
+  // 两人到齐, 开局。计时器关闭时不设置 turnStartedAt (服务端扫描器靠 timer.enabled 兜底)
   if (seatCount(room) === 2 && room.status === 'waiting') {
     room.status = 'playing';
+    if (room.timer?.enabled) room.turnStartedAt = Date.now();
   }
   room.updatedAt = Date.now();
   return color;
@@ -80,7 +85,11 @@ export function tryMove(room, token, x, y) {
   if (room.status === 'won') {
     const winToken = tokenOf(room, color);
     if (winToken) room.score[winToken] = (room.score[winToken] || 0) + 1;
+  } else if (!room.timer?.enabled) {
+    // 计时器关闭时清掉 turnStartedAt, 避免误触发服务端超时
+    room.turnStartedAt = null;
   }
+  // 计时器开启时, applyMove 内部已设置 turnStartedAt = now
   return { ok: true };
 }
 
@@ -141,6 +150,8 @@ export function newGame(room) {
   room.winLine = null;
   room.lastMove = null;
   room.undoRequest = null;
+  // 新局开始计时 (若计时器启用)
+  room.turnStartedAt = tokens.length === 2 && room.timer?.enabled ? Date.now() : null;
   room.updatedAt = Date.now();
 }
 
@@ -158,6 +169,9 @@ export function publicView(room, viewerToken) {
     winner: room.winner,
     winLine: room.winLine,
     lastMove: room.lastMove,
+    // 服务端当前回合开始时间 (ms) —— 客户端用来同步计时, 避免本地时钟漂移
+    // null 表示不在计时 (waiting/won/draw/计时器关闭/老存档未初始化)
+    turnStartedAt: room.turnStartedAt ?? null,
     names: room.names,
     score: scoreByColor,
     you,

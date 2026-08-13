@@ -88,14 +88,17 @@ export function applyMove(state, x, y, color, now = Date.now()) {
     state.status = 'won';
     state.winner = color;
     state.winLine = win.line;
+    state.turnStartedAt = null; // 对局已终, 计时停止
     return state;
   }
   if (isFull(state.board)) {
     state.status = 'draw';
     state.winner = null;
+    state.turnStartedAt = null;
     return state;
   }
   state.turn = other(color);
+  state.turnStartedAt = now; // 新回合开始, 服务端计时器从这里起算
   return state;
 }
 
@@ -126,6 +129,7 @@ export function applyUndo(state, requesterColor) {
   state.winner = null;
   state.winLine = null;
   state.turn = requesterColor;
+  state.turnStartedAt = Date.now(); // 落子权回到请求方, 重新开始计时
   state.lastMove =
     state.moves.length > 0
       ? {

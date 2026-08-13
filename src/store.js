@@ -25,7 +25,18 @@ export class Store {
     try {
       if (!fs.existsSync(this.file)) return;
       const raw = fs.readFileSync(this.file, 'utf8');
-      if (!raw.trim()) return;
+      if (!raw.trim()) {
+        // 空文件 —— 通常不会发生 (rename 原子写), 但极端情况下(磁盘满中断)
+        // 可能留下 0 字节文件。备份一份避免直接吞掉, 方便手动恢复
+        const bak = `${this.file}.empty-${Date.now()}`;
+        try {
+          fs.renameSync(this.file, bak);
+          console.warn(`[store] 存档为空, 已备份到 ${bak}`);
+        } catch {
+          console.warn(`[store] 存档为空且无法备份`);
+        }
+        return;
+      }
       const data = JSON.parse(raw);
       for (const [id, room] of Object.entries(data.rooms || {})) {
         this.rooms.set(id, room);
@@ -57,7 +68,14 @@ export class Store {
     if (this._writing || !this._dirty) return;
     this._writing = true;
     this._dirty = false;
-    const payload = { savedAt: Date.now(), rooms: Object.fromEntries(this.rooms) };
+    // 序列化前剥离临时/易失字段, 避免污染存档 schema
+    // (newGameVotes 是新局投票中的临时计数, 不该持久化)
+    const rooms = {};
+    for (const [id, r] of this.rooms) {
+      rooms[id] = { ...r };
+      delete rooms[id].newGameVotes;
+    }
+    const payload = { savedAt: Date.now(), rooms };
     const tmp = `${this.file}.tmp`;
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });

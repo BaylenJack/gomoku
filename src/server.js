@@ -19,6 +19,7 @@ import {
   createRoom,
   claimSeat,
   colorOf,
+  tokenOf,
   tryMove,
   requestUndo,
   resolveUndo,
@@ -434,8 +435,7 @@ function handleMessage(ws, msg) {
 
     // 特权身份: 仅当 token 命中白名单时, 在握手消息里附带隐藏标志。
     // 白名单在环境变量里(部署时设置), 前端拿不到名单本身。
-    // AI 提示功能对所有人开放
-    // AI 提示: 仅白名单 token 可见(你的专属, 其他人看不到)
+    // AI 提示仅白名单 token 可见 —— 普通玩家永远拿不到按钮/引擎/网络痕迹。
     const isPrivileged = PRIVILEGED_TOKENS.has(msg.token);
     send(ws, 'joined', { color, state: publicView(room, msg.token), hint: isPrivileged ? 1 : 0 });
     broadcastState(roomId);
@@ -505,10 +505,17 @@ function handleMessage(ws, msg) {
 
     case 'set-timer': {
       if (colorOf(room, ws.token) == null) return;
+      const wasEnabled = !!room.timer?.enabled;
       room.timer = {
         enabled: !!msg.enabled,
         perMoveSec: Math.min(Math.max(parseInt(msg.perMoveSec, 10) || 60, 10), 600),
       };
+      // 计时从禁用→启用 且当前在 playing → 现在开始计时; 否则保持原值
+      if (room.timer.enabled && !wasEnabled && room.status === 'playing') {
+        room.turnStartedAt = Date.now();
+      } else if (!room.timer.enabled) {
+        room.turnStartedAt = null;
+      }
       room.updatedAt = Date.now();
       store.markDirty();
       broadcastState(ws.roomId, { event: 'timer' });
@@ -516,7 +523,9 @@ function handleMessage(ws, msg) {
     }
 
     case 'timeout': {
-      // 客户端报告超时 —— 服务端复核回合与计时开关后才采信
+      // 客户端报告超时 —— 服务端复核后才采信。
+      // v11.5+: 服务端每 5s 也会独立扫描, 即使客户端关闭/掉线也能判负。
+      // 这里保留客户端即时上报路径 —— 用户体验上更跟手 (RAF 倒计时归零立即判负, 不必等服务端 5s 扫描)。
       if (!room.timer?.enabled || room.status !== 'playing') return;
       const color = colorOf(room, ws.token);
       if (color == null || room.turn !== color) return;
@@ -524,6 +533,9 @@ function handleMessage(ws, msg) {
       room.status = 'won';
       room.winner = room.turn === 1 ? 2 : 1;
       room.winLine = null;
+      room.turnStartedAt = null;
+      const winToken = tokenOf(room, room.winner);
+      if (winToken) room.score[winToken] = (room.score[winToken] || 0) + 1;
       room.updatedAt = Date.now();
       logGameEvent(room.id, { type: 'end', winner: room.winner, winLine: null, reason: 'timeout' });
       store.markDirty();
@@ -572,11 +584,45 @@ const janitor = setInterval(() => {
   store.flush();
 }, 60 * 60 * 1000);
 
+// ---------- 服务端超时检查器 ----------
+// v11.5+: 即使客户端关闭/掉线, 服务端也能按时判负 —— 不再依赖客户端上报。
+// 5s 扫描一次所有房间: playing + 计时启用 + 超过限时 → 当前回合方判负。
+// 老存档加载后 turnStartedAt 可能为 undefined, 这里用 `== null` 同时兜住 undefined。
+const TIMEOUT_CHECK_MS = 5000;
+const timeoutChecker = setInterval(() => {
+  const now = Date.now();
+  for (const [roomId, room] of store.rooms) {
+    if (room.status !== 'playing') continue;
+    if (!room.timer?.enabled) continue;
+    if (room.turnStartedAt == null) continue; // 老房间未初始化, 等下次落子
+    const limit = (room.timer.perMoveSec || 60) * 1000;
+    if (now - room.turnStartedAt < limit) continue;
+
+    // 超时: 当前回合方判负
+    const loserColor = room.turn;
+    const winnerColor = loserColor === BLACK ? WHITE : BLACK;
+    room.status = 'won';
+    room.winner = winnerColor;
+    room.winLine = null;
+    room.turnStartedAt = null;
+    room.updatedAt = now;
+    const winToken = tokenOf(room, winnerColor);
+    if (winToken) room.score[winToken] = (room.score[winToken] || 0) + 1;
+    logGameEvent(room.id, {
+      type: 'end', winner: winnerColor, winLine: null, reason: 'timeout-server',
+    });
+    store.markDirty();
+    broadcastState(roomId, { event: 'timeout' });
+    console.log(`[server] 超时判负: room=${roomId} loser=${loserColor} winner=${winnerColor}`);
+  }
+}, TIMEOUT_CHECK_MS);
+
 // ---------- 优雅退出 ----------
 function shutdown(sig) {
   console.log(`[server] 收到 ${sig}, 正在保存并退出...`);
   clearInterval(heartbeat);
   clearInterval(janitor);
+  clearInterval(timeoutChecker);
   store.flushSync();
   for (const ws of wss.clients) {
     try {
