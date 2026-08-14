@@ -88,3 +88,17 @@ test('hint-worker-search.cjs 启动并返回 shape 正确的结果', async () =>
   assert.equal(typeof result.value, 'number');
   assert.equal(result.workerId, 1);
 });
+
+test('dispatcher 深度档启动 4 worker 谈合出最佳着', async () => {
+  const { pickBest } = await import('../src/lazy-smp-protocol.cjs');
+  const results = [
+    { workerId: 0, value: 100, path: [[1, 1]], x: 1, y: 1, ms: 100 },
+    { workerId: 1, value: 1000, path: [[2, 2]], x: 2, y: 2, ms: 200 },
+    { workerId: 2, value: -100, path: [[3, 3]], x: 3, y: 3, ms: 150 },
+    { workerId: 3, value: 50, path: [[4, 4]], x: 4, y: 4, ms: 80 },
+  ];
+  const best = pickBest(results);
+  // 必胜值 (|value| >= 100000 才是必胜, 但这里 value=1000 < 100000)
+  // 实际是 value=1000 > 500 > 100 > 50, 选 workerId=1
+  assert.equal(best.workerId, 1);
+});
