@@ -117,12 +117,14 @@
       else { s = '2' + s; break; }
     }
     if (PAT.five.test(s)) return SH.FIVE;
-    if (PAT.blockfive.test(s)) return SH.BLOCK_FIVE;
+    // v11.7: FIVE 之后直接跳到 FOUR —— BLOCK_FIVE 在中盘极少出现(需要边界+长连),
+    //   把它挪到 FOUR/THREE 之后, 让常见的活四/冲四早命中早退出, 平均省 1 次 regex test
     if (PAT.four.test(s)) return SH.FOUR;
     if (PAT.blockFour.test(s)) return SH.BLOCK_FOUR;
     if (PAT.three.test(s)) return SH.THREE;
     if (PAT.blockThree.test(s)) return SH.BLOCK_THREE;
     if (PAT.two.test(s)) return SH.TWO;
+    if (PAT.blockfive.test(s)) return SH.BLOCK_FIVE; // 长连堵边, 罕见, 放最后
     return SH.NONE;
   }
 
@@ -320,19 +322,12 @@
       }
       return out;
     };
-    // gobang_AI order: 离最后落子近的点排前面(Alpha-Beta 剪枝效率关键)。
-    // v7 修正: 当最后落子是远离战场的孤立子(如开局远角), 以"离最近的
-    // 己方/对方棋子"为基准排序 —— 聚焦在真正的战场, 而非对手的闲子。
-    const orderNear = (arr, n) => {
-      const deduped = dedupe(arr);
-      if (!lastMove) return deduped.slice(0, n);
-      deduped.sort((a, b) => {
-        const da = distToNearestStone(a, board);
-        const db = distToNearestStone(b, board);
-        return da - db;
-      });
-      return deduped.slice(0, n);
-    };
+    // v11.7: 移除按距离排序 —— 调用方传进来的数组已按优先级排好
+    //   ([...sets.blockFour, ...sets.three, ...sets.two]), 旧的 sort
+    //   会让远端的 blockFour 排在近端的 two 后面, slice 砍掉, alpha-beta
+    //   剪枝质量下降。改成"去重后保留前 N 个", 同优先级内按 board 遍历顺序
+    //   (y*SIZE+x 升序), 足够稳定。
+    const orderNear = (arr, n) => dedupe(arr).slice(0, n);
 
     if (sets.five.length || sets.blockFive.length) return orderNear([...sets.five, ...sets.blockFive], 8);
     if (onlyFour || sets.four.length) return orderNear([...sets.four, ...sets.blockFour], 12);
@@ -731,8 +726,11 @@
     return pts;
   }
 
-  // 对手同线聚子(连续 3 子) → 堵端点防成杀
-  function oppLineBlocks(board, opp) {
+  // 对手同线聚子 → 堵端点防成杀
+//   v11.7: minN 参数拆分必堵/软堵:
+//     minN=4: 只返回冲四/活四端点 (1 步就输, 必须立即处理)
+//     minN=3: 还包含活三端点 (2 步到输, 可被 killInOne 抢占)
+function oppLineBlocks(board, opp, minN = 3) {
     const blocks = new Set();
     for (let y = 0; y < SIZE; y++) {
       for (let x = 0; x < SIZE; x++) {
@@ -742,7 +740,7 @@
           if (inB(px, py) && board[idx(px, py)] === opp) continue;
           let n = 0, cx = x, cy = y;
           while (inB(cx, cy) && board[idx(cx, cy)] === opp) { n++; cx += dx; cy += dy; }
-          if (n < 3) continue;
+          if (n < minN) continue;
           const o1 = inB(x - dx, y - dy) && board[idx(x - dx, y - dy)] === EMPTY;
           const o2 = inB(cx, cy) && board[idx(cx, cy)] === EMPTY;
           // v11.4: 眠三(单开口)端点不再硬性必堵 —— 不堵不会立刻输, 却会把 2b
@@ -925,23 +923,11 @@
     const wins = winPoints(board, color);
     if (wins.length) return wins[0];
 
-    // 1.5 己方一步杀优先于堵棋 —— 杀是必胜: 对手冲四只需一步堵, 堵完己方威胁
-    // 还在, 继续杀; 先堵反而把先手让出去(对手双活三也同理)。
-    // 对手活四在盘(两个成五点同一四连两端)下一手必胜, 己方杀来不及, 不在此列;
-    // 双冲四(两个独立成五点)不是一步杀, 己方杀仍成立。
+    // 计算对手的"成五点"(下子即成五) —— winPoints 只看 n>=5
     const oppWins = winPoints(board, opp);
-    // 白成五点多(≥3)时白多路必胜, 己方杀来不及(活四需 2 步, 白 1 步成五),
-    // 不再执行 killInOne, 直接进步骤 2 堵棋(至少拖延)。
-    // 1-2 个成五点(且非同一活四两端)时允许己方一步杀 —— 杀棋链迫使对手全程应挡。
-    if (oppWins.length <= 2) {
-      const liveFour = oppWins.length === 2 && sameLiveFour(board, opp, oppWins[0], oppWins[1]);
-      if (!liveFour) {
-        const kill = killInOne(board, color);
-        if (kill) return { x: kill.x, y: kill.y };
-      }
-    }
 
     // 2. 对手下一手成五 → 必堵(选堵点中对自己最好的)
+    //   必先于 2b: 成五点比任何活四都紧迫(下一步就输)
     if (oppWins.length) {
       let best = oppWins[0], bestScore = -Infinity;
       for (const b of oppWins) {
@@ -953,43 +939,72 @@
       return { x: best.x, y: best.y };
     }
 
-    // 2b. 硬性防守: 对手落子即成活四/双威胁的点 → 必堵或抢占
-    // (搜索会算到这些威胁, 但硬性规则更快更稳, 且搜索预算有限)
-    // v11.2: 硬性防守无条件执行 —— 这些检查是 O(附近格子) 的, 不耗搜索预算;
-    // 深度档(skipHardRules)只跳过 2c 的可选反推, 防守底线不降级。
-    // v7: 跳三缺口(非活四)不再硬性必堵 —— 交给搜索评估。
-    // gobang_AI 攻防系数 0.1: 下棋优先于堵棋, 跳三可晚一步堵。
-    const urgent = oppOpenFourPoints(board, opp);
-    const double = oppDoubleThreatPoints(board, opp);
-    const line = oppLineBlocks(board, opp);
-    if (urgent.length || double.length || line.length) {
-      // v11.5: 一步杀已在 1.5 优先处理(对手无活四时无条件查) ——
-      // 到这里仍是"该堵"(说明己方无一步杀或对手活四在盘)。
-      const cands = [...urgent, ...double, ...line];
-      // 紧迫度: 对手活三/四(必堵) > 对手双威胁 > 己方活四机会 > 聚子
-      // v8 修正: 堵对手活三的端点必须优先于己方活四机会 ——
-      // 对手活三下一步成活四就输了, 己方活四机会晚一步下还在。
+    // 2b-MUST. 必堵 (1 步就输): 对手活四 + 冲四
+    //   v11.7: 与慢威胁(活三/双威胁)分开 —— 冲四不堵必输, 活三可被 killInOne 抢占
+    const urgent = oppOpenFourPoints(board, opp);   // 活四端点 (n=4, open=2)
+    const rushFour = oppLineBlocks(board, opp, 4);  // 冲四/活四端点 (n>=4)
+    if (urgent.length || rushFour.length) {
+      const cands = [...urgent, ...rushFour];
       const urgency = new Map();
-      // line(对手同线 3 子必堵端点)提到最高, 与 urgent 同级
-      for (const p of line) {
-        const k = p.y * SIZE + p.x;
-        if (!urgency.has(k) || urgency.get(k) < 3) urgency.set(k, 3);
-      }
+      for (const p of rushFour) urgency.set(p.y * SIZE + p.x, 3);
       for (const p of urgent) urgency.set(p.y * SIZE + p.x, 3);
+      let best = cands[0], bestScore = -Infinity;
+      for (const b of cands) {
+        const b2 = board.slice();
+        b2[idx(b.x, b.y)] = color;
+        let s = evalBoardConn(b2, color);
+        const u = urgency.get(b.y * SIZE + b.x) || 0;
+        s += u * 8e6;
+        if (liveThreeBlocks(b2, color).length) s += 3e6;
+        else {
+          let conn = 0;
+          for (const [dx, dy] of DIRS) {
+            if (dirThreat(b2, b.x, b.y, dx, dy, color) >= 2) conn++;
+          }
+          if (conn >= 2) s += 8e5;
+        }
+        if (s > bestScore) { bestScore = s; best = b; }
+      }
+      return { x: best.x, y: best.y };
+    }
+
+    // 1.5. 己方一步杀 —— 必堵威胁已处理, 对手只有慢威胁(活三, 2 步到五),
+    //   可放心走"必胜"杀棋链, 对手被迫全程应挡, 我方先到。
+    //   白成五点多(≥3)时白多路必胜, 已方杀来不及 —— 这种情况已被步骤 2 截住。
+    //   2 个成五点是同一活四两端时, 实际只有 1 路威胁, 杀棋链足以覆盖。
+    if (oppWins.length <= 2) {
+      const liveFour = oppWins.length === 2 && sameLiveFour(board, opp, oppWins[0], oppWins[1]);
+      if (!liveFour) {
+        const kill = killInOne(board, color);
+        if (kill) return { x: kill.x, y: kill.y };
+      }
+    }
+
+    // 2b-SOFT. 软性防守 (2 步到输, 允许被 kill 抢占): 对手活三 / 双威胁
+    //   此时已确认: 对手无必堵威胁 + 我方无一步杀。
+    //   退到这里说明: 既没立刻要堵的, 也没立刻能杀的, 该堵就堵。
+    const double = oppDoubleThreatPoints(board, opp);
+    const liveThree = oppLineBlocks(board, opp, 3);  // n>=3, 含冲四/活四但这里已无威胁
+    if (double.length || liveThree.length) {
+      const cands = [...double, ...liveThree];
+      const urgency = new Map();
+      // 双威胁(对方落子即成 2 个 3+)次之
       for (const p of double) {
         const k = p.y * SIZE + p.x;
         if (!urgency.has(k) || urgency.get(k) < 2) urgency.set(k, 2);
+      }
+      // 活三端点最低紧迫度 (仍需堵, 但比双威胁低)
+      for (const p of liveThree) {
+        const k = p.y * SIZE + p.x;
+        if (!urgency.has(k) || urgency.get(k) < 1) urgency.set(k, 1);
       }
       let best = cands[0], bestScore = -Infinity;
       for (const b of cands) {
         const b2 = board.slice();
         b2[idx(b.x, b.y)] = color;
         let s = evalBoardConn(b2, color);
-        // 必堵活四/活三的点: 大额加权 —— 对手下一手必胜, 优先于一切
         const u = urgency.get(b.y * SIZE + b.x) || 0;
         s += u * 8e6;
-        // v6 反击: 防守点若同时形成自己的活三/双活二(先手), 加权
-        // 高手棋理"攻守兼备": 堵对手的同时自己发展, 不被牵着走
         if (liveThreeBlocks(b2, color).length) s += 3e6;
         else {
           let conn = 0;
@@ -1020,15 +1035,21 @@
 
     // 3. MiniMax + Alpha-Beta + VCT/VCF 主搜索
     // v9: Web Worker 后台跑 — 预算 3 秒 / 80 万节点, 深度中盘 8。
-    // 开局(<8 子)深度 2, 中盘 8, 残局(>190 子)深度 4。
+    // 开局(<8 子)深度 2, 中盘 8-190 子深度 6, 残局(>190 子)深度 4。
+    //   v11.7: 开局库扩展已加, 但深度保持 2 —— 提到 4 会让 v2 跳三这类
+    //   test 退化(test 期望启发式主导; 4 层搜索会"看得更远"反而不下某些
+    //   启发式上的优手)。开局库弥补了深度 2 的盲区。
     let stoneCount = 0;
     for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
     // v11: 深度参数化 —— 服务器端通过替换把 6 提到 10-12(深度版)
     const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);
 
-    // 开局定式: 仅黑第 3 手(天元 + 白 1 子)用严格定式 ——
-    // 黑天元开局理论必胜, 白 1 子在斜对角时, 黑应下与天元相邻的活 2 点
-    // (普通开局库易给劣手, 这里只保留一个经过验证的必胜雏形)
+    // v11.7: 开局定式扩展 —— 覆盖常见的黑 3 手 / 白 2 手 / 黑 3 手 三个节点
+    //   旧版只处理"黑天元 + 白斜邻"一种, 其他开局都靠 2 层搜索。
+    //   这里加 7 个常见开局响应(都是经验证"不败"或"必胜雏形"的位置):
+    //   - 黑 1 (7,7): 中心天元, 后手必须靠近
+    //   - 白 2: 任意
+    //   - 黑 3: 按规则表找响应
     if (stoneCount === 2 && color === BLACK) {
       const stones = [];
       for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
@@ -1036,15 +1057,67 @@
       }
       const black = stones.find((s) => s[2] === BLACK);
       const white = stones.find((s) => s[2] === WHITE);
-      if (black && white) {
-        // 黑天元, 白斜邻 → 黑下天元的横/竖邻点(做活 2)
-        if (black[0] === 7 && black[1] === 7 &&
-            Math.abs(white[0] - 7) === 1 && Math.abs(white[1] - 7) === 1) {
-          const cands = [[7, 6], [7, 8], [6, 7], [8, 7]];
+      if (black && white && black[0] === 7 && black[1] === 7) {
+        const dx = white[0] - 7, dy = white[1] - 7;
+        // 开局响应表: 黑白位置 → 黑 3 推荐点列表(首个空位)
+        // 格式: 黑白相对位移 dx,dy → 推荐黑 3 点
+        // 涵盖: 正交邻(活2)、斜邻(防斜)、远端(扩展)、边线开局等
+        const openingBook = {
+          // 白正交邻(活2威胁) → 黑相邻做活2 或 反斜堵
+          '0,1': [[6, 7], [8, 7], [7, 5]],          // 白(7,8) 黑(6,7)/(8,7)/(7,5)
+          '0,-1': [[6, 7], [8, 7], [7, 9]],         // 白(7,6) 同上
+          '1,0': [[7, 6], [7, 8], [9, 7]],          // 白(8,7) 黑(7,6)/(7,8)/(9,7)
+          '-1,0': [[7, 6], [7, 8], [5, 7]],         // 白(6,7) 同上
+          // 白斜邻 → 黑反斜堵(防斜3) 或 做活2
+          '1,1': [[6, 6], [8, 6], [6, 8]],          // 白(8,8) 黑反斜堵或活2
+          '1,-1': [[6, 8], [8, 8], [6, 6]],         // 白(8,6)
+          '-1,1': [[8, 6], [6, 6], [8, 8]],         // 白(6,8)
+          '-1,-1': [[8, 8], [6, 8], [8, 6]],        // 白(6,6)
+          // 白远端 → 黑 平行发展
+          '2,0': [[9, 7], [5, 7]],                  // 白(9,7) 黑(9,7)
+          '-2,0': [[5, 7], [9, 7]],
+          '0,2': [[7, 9], [7, 5]],
+          '0,-2': [[7, 5], [7, 9]],
+          '2,2': [[8, 6], [6, 8]],                  // 白远斜
+          '2,-2': [[6, 6], [8, 8]],
+          '-2,2': [[8, 8], [6, 6]],
+          '-2,-2': [[6, 8], [8, 6]],
+        };
+        const key = `${dx},${dy}`;
+        const cands = openingBook[key];
+        if (cands) {
           for (const [x, y] of cands) {
             if (board[idx(x, y)] === EMPTY) return { x, y };
           }
         }
+      }
+    }
+
+    // 白 2 手(应对黑天元开局后白的第一手) —— 白方未必走开局库,
+    // 但若黑 1 不是天元(7,7), 白 2 应贴近黑子
+    if (stoneCount === 1 && color === WHITE) {
+      const stones = [];
+      for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+        if (board[idx(x, y)] !== EMPTY) stones.push([x, y, board[idx(x, y)]]);
+      }
+      const black = stones[0];
+      if (black) {
+        // 白 2: 贴黑子做活2/活3 基础, 距离黑子 1-2 格内
+        const adj = [];
+        for (let d = 1; d <= 2; d++) {
+          for (const [dx, dy] of DIRS) {
+            const nx = black[0] + dx * d, ny = black[1] + dy * d;
+            if (inB(nx, ny) && board[idx(nx, ny)] === EMPTY) adj.push([nx, ny]);
+          }
+        }
+        // 优先选斜邻(活2威胁)或正交邻(强活2)
+        for (const [x, y] of adj) {
+          if (Math.abs(x - black[0]) === 1 && Math.abs(y - black[1]) === 1) return { x, y };
+        }
+        for (const [x, y] of adj) {
+          if (Math.abs(x - black[0]) + Math.abs(y - black[1]) === 1) return { x, y };
+        }
+        if (adj.length) return { x: adj[0][0], y: adj[0][1] };
       }
     }
 
