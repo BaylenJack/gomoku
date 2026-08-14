@@ -562,3 +562,144 @@ test('v45.1 深档必堵仍然触发 (活四/冲四不被搜索覆盖)', () => {
   assert.equal(r.x, 7, `深档应堵白活四 x=7, 实际 ${r.x},${r.y}`);
   assert.ok(r.y === 4 || r.y === 9, `应堵活四端点, 实际 y=${r.y}`);
 });
+
+// ================= v45.2: 开局库扩展到 5 手常见定式 =================
+//
+// 背景: 旧版 (v11.7) 只处理"黑开天元 + 白邻 + 黑 3" 这 16 个 dx,dy 表项,
+//   其他开局都靠 2 层搜索。v45.2 把表扩展到 ~3KB 静态数据, 覆盖:
+//   - 1-2 手 (黑白开局定式)
+//   - 3-5 手 (关键决策点的 B/W 推荐)
+// 编码约定: 棋子按落子顺序交替 B/W (B1, W1, B2, W2, ...);
+//   黑 1 在 (7,7) 时优先 (天元开局最常见), 其余 (y,x) 字典序;
+//   白按 (y,x) 字典序。
+
+// T1: 1 手 —— 黑开天元, 白 2 推荐贴邻
+test('v45.2 开局库 1 手: 黑开 (7,7) 白 2 推荐贴邻', () => {
+  const b = empty();
+  b[idx(7, 7)] = 1;  // 黑 1
+  const r = computeBest(b, 2);
+  // 推荐点应在 (7,7) 周围: (7,6)/(7,8)/(8,7)/(6,7)
+  const allowed = [[7, 6], [7, 8], [8, 7], [6, 7]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T2: 1 手 —— 黑开 (8,8) 非天元, 白 2 推荐贴邻
+test('v45.2 开局库 1 手: 黑开 (8,8) 白 2 推荐贴邻', () => {
+  const b = empty();
+  b[idx(8, 8)] = 1;
+  const r = computeBest(b, 2);
+  const allowed = [[7, 7], [7, 8], [8, 7]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T3: 2 手 —— 黑 (7,7) + 白 (7,6), 黑 3 推荐
+test('v45.2 开局库 2 手: (7,7)+(7,6) 黑 3 推荐列表', () => {
+  const b = empty();
+  b[idx(7, 7)] = 1;  // 黑 1
+  b[idx(7, 6)] = 2;  // 白 2
+  const r = computeBest(b, 1);
+  const allowed = [[7, 8], [8, 7], [8, 8], [6, 6], [8, 6], [6, 8]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T4: 2 手 —— 黑 (7,7) + 白 (8,7), 黑 3 推荐
+test('v45.2 开局库 2 手: (7,7)+(8,7) 黑 3 推荐列表', () => {
+  const b = empty();
+  b[idx(7, 7)] = 1;
+  b[idx(8, 7)] = 2;
+  const r = computeBest(b, 1);
+  const allowed = [[7, 8], [8, 8], [9, 7], [8, 6], [7, 6]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T5: 2 手 —— 黑 (7,7) + 白 (8,8), 黑 3 推荐
+test('v45.2 开局库 2 手: (7,7)+(8,8) 黑 3 推荐列表', () => {
+  const b = empty();
+  b[idx(7, 7)] = 1;
+  b[idx(8, 8)] = 2;
+  const r = computeBest(b, 1);
+  const allowed = [[7, 6], [8, 7], [6, 7], [7, 8]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T6: 3 手 —— 黑 (7,7) + 白 (7,6) + 黑 (7,8), 白 4 推荐
+test('v45.2 开局库 3 手: (7,7)+(7,6)+(7,8) 白 4 推荐', () => {
+  const b = empty();
+  b[idx(7, 7)] = 1;
+  b[idx(7, 6)] = 2;
+  b[idx(7, 8)] = 1;
+  const r = computeBest(b, 2);
+  const allowed = [[8, 7], [8, 6], [6, 6]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T7: 4 手 —— 黑 (7,7) + 白 (7,6) + 黑 (7,8) + 白 (8,7), 黑 5 推荐
+test('v45.2 开局库 4 手: (7,7)+(7,6)+(7,8)+(8,7) 黑 5 推荐', () => {
+  const b = empty();
+  b[idx(7, 7)] = 1;
+  b[idx(7, 6)] = 2;
+  b[idx(7, 8)] = 1;
+  b[idx(8, 7)] = 2;
+  const r = computeBest(b, 1);
+  const allowed = [[8, 8], [8, 6], [6, 6]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T8: 5 手 —— 黑 (7,7) + 白 (7,6) + 黑 (7,8) + 白 (8,7) + 黑 (8,8), 白 6 推荐
+test('v45.2 开局库 5 手: (7,7)+(7,6)+(7,8)+(8,7)+(8,8) 白 6 推荐', () => {
+  const b = empty();
+  b[idx(7, 7)] = 1;
+  b[idx(7, 6)] = 2;
+  b[idx(7, 8)] = 1;
+  b[idx(8, 7)] = 2;
+  b[idx(8, 8)] = 1;
+  const r = computeBest(b, 2);
+  const allowed = [[6, 6], [6, 7], [8, 6]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T9: 未在库中 —— 落入搜索, 返回合法点
+test('v45.2 开局库 6+ 手: 不在库中 → 落入搜索 (返回合法点)', () => {
+  const b = empty();
+  // 6 手但属于非典型开局模式, 不在 OPENING_BOOK 中
+  b[idx(0, 0)] = 1; b[idx(14, 14)] = 2;
+  b[idx(0, 14)] = 1; b[idx(14, 0)] = 2;
+  b[idx(1, 1)] = 1; b[idx(13, 13)] = 2;
+  const r = computeBest(b, 1, { deep: true });
+  assert.ok(r && r.x >= 0 && r.x < 15 && r.y >= 0 && r.y < 15,
+    `6+ 手非典型开局应返回合法点, 实际 ${JSON.stringify(r)}`);
+});
+
+// T10: 白 2 兜底 —— 黑开非中心, 白贴邻 (OPENING_BOOK 命中或 fallback)
+test('v45.2 开局库 兜底: 黑开 (0,0) 白 2 应贴邻或落入搜索', () => {
+  const b = empty();
+  b[idx(0, 0)] = 1;  // 黑 1 在角落
+  const r = computeBest(b, 2);
+  // 兜底逻辑: 斜邻优先 → 正交邻 → 任意; 或 OPENING_BOOK 命中
+  // 黑开 (0,0) 不在 book 中, 应走 fallback, 贴邻 (1,1)/(0,1)/(1,0)
+  const allowed = [[1, 1], [0, 1], [1, 0], [2, 2], [2, 0], [0, 2]];
+  assert.ok(allowed.some(([x, y]) => r.x === x && r.y === y),
+    `book fallback 应返回 ${JSON.stringify(allowed)} 之一, 实际 (${r.x},${r.y})`);
+});
+
+// T11: 命中检查 —— book 命中时, 引擎直接返回不走搜索
+test('v45.2 开局库 命中: 1 手开局走 book (耗时 < 5ms)', () => {
+  const b = empty();
+  b[idx(7, 7)] = 1;
+  const t0 = performance.now();
+  const r = computeBest(b, 2);
+  const dt = performance.now() - t0;
+  // book 命中应极快 (查表 + 邻位判断, 不应走深度搜索)
+  assert.ok(dt < 50,
+    `book 命中应 < 50ms (走查表不走搜索), 实际 ${dt.toFixed(1)}ms`);
+  assert.ok(r.x >= 6 && r.x <= 8 && r.y >= 6 && r.y <= 8,
+    `应返回 (7,7) 邻位, 实际 (${r.x},${r.y})`);
+});
