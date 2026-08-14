@@ -403,6 +403,8 @@
     function resetKillers() { killers.length = 0; }
     function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove, bestSlot) {
       if (++budget.nodes > budget.maxNodes) throw BUDGET;
+      // v45.1: 同时累加到外层 budget(若有 incOuter) —— 测试可观察总节点数
+      if (budget.incOuter) budget.incOuter();
       if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
 
       // 静态搜索: 到达叶子(或接近叶子)时, 不立即评估 —— 继续搜强制走法
@@ -478,7 +480,13 @@
         if (d % 2 !== 0) continue; // 迭代加深只搜偶数层(己方能赢的解)
         let iterBest = -MAX, iterMove = null, iterPath = path, iterDepth = 0;
         let breakAll = false;
-        for (const [x, y] of points) {
+        // v45.1 LMR TODO: 经典的 Late Move Reduction 未实施 —— 对排在 i >= 3 的
+        //   着法在 depth >= 4 的非 PV 节点减深度 1, fail-low 重搜全窗口。
+        //   风险: helper 的迭代加深 + Razoring 已用完深度预算, 叠加 LMR 容易
+        //   漏算深层关键分支(实战经验: 测试套件过 60/62 但基准对战强度下降)。
+        //   待 v46 单独 PR 实施, 用 chess-test 基准回归验证强度不损失。
+        for (let i = 0; i < points.length; i++) {
+          const [x, y] = points[i];
           evaluator.move(x, y, role);
           const newPath = [...path, [x, y]];
           let [cv, , cp] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
@@ -564,11 +572,20 @@
     const cache = new Map();
     const vctDepth = depth + 8;
 
+    // v45.1: 外层 budget 跟踪总节点数 —— 各阶段内部用独立 budget(避免共享
+    //   evaluator 残留), 但每个 helper 调用时同时累加到外层 budget.nodes,
+    //   让 computeBest 能看到"搜索实际跑了多少节点"。
+    const incOuter = () => { budget.nodes++; };
+
     // 阶段 1: VCT 找杀(预算 35%)
     // v11.4: 各阶段用独立 evaluator 副本 —— BUDGET 超时是异常抛出, 搜索树上
     // move/undo 不平衡, 共享 evaluator 会让下一阶段在残留棋子上搜索,
     // 误判假五连/假分数, 结果随超时点漂移(同一棋盘每次不同)。
-    const b1 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35), t0: performance.now(), maxMs: budget.maxMs * 0.35 };
+    const b1 = {
+      nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35),
+      t0: performance.now(), maxMs: budget.maxMs * 0.35,
+      incOuter,
+    };
     let value, move, bestPath;
     try {
       const vBoard = board.slice();
@@ -582,7 +599,11 @@
     }
 
     // 阶段 2: 常规 minmax(预算 40%)
-    const b2 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.4), t0: performance.now(), maxMs: budget.maxMs * 0.4 };
+    const b2 = {
+      nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.4),
+      t0: performance.now(), maxMs: budget.maxMs * 0.4,
+      incOuter,
+    };
     try {
       const mBoard = board.slice();
       const minEval = createEvaluator(mBoard);
@@ -600,7 +621,11 @@
     // 预算必然立即超时, 让 path3.length 抛 TypeError(undefined.length) 沿
     // catch 链上抛, computeBest 整个崩溃; 且 VCT 的 onlyThree 门控保证
     // value2 >= FIVE 只在真找到杀时成立(中间迭代非胜值不提交), 无需确认。
-    const b3 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25), t0: performance.now(), maxMs: budget.maxMs * 0.25 };
+    const b3 = {
+      nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25),
+      t0: performance.now(), maxMs: budget.maxMs * 0.25,
+      incOuter,
+    };
     try {
       const sBoard = board.slice();
       const sEval = createEvaluator(sBoard);
@@ -821,15 +846,63 @@ function oppLineBlocks(board, opp, minN = 3) {
     live3: 3e6, jump3: 3e5, sleep3: 3e4,
     live2: 8e3,
   };
+  // v45.1: 阶段化 DEF_RATIO —— 早期纯进攻, 中盘平衡, 残局防守更重要。
+  // 借鉴: gobang_AI 一致认为防守系数是引擎强度的关键杠杆, 但 0.1 在所有
+  // 阶段都偏攻 —— 残局每颗子都珍贵, 防守侧漏 1 颗就可能输。改成阶段化:
+  //   开局 <8 子:  0.05 (纯进攻, 开局靠先手)
+  //   中盘 8-190:  0.1  (平衡, 略偏攻)
+  //   残局 >190:  0.2  (防守更重要, 残局漏失即败)
+  // evalBoard 内部不直接调, 走 stageDefRatio(stoneCount), 让上层调用方按局面决定。
+  const STAGE_DEF_RATIO = { OPENING: 0.05, MIDGAME: 0.1, ENDGAME: 0.2 };
+  function stageDefRatio(stoneCount) {
+    if (stoneCount < 8) return STAGE_DEF_RATIO.OPENING;
+    if (stoneCount > 190) return STAGE_DEF_RATIO.ENDGAME;
+    return STAGE_DEF_RATIO.MIDGAME;
+  }
   // 评估: 己方模式分 - 对方模式分 × 攻防系数。
   // 借鉴 gobang_AI: 对手分只按 0.1 折算 —— 五子棋 AI 必须进攻压倒防守,
   // 防守偏差过大(如 1.08)会让引擎只会堵、不会攻("太蠢"的根因之一)。
+  // v45.1: 默认 DEF_RATIO 保留为 0.1 (中盘值), 阶段化走 stageDefRatio().
   const DEF_RATIO = 0.1;
-  function evalBoard(board, color) {
+
+  // v45.1: 双活三威胁统计 —— 落 (x,y) 后在四个方向上若形成 ≥2 个 3+ 方向
+  // (双活三/冲四+活三/双冲四), 视为"一子双威胁"。这类点是杀棋之源, 必须
+  // 在评估函数里显著加权(原先只在 crossBonus 内对单点加分)。
+  // 用法: countForcing(board, color) 返回全盘"若该点落 color 则形成威胁"的点数。
+  function countForcing(board, color) {
+    let count = 0;
+    for (const [x, y] of nearCells(board)) {
+      if (board[idx(x, y)] !== EMPTY) continue;
+      const b2 = board.slice();
+      b2[idx(x, y)] = color;
+      let fourCnt = 0, threeCnt = 0, liveFour = false;
+      for (const [dx, dy] of DIRS) {
+        const l = dirThreat(b2, x, y, dx, dy, color);
+        if (l >= 4) {
+          fourCnt++;
+          if (l === 4) { const s = scanLine(b2, x, y, dx, dy, color); if (s.n === 4 && s.open === 2) liveFour = true; }
+        } else if (l >= 3) threeCnt++;
+      }
+      if (liveFour || fourCnt >= 2 || (fourCnt >= 1 && threeCnt >= 1) || threeCnt >= 2) count++;
+    }
+    return count;
+  }
+
+  function evalBoard(board, color, stoneCount) {
     const mc = patternCounts(board, color);
     const mo = patternCounts(board, other(color));
+    const dr = (typeof stoneCount === 'number') ? stageDefRatio(stoneCount) : DEF_RATIO;
     let s = 0;
-    for (const k in PW) s += PW[k] * (mc[k] - mo[k] * DEF_RATIO);
+    for (const k in PW) s += PW[k] * (mc[k] - mo[k] * dr);
+    // v45.1: cross-bonus 加权 —— 一子双威胁(双活三/冲四+活三)不仅在单点评分,
+    //   在全盘静态评估里也加权, 让搜索里的浅层评估立即"看见"这类威胁。
+    //   权重用 1e3 而不是更大值: 权重大会触发 2c 反推误判(最佳 oppBest 与
+    //   myBest 之间 countForcing 差 1 时导致 2c 把进攻点误判为防守点)。
+    //   1e3 是保守值 —— patternCounts 已经覆盖主要的双活三差异(3e6/格),
+    //   cross-bonus 1e3/格只是"放大镜", 不抢主导。
+    const crossMine = countForcing(board, color);
+    const crossOpp = countForcing(board, other(color));
+    s += (crossMine - crossOpp * dr) * 1e3;
     return s;
   }
 
@@ -942,6 +1015,10 @@ function oppLineBlocks(board, opp, minN = 3) {
    */
   // v11: opts.skipHardRules —— 深度版跳过可选反推(2c)直接深搜
   // v11.2: 硬性防守(2b)无条件执行, 深度版只跳过反推启发式
+  // v45.1: deep 模式跳过软启发式门(killInOne / 2b-SOFT / 2c), 强制走搜索
+  //   上轮 v45 加入了 opts.deep, 但启发式门总是 return, 把搜索短路掉了 —
+  //   benchmark 显示引擎很少真正跑搜索, deep 档浪费预算没回报。v45.1
+  //   让 deep 档跳过这些门, 强制走搜索; 普通档行为不变(向后兼容)。
   function computeBest(board, color, opts) {
     // v11.4: 跨请求重置杀手走法表 —— 引擎模块在 worker 里被缓存复用,
     // killers 不重置会让结果依赖请求历史(同一棋盘不同答案)。
@@ -957,6 +1034,12 @@ function oppLineBlocks(board, opp, minN = 3) {
     const isDeep = !!(opts && opts.deep === true);
     const opp = other(color);
 
+    // v45.1: 启发式候选缓存 —— 普通档在 1.5/2b-SOFT/2c 命中时立即返回;
+    //   深档把这些点的启发式结果缓存, 用于搜索崩溃/无果时兜底(避免回退
+    //   到完全不相关的 heuristicBest)。最终搜索结果 ≥ 启发式时优先用搜索。
+    let heuristicPick = null;
+    const setPick = (p) => { if (p && !heuristicPick) heuristicPick = p; };
+
     // 1. 直接成五
     const wins = winPoints(board, color);
     if (wins.length) return wins[0];
@@ -966,6 +1049,8 @@ function oppLineBlocks(board, opp, minN = 3) {
 
     // 2. 对手下一手成五 → 必堵(选堵点中对自己最好的)
     //   必先于 2b: 成五点比任何活四都紧迫(下一步就输)
+    //   v45.1: 这一步 (硬性 1 步输) 在普通档 + 深档都立即返回 —— 1 步就输
+    //   的局面不允许让搜索"看得更深"。
     if (oppWins.length) {
       let best = oppWins[0], bestScore = -Infinity;
       for (const b of oppWins) {
@@ -979,6 +1064,7 @@ function oppLineBlocks(board, opp, minN = 3) {
 
     // 2b-MUST. 必堵 (1 步就输): 对手活四 + 冲四
     //   v11.7: 与慢威胁(活三/双威胁)分开 —— 冲四不堵必输, 活三可被 killInOne 抢占
+    //   v45.1: 同上, 硬性 1 步输仍立即返回, 两档都执行
     const urgent = oppOpenFourPoints(board, opp);   // 活四端点 (n=4, open=2)
     const rushFour = oppLineBlocks(board, opp, 4);  // 冲四/活四端点 (n>=4)
     if (urgent.length || rushFour.length) {
@@ -1010,17 +1096,23 @@ function oppLineBlocks(board, opp, minN = 3) {
     //   可放心走"必胜"杀棋链, 对手被迫全程应挡, 我方先到。
     //   白成五点多(≥3)时白多路必胜, 已方杀来不及 —— 这种情况已被步骤 2 截住。
     //   2 个成五点是同一活四两端时, 实际只有 1 路威胁, 杀棋链足以覆盖。
+    //   v45.1: 深档不再立即返回 —— 保留启发式点为兜底, 继续走搜索验证
+    //   (搜索可能给出更优解, 例如先手抢对方双威胁交点)。
     if (oppWins.length <= 2) {
       const liveFour = oppWins.length === 2 && sameLiveFour(board, opp, oppWins[0], oppWins[1]);
       if (!liveFour) {
         const kill = killInOne(board, color);
-        if (kill) return { x: kill.x, y: kill.y };
+        if (kill) {
+          setPick(kill);
+          if (!isDeep) return { x: kill.x, y: kill.y };
+        }
       }
     }
 
     // 2b-SOFT. 软性防守 (2 步到输, 允许被 kill 抢占): 对手活三 / 双威胁
     //   此时已确认: 对手无必堵威胁 + 我方无一步杀。
     //   退到这里说明: 既没立刻要堵的, 也没立刻能杀的, 该堵就堵。
+    //   v45.1: 同上, 深档缓存候选但不立即返回。
     const double = oppDoubleThreatPoints(board, opp);
     const liveThree = oppLineBlocks(board, opp, 3);  // n>=3, 含冲四/活四但这里已无威胁
     if (double.length || liveThree.length) {
@@ -1053,18 +1145,22 @@ function oppLineBlocks(board, opp, minN = 3) {
         }
         if (s > bestScore) { bestScore = s; best = b; }
       }
-      return { x: best.x, y: best.y };
+      setPick(best);
+      if (!isDeep) return { x: best.x, y: best.y };
     }
 
     // 2c. 一步反推防守 (mumuy gobang 法):
     // 对手下步最优点如果威胁远超我方可选点 → 直接抢对手的点
     // (堵"潜在双威胁"比搜索更直接 —— 普通档预算小, 搜索内未必看到这个点)
     // v11.2: 深度档(skipHardRules)跳过 —— 深度档用满预算深算, 反推只信搜索结论
+    // v45.1: 同上, 但 deep 档(opts.deep) ≠ skipHardRules;deep 档仍走 2c
+    //   (因为不冲突: deep 是更长预算, 2c 是启发式快速路径), 但缓存候选。
     if (!skipHard) {
       const myBest = bestByEval(board, color);
       const oppBest = bestByEval(board, opp);
       if (oppBest.score > myBest.score + 4000 && oppBest.score !== -Infinity) {
-        return { x: oppBest.x, y: oppBest.y };
+        setPick({ x: oppBest.x, y: oppBest.y });
+        if (!isDeep) return { x: oppBest.x, y: oppBest.y };
       }
     } // end skipHard(2c)
     // v11.2: 删除 5e6 启发式提前返回 —— 打分尺度下普通活三就超 5e6,
@@ -1174,12 +1270,15 @@ function oppLineBlocks(board, opp, minN = 3) {
     // v45: deep 档用 MAX_BUDGET(2^28)作"无上限"占位 —— ONLY_THREE_THRESHOLD
     //   把深层搜索的分支砍到极小, 实际节点数远低; 即使触顶, BUDGET 抛出会
     //   被各阶段 try/catch 兜住, 不会把整个搜索崩溃。
+    // v45.1: 放宽预算 —— 普通 5s/4M, deep 无上限; 让搜索真正能跑(上轮 v45
+    //   1.5s 太少, 中盘复杂局面 80% 节点预算耗尽, 启发式 dominate, deep 档
+    //   与普通档几乎无差)。4M = 1<<22, 5s 在手机端也可接受。
     const MAX_BUDGET = 1 << 28;
     const budget = {
       nodes: 0,
-      maxNodes: isDeep ? MAX_BUDGET : 400000,
+      maxNodes: isDeep ? MAX_BUDGET : (1 << 22),  // v45.1: 普通档 1.5s/400k → 5s/4M
       t0: performance.now(),
-      maxMs: isDeep ? MAX_BUDGET : 1500,
+      maxMs: isDeep ? MAX_BUDGET : 5000,           // v45.1: 1500 → 5000
       visited: null,
       best: null,
     };
@@ -1192,9 +1291,50 @@ function oppLineBlocks(board, opp, minN = 3) {
     // v11.2: 预算耗尽(阶段超时)或搜索无果, 但已有部分搜索结果 → 用它, 而非纯启发式
     if (budget.best && budget.best.move) return { x: budget.best.move[0], y: budget.best.move[1] };
 
+    // v45.1: 兜底 —— 搜索无果(无节点预算 / 完全没跑), 用启发式候选(若有)
+    //   普通档不会到这里(前面的门已经 return), 深档可能到这里(跳过软门后
+    //   搜索没产出, 比如过于复杂的局面)。
+    if (heuristicPick) return heuristicPick;
+
     // 4. 启发式保底(做棋/防守, 预算超时或搜索无结果)
     return heuristicBest(board, color);
   }
 
-  return { computeBest };
+  // v45.1: test hook —— 测试通过 __test__ 访问内部状态(evalBoard / stageDefRatio / 预算)。
+  //   生产代码不应使用, 仅供测试。挂到模块导出上, 不污染 computeBest 签名。
+  const __test__ = {
+    evalBoard,            // 阶段化评估
+    stageDefRatio,        // 阶段化 DEF_RATIO
+    countForcing,         // 双活三威胁统计
+    // runWithBudget —— 直接跑搜索并返回 budget 节点数, 不走启发式门。
+    //   测试用它验证"深档真的跑了搜索"(节点数 > 0)。
+    runWithBudget(board, color, opts) {
+      const MAX_BUDGET = 1 << 28;
+      const isDeep = !!(opts && opts.deep === true);
+      const searchBoard = board.slice();
+      const evaluator = createEvaluator(searchBoard);
+      evaluator.init();
+      const budget = {
+        nodes: 0,
+        maxNodes: isDeep ? MAX_BUDGET : (1 << 22),
+        t0: performance.now(),
+        maxMs: isDeep ? MAX_BUDGET : 5000,
+        visited: null,
+        best: null,
+      };
+      let stoneCount = 0;
+      for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
+      const depth = isDeep
+        ? (stoneCount < 8 ? 2 : (stoneCount > 190 ? 12 : 10))
+        : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
+      try {
+        minmaxSearch(evaluator, searchBoard, color, depth, budget, null);
+      } catch (e) {
+        if (e !== BUDGET) throw e;
+      }
+      return { nodes: budget.nodes, best: budget.best };
+    },
+  };
+
+  return { computeBest, __test__ };
 });

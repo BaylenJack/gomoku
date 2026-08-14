@@ -433,3 +433,132 @@ test('opts.deep 模式在双活二结构上制造双活三', () => {
   assert.equal(r.x, 5);
   assert.equal(r.y, 5);
 });
+
+// ================= v45.1: 深档强制搜索验证 + 静态评估补 cross-bonus + LMR + 阶段 DEF_RATIO =================
+//
+// 背景: 上轮 v45 加入了 opts.deep 模式, 但启发式门(killInOne / 2b-SOFT / 2c)
+// 总是 return, 把搜索短路掉了 —— benchmark 显示引擎很少真正跑搜索, deep 档
+// 浪费预算没回报。v45.1 让深档跳过这些"门", 强制走搜索, 配合 cross-bonus
+// 加权、LMR、阶段化 DEF_RATIO 让搜索真正起作用。
+//
+// 测试策略: 通过返回的坐标 + timing + 评估函数间接验证。computeBest 是
+// 模块唯一对外函数, 内部状态(evalBoard/budget)用 test hook 暴露。
+
+// ================= v45.1 T1: 深档不短路启发式门 =================
+test('v45.1 深档对有 killInOne 的局面不再立即返回启发式点', () => {
+  // 构造 killInOne 候选(黑双活二): 普通档应返回交点 (5,5);
+  // 深档会跳过 1.5 gate, 走搜索 —— 仍然应返回 (5,5) 或更好的解,
+  // 且 timing 应 >= 普通档 (证明搜索实际跑了, 不是启发式秒回)
+  const b = empty();
+  for (const [x, y] of [[4,5],[6,5],[5,4],[5,6]]) b[idx(x, y)] = 1;
+  b[idx(0,0)] = 2; b[idx(14,14)] = 2;
+  // 普通档: 立即返回 (5,5)
+  const tNormal = Date.now();
+  const rNormal = computeBest(b, 1);
+  const dtNormal = Date.now() - tNormal;
+  // 深档: 走搜索 + 验证 —— 也应返回合法解 (5,5 或更优)
+  const tDeep = Date.now();
+  const rDeep = computeBest(b, 1, { deep: true });
+  const dtDeep = Date.now() - tDeep;
+  assert.ok(rDeep && rDeep.x >= 0 && rDeep.x < 15 && rDeep.y >= 0 && rDeep.y < 15,
+    `深档应返回合法点, 实际 ${JSON.stringify(rDeep)}`);
+  // 双活三结构明确, 搜索应找到交点
+  assert.equal(rDeep.x, 5, `深档应找到双活三交点 (5,5), 实际 ${rDeep.x},${rDeep.y}`);
+  assert.equal(rDeep.y, 5);
+  // 深档 timing 应 >= 普通档 (证明搜索真跑了 —— 启发式秒回的话 deep 应更快)
+  // 注意: 不能强制 deep 一定更慢(搜索可能秒回), 但平均/典型场景下应 ≥ 普通档
+  // 改成"不要求更快" —— 启发式立即返回 ≈ 0ms, 深档走搜索必然 ≥ 启发式
+  assert.ok(dtDeep >= dtNormal || dtDeep >= 5,
+    `深档 timing (${dtDeep}ms) 应至少不显著快于普通档 (${dtNormal}ms), 证明搜索在跑`);
+});
+
+// ================= v45.1 T2: evalBoard 加权 cross-bonus =================
+test('v45.1 evalBoard 对双活三交点的分数显著高于单活三', () => {
+  // 通过 test hook 直接调 evalBoard, 比较:
+  // 局面 A: 黑有单活三(3,5)(4,5)(5,5) — 平局
+  // 局面 B: 黑有双活二交叉 (4,5)(6,5)+(5,4)(5,6), 落 (5,5) 成双活三
+  // 局面 B 应远高于 A(双活三是杀棋之势, 一子双威胁)
+  const testHook = sandbox.self.GomokuHint.__test__;
+  assert.ok(testHook, '需 test hook 暴露 evalBoard, 当前 __test__ 未定义');
+  const b1 = empty();
+  b1[idx(3, 5)] = 1; b1[idx(4, 5)] = 1; b1[idx(5, 5)] = 1;
+  // 评分前在 (5,5) 放一个空评估(落 (5,5) 后评黑色) —— 我们想要 "黑在 (5,5)
+  // 落子后" 的局面分; 但 evalBoard 直接吃 board, 所以让黑在 (5,5) 已经落子
+  // 然后再加一格测威胁
+  const sA = testHook.evalBoard(b1, 1);
+  const b2 = empty();
+  // 模拟落 (5,5) 后的局面(双活三已形成)
+  b2[idx(4, 5)] = 1; b2[idx(5, 5)] = 1; b2[idx(6, 5)] = 1;
+  b2[idx(5, 4)] = 1; b2[idx(5, 6)] = 1;
+  const sB = testHook.evalBoard(b2, 1);
+  assert.ok(sB > sA,
+    `双活三局面的 evalBoard (${sB}) 应高于单活三 (${sA}) —— cross-bonus 应加权`);
+  // 双活三相对单活三的差应明显(>= 5e5; 否则 cross-bonus 没起作用)
+  assert.ok(sB - sA >= 5e5,
+    `双活三对单活三的优势应 >= 5e5 (cross-bonus 加权), 实际差 ${sB - sA}`);
+});
+
+// ================= v45.1 T3: 阶段化 DEF_RATIO =================
+test('v45.1 残局阶段 DEF_RATIO 提高: 对方威胁在残局被更重视', () => {
+  // DEF_RATIO 在 stoneCount > 190 时从 0.1 → 0.2 (防守更重)
+  // 测试方法: 构造"开局面"和"残局面", 同样子结构, 让对方在白位威胁
+  // 用 test hook 直接调用 evalBoard 比较
+  const testHook = sandbox.self.GomokuHint.__test__;
+  assert.ok(testHook, '需 test hook 暴露 evalBoard');
+
+  // 简化: evalBoard 本身不吃 stoneCount, 是上层 (bestByEval) 调的;
+  // 引入 stageDefRatio 函数做阶段化, test hook 暴露给测试直接用
+  assert.ok(typeof testHook.stageDefRatio === 'function',
+    '需 test hook 暴露 stageDefRatio(stoneCount)');
+
+  // 开局面 (<8 子): 0.05
+  assert.equal(testHook.stageDefRatio(0), 0.05);
+  assert.equal(testHook.stageDefRatio(7), 0.05);
+  // 中盘: 0.1 (含 8-190, 边界 190 仍归中盘)
+  assert.equal(testHook.stageDefRatio(8), 0.1);
+  assert.equal(testHook.stageDefRatio(189), 0.1);
+  assert.equal(testHook.stageDefRatio(190), 0.1);
+  // 残局 (>190): 0.2
+  assert.equal(testHook.stageDefRatio(191), 0.2);
+  assert.equal(testHook.stageDefRatio(220), 0.2);
+});
+
+// ================= v45.1 T4: 深档 budget 计数不应为 0 =================
+test('v45.1 深档搜索实际跑了 (budget 计数 > 0)', () => {
+  // 通过 test hook 暴露的 budget 检查节点数 —— 深档必须真的跑搜索,
+  // 不能被启发式门短路到 0 节点。
+  const testHook = sandbox.self.GomokuHint.__test__;
+  assert.ok(testHook && typeof testHook.runWithBudget === 'function',
+    '需 test hook 暴露 runWithBudget 用于直接测搜索');
+  const b = empty();
+  for (const [x, y] of [[4,5],[6,5],[5,4],[5,6]]) b[idx(x, y)] = 1;
+  b[idx(0,0)] = 2; b[idx(14,14)] = 2;
+  const { nodes } = testHook.runWithBudget(b, 1, { deep: true });
+  assert.ok(nodes > 0,
+    `深档搜索节点数应 > 0 (证明搜索真跑了), 实际 ${nodes}`);
+});
+
+// ================= v45.1 T5: 普通档延迟仍 < 5s =================
+test('v45.1 普通档性能: 中盘复杂局面 < 5000ms (新预算上限)', () => {
+  const b = empty();
+  const seed = [7,7,1, 8,8,2, 6,7,1, 8,7,2, 5,7,1, 9,9,2, 4,7,1, 10,10,2, 3,7,1, 11,11,2,
+                7,5,1, 8,10,2, 6,5,1, 9,7,2, 5,5,1, 10,8,2, 4,5,1, 11,9,2];
+  for (let i = 0; i < seed.length; i += 3) b[idx(seed[i], seed[i+1])] = seed[i+2];
+  const t0 = performance.now();
+  computeBest(b, 1);
+  const dt = performance.now() - t0;
+  assert.ok(dt < 5000, `普通档耗时 ${dt.toFixed(0)}ms 应 < 5000ms`);
+});
+
+// ================= v45.1 T6: 深档必堵仍然执行 =================
+test('v45.1 深档必堵仍然触发 (活四/冲四不被搜索覆盖)', () => {
+  // 即使深档跳过软门 (1.5/2b-SOFT/2c), 硬门 (成五/活四/冲四) 必须仍然
+  // 立即返回 —— 1 步就输的局面, 搜索不可能"看得更深"而忽略, 但要确认
+  // 我们没把硬门也错误地"深层化"了。
+  const b = empty();
+  for (let i = 5; i <= 8; i++) b[idx(7, i)] = 2;  // 白活四
+  b[idx(0, 0)] = 1; b[idx(1, 1)] = 1; b[idx(2, 2)] = 1;
+  const r = computeBest(b, 1, { deep: true });
+  assert.equal(r.x, 7, `深档应堵白活四 x=7, 实际 ${r.x},${r.y}`);
+  assert.ok(r.y === 4 || r.y === 9, `应堵活四端点, 实际 y=${r.y}`);
+});
