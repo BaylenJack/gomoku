@@ -14,6 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { BLACK, WHITE } from './game.js';
 import { Store } from './store.js';
 import {
   createRoom,
@@ -26,8 +27,6 @@ import {
   newGame,
   publicView,
   seatCount,
-  BLACK,
-  WHITE,
 } from './room.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
