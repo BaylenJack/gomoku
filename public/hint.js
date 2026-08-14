@@ -383,23 +383,16 @@
 
   // ---------- MiniMax + Alpha-Beta + 迭代加深 (gobang minmax.js) ----------
   const MAX = 1000000000;
-  // v12.0: TT cache 8k → 32k (深度档 10M 节点场景下原 8k 太小, cache 满了之后
-  //   新条目被丢弃, 缓存形同虚设)。配合 LRU 驱逐 —— 写满时删最旧条目,
-  //   保证新条目有空间, 旧有用条目不会被无脑挤掉。
-  const CACHE_MAX = 32768;
+  const CACHE_MAX = 8000;
 
   // onlyThree: VCT 变体(只搜活三+/冲四); onlyFour: VCF 变体(只搜四/五)
   // v10 (PentaZen 剪枝): 杀手走法 + 静态搜索 + Razoring/Futility
   function makeMinmax(onlyThree = false, onlyFour = false) {
     // 杀手走法表: killers[深度][0/1] —— 记录剪枝成功的走法, 同深度优先试
     const killers = [];
-    // v12.0: history heuristic —— 跨深度统计每个 move 引起 beta 剪枝的次数,
-    //   按 history 降序作为首选排序。业界经验值: 在深度档下可省 20-35% 节点。
-    //   只用 move 索引 (curIdx) 而非 (from, to) 对, 内存 225*4=900B, 够用。
-    const history = new Int32Array(SIZE * SIZE);
-    // v11.4: 跨请求重置 —— worker 缓存引擎模块, killers/history 不重置会把上一请求的
+    // v11.4: 跨请求重置 —— worker 缓存引擎模块, killers 不重置会把上一请求的
     // 剪枝记录泄漏进下一请求的走法排序, 预算截断时结果随请求历史漂移。
-    function resetKillers() { killers.length = 0; history.fill(0); }
+    function resetKillers() { killers.length = 0; }
     function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove, bestSlot) {
       if (++budget.nodes > budget.maxNodes) throw BUDGET;
       if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
@@ -433,13 +426,6 @@
       // gobang_AI order: 离最后落子近的点优先搜索(Alpha-Beta 剪枝效率关键)
       let points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour, lastMove);
       if (!points.length) return [evaluator.evaluate(role), null, path];
-
-      // v12.0: history-first sort —— history[m] 越大, 排越越前, 引起剪枝的走法优先试。
-      //   使用稳定排序 (Array.prototype.sort 本身就是稳定的, ES2019+)。
-      //   写时用 slice() 避免修改原数组(可能上游 getValuableMoves 缓存了)。
-      points = points.slice().sort((a, b) =>
-        history[b[0] * SIZE + b[1]] - history[a[0] * SIZE + a[1]]
-      );
 
       // v10 杀手走法: 把剪枝成功的走法排到最前面(同深度优先试)。
       // 注意: killers 按 cDepth 索引(同深度节点), 只在剪枝时写入;
@@ -491,9 +477,6 @@
               killers[cDepth][1] = killers[cDepth][0];
               killers[cDepth][0] = x * SIZE + y;
             }
-            // v12.0: 更新 history —— 深层剪枝权重大(平方), 浅层权重小,
-            //   避免浅层"被堵后重新可走"导致 history 被刷爆
-            history[x * SIZE + y] += (depth - cDepth) * (depth - cDepth);
             break;
           }
           if (alpha >= FIVE) { breakAll = true; break; } // 自己赢了就结束
@@ -518,10 +501,7 @@
         if (breakAll) break;
       }
 
-      // v12.0: LRU 驱逐 —— cache 满了先删最旧条目(Map 保留插入顺序),
-      //   避免反模式"满了就不写"导致新有用条目被无脑丢
-      if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);
-      if (!prev || prev.depth < depth - cDepth) {
+      if (cache.size < CACHE_MAX && (!prev || prev.depth < depth - cDepth)) {
         cache.set(key, {
           depth: depth - cDepth,
           value,
@@ -553,12 +533,11 @@
     const cache = new Map();
     const vctDepth = depth + 8;
 
-    // 阶段 1: VCT 找杀(预算 20%) —— v12.0: 从 35% 降到 20%, 大多数盘面无强制杀,
-    //   VCT 只消耗预算找不到东西。省下的 15% 给阶段 2, 主搜索更深。
+    // 阶段 1: VCT 找杀(预算 35%)
     // v11.4: 各阶段用独立 evaluator 副本 —— BUDGET 超时是异常抛出, 搜索树上
     // move/undo 不平衡, 共享 evaluator 会让下一阶段在残留棋子上搜索,
     // 误判假五连/假分数, 结果随超时点漂移(同一棋盘每次不同)。
-    const b1 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.20), t0: performance.now(), maxMs: budget.maxMs * 0.20 };
+    const b1 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35), t0: performance.now(), maxMs: budget.maxMs * 0.35 };
     let value, move, bestPath;
     try {
       const vBoard = board.slice();
@@ -571,8 +550,8 @@
       // 阶段 1 超时: 保留已搜到的部分结果, 继续阶段 2
     }
 
-    // 阶段 2: 常规 minmax(预算 60%) —— v12.0: 从 40% 提到 60%, 主要受益者
-    const b2 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.60), t0: performance.now(), maxMs: budget.maxMs * 0.60 };
+    // 阶段 2: 常规 minmax(预算 40%)
+    const b2 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.4), t0: performance.now(), maxMs: budget.maxMs * 0.4 };
     try {
       const mBoard = board.slice();
       const minEval = createEvaluator(mBoard);
@@ -582,18 +561,15 @@
       if (e !== BUDGET) throw e;
     }
     if (!move) return null;
-    // v12.0: 阶段 2 已找到必胜(value >= FIVE), 不可能有更优解, 跳过阶段 3
-    //   (阶段 3 是查对手 VCT 反杀, 己方已赢则对手无法反杀)
-    if (value >= FIVE) return { move, value, path: bestPath };
 
-    // 阶段 3: 防守校验(预算 20%) —— v12.0: 从 25% 降到 20%
-    // 我落 move 后对手能否 VCT 杀? 能且己方无必胜 → 改堵对方杀棋起点(防守妙手, 补 2b 的盲区:
+    // 阶段 3: 防守校验(预算 25%) —— 我落 move 后对手能否 VCT 杀?
+    // 能且己方无必胜 → 改堵对方杀棋起点(防守妙手, 补 2b 的盲区:
     // 2b 只拦 1-2 步的盘面威胁, 搜索级的强制杀链由这里拦截)。
     // v11.5: 删第二次"确认"调用 —— 第一次 vct 已耗尽 b3, 第二次共享同一
     // 预算必然立即超时, 让 path3.length 抛 TypeError(undefined.length) 沿
     // catch 链上抛, computeBest 整个崩溃; 且 VCT 的 onlyThree 门控保证
     // value2 >= FIVE 只在真找到杀时成立(中间迭代非胜值不提交), 无需确认。
-    const b3 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.20), t0: performance.now(), maxMs: budget.maxMs * 0.20 };
+    const b3 = { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25), t0: performance.now(), maxMs: budget.maxMs * 0.25 };
     try {
       const sBoard = board.slice();
       const sEval = createEvaluator(sBoard);
