@@ -342,7 +342,7 @@
   // v8: 动态深度降级 —— 深度 > 6 层时强制只搜活三/冲四(gobang onlyThreeThreshold)。
   // 这是 gobang 能搜 12 层的核心: 深层只搜威胁, 分支砍到极小。
   const ONLY_THREE_THRESHOLD = 6;
-  function getValuableMoves(evaluator, board, role, depth, onlyThree, onlyFour, lastMove) {
+  function getValuableMoves(evaluator, board, role, depth, onlyThree, onlyFour, lastMove, jitterSeed) {
     const N = SIZE;
     // 深度降级: 深层搜索只保留活三/冲四/成五级威胁
     const deep = depth > ONLY_THREE_THRESHOLD && !onlyThree && !onlyFour;
@@ -417,14 +417,28 @@
     //   剪枝质量下降。改成"去重后保留前 N 个", 同优先级内按 board 遍历顺序
     //   (y*SIZE+x 升序), 足够稳定。
     const orderNear = (arr, n) => dedupe(arr).slice(0, n);
+    // v46 Lazy SMP: stable shuffle —— 不同 worker 不同 jitterSeed,
+    //   保留前 KEEP 个不动(已是 killer/ttMove 优先级最高段), 后段 Fisher-Yates
+    //   让 worker 间走法顺序分散 → 谈合时选出更强解。
+    const KEEP = 8;
+    const applyJitter = (points) => {
+      if (!jitterSeed || points.length <= KEEP) return points;
+      const rnd = mulberry32(jitterSeed >>> 0);
+      const tail = points.slice(KEEP);
+      for (let i = tail.length - 1; i > 0; i--) {
+        const j = Math.floor(rnd() * (i + 1));
+        [tail[i], tail[j]] = [tail[j], tail[i]];
+      }
+      return [...points.slice(0, KEEP), ...tail];
+    };
 
-    if (sets.five.length || sets.blockFive.length) return orderNear([...sets.five, ...sets.blockFive], 8);
-    if (onlyFour || sets.four.length) return orderNear([...sets.four, ...sets.blockFour], 12);
-    if (sets.fourFour.length) return orderNear([...sets.fourFour, ...sets.blockFour], 12);
-    if (sets.fourThree.length) return orderNear([...sets.fourThree, ...sets.blockFour, ...sets.three], 14);
-    if (sets.threeThree.length) return orderNear([...sets.threeThree, ...sets.blockFour, ...sets.three], 14);
-    if (onlyThree) return orderNear([...sets.blockFour, ...sets.three], 14);
-    return orderNear([...sets.blockFour, ...sets.three, ...sets.blockThree, ...sets.twoTwo, ...sets.two], 16);
+    if (sets.five.length || sets.blockFive.length) return applyJitter(orderNear([...sets.five, ...sets.blockFive], 8));
+    if (onlyFour || sets.four.length) return applyJitter(orderNear([...sets.four, ...sets.blockFour], 12));
+    if (sets.fourFour.length) return applyJitter(orderNear([...sets.fourFour, ...sets.blockFour], 12));
+    if (sets.fourThree.length) return applyJitter(orderNear([...sets.fourThree, ...sets.blockFour, ...sets.three], 14));
+    if (sets.threeThree.length) return applyJitter(orderNear([...sets.threeThree, ...sets.blockFour, ...sets.three], 14));
+    if (onlyThree) return applyJitter(orderNear([...sets.blockFour, ...sets.three], 14));
+    return applyJitter(orderNear([...sets.blockFour, ...sets.three, ...sets.blockThree, ...sets.twoTwo, ...sets.two], 16));
   }
 
   function hasNeighbor(board, x, y) {
@@ -527,7 +541,9 @@
       const ttMove = prev && prev.move ? prev.move : null;
 
       // gobang_AI order: 离最后落子近的点优先搜索(Alpha-Beta 剪枝效率关键)
-      let points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour, lastMove);
+      // v46 Lazy SMP: jitterSeed 来自 budget(computeBest 设置), 让不同 worker
+      //   在 getValuableMoves 尾段走不同 Fisher-Yates 顺序, 谈合时分散候选
+      let points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour, lastMove, budget.jitterSeed);
       if (!points.length) return [evaluator.evaluate(role), null, path];
 
       // v10 杀手走法: 把剪枝成功的走法排到最前面(同深度优先试)。
@@ -1108,6 +1124,9 @@ function oppLineBlocks(board, opp, minN = 3) {
   //   上轮 v45 加入了 opts.deep, 但启发式门总是 return, 把搜索短路掉了 —
   //   benchmark 显示引擎很少真正跑搜索, deep 档浪费预算没回报。v45.1
   //   让 deep 档跳过这些门, 强制走搜索; 普通档行为不变(向后兼容)。
+  // v46 Lazy SMP: workerId/jitterSeed 让多 worker 在搜索走法排序上分散 —
+  //   getValuableMoves 用 jitterSeed 对候选段做 Fisher-Yates, dispatcher
+  //   谈合后选全局最优。workerId=0(单跑/无 dispatcher) 不抖动, 保持确定。
   function computeBest(board, color, opts) {
     // v11.4: 跨请求重置杀手走法表 —— 引擎模块在 worker 里被缓存复用,
     // killers 不重置会让结果依赖请求历史(同一棋盘不同答案)。
@@ -1115,12 +1134,18 @@ function oppLineBlocks(board, opp, minN = 3) {
     _minmax.resetKillers();
     vct.resetHistory();
     _minmax.resetHistory();
+    const workerId = (opts && typeof opts.workerId === 'number') ? opts.workerId : 0;
+    const jitterSeed = (opts && typeof opts.jitterSeed === 'number')
+      ? opts.jitterSeed >>> 0
+      : 0;
     const skipHard = opts && opts.skipHardRules === true;
     // v45: 原生 deep 模式 —— 走 opts.deep=true, 深度预算大幅提升
     // (替代 hint-worker.cjs 的字符串替换 hack)。MAX_BUDGET 是 2^28,
     // 实际预算由 ONLY_THREE_THRESHOLD / move 生成层限制, 永不会触顶;
     // 保留 BUDGET throwable 用于边界保护(如递归异常时强制退出)。
     const isDeep = !!(opts && opts.deep === true);
+    // v46 Lazy SMP: workerId=0(单跑/无 dispatcher) 不抖动, 保证确定
+    const useJitter = isDeep && workerId > 0;
     const opp = other(color);
 
     // v45.1: 启发式候选缓存 —— 普通档在 1.5/2b-SOFT/2c 命中时立即返回;
@@ -1334,6 +1359,8 @@ function oppLineBlocks(board, opp, minN = 3) {
       maxMs: isDeep ? MAX_BUDGET : 5000,           // v45.1: 1500 → 5000
       visited: null,
       best: null,
+      // v46 Lazy SMP: jitterSeed 透传到 helper → getValuableMoves 尾段 Fisher-Yates
+      jitterSeed: useJitter ? jitterSeed : 0,
     };
     // v45.2: depth 沿用 v11 参数化 (v45 普通 6, deep 10-12)
     const depth = isDeep
@@ -1341,20 +1368,29 @@ function oppLineBlocks(board, opp, minN = 3) {
       : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
     try {
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
-      if (res && res.move) return { x: res.move[0], y: res.move[1] };
+      if (res && res.move) {
+        const r = { x: res.move[0], y: res.move[1] };
+        return useJitter ? { ...r, jitterUsed: true } : r;
+      }
     } catch (e) {
       if (e !== BUDGET) throw e;
     }
     // v11.2: 预算耗尽(阶段超时)或搜索无果, 但已有部分搜索结果 → 用它, 而非纯启发式
-    if (budget.best && budget.best.move) return { x: budget.best.move[0], y: budget.best.move[1] };
+    if (budget.best && budget.best.move) {
+      const r = { x: budget.best.move[0], y: budget.best.move[1] };
+      return useJitter ? { ...r, jitterUsed: true } : r;
+    }
 
     // v45.1: 兜底 —— 搜索无果(无节点预算 / 完全没跑), 用启发式候选(若有)
     //   普通档不会到这里(前面的门已经 return), 深档可能到这里(跳过软门后
     //   搜索没产出, 比如过于复杂的局面)。
-    if (heuristicPick) return heuristicPick;
+    if (heuristicPick) {
+      return useJitter ? { ...heuristicPick, jitterUsed: true } : heuristicPick;
+    }
 
     // 4. 启发式保底(做棋/防守, 预算超时或搜索无结果)
-    return heuristicBest(board, color);
+    const fallback = heuristicBest(board, color);
+    return useJitter ? { ...fallback, jitterUsed: true } : fallback;
   }
 
   // v45.1: test hook —— 测试通过 __test__ 访问内部状态(evalBoard / stageDefRatio / 预算)。
