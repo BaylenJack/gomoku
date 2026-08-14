@@ -400,3 +400,36 @@ test('v11.7 对手无冲四时 killInOne 仍生效', () => {
   assert.equal(r.x, 5, `应落双活三交点, 实际 (${r.x},${r.y})`);
   assert.equal(r.y, 5);
 });
+
+// ================= v45: 原生 opts.deep + history 启发 + TT best-move 排序 =================
+
+test('opts.deep 模式返回合法点 (普通局面)', () => {
+  const b = empty();
+  const seed = [7,7,1, 8,8,2, 6,7,1, 8,7,2, 5,7,1, 9,9,2, 4,7,1, 10,10,2, 3,7,1, 11,11,2];
+  for (let i = 0; i < seed.length; i += 3) b[idx(seed[i], seed[i+1])] = seed[i+2];
+  const r = computeBest(b, 1, { deep: true });
+  assert.ok(r && r.x >= 0 && r.x < 15 && r.y >= 0 && r.y < 15,
+    `deep 模式应返回合法点, 实际 ${JSON.stringify(r)}`);
+  // 普通局面也必须不污染
+  const before = b.slice();
+  computeBest(b, 1, { deep: true });
+  for (let i = 0; i < b.length; i++) assert.equal(b[i], before[i], 'deep 模式污染了棋盘');
+});
+
+test('opts.deep 模式必堵对手活四', () => {
+  const b = empty();
+  for (let i = 5; i <= 8; i++) b[idx(7, i)] = 2;  // 白活四
+  b[idx(0, 0)] = 1; b[idx(1, 1)] = 1; b[idx(2, 2)] = 1;
+  const r = computeBest(b, 1, { deep: true });
+  assert.equal(r.x, 7, `deep 模式应堵白活四, 实际 ${r.x},${r.y}`);
+  assert.ok(r.y === 4 || r.y === 9, `应堵活四端点, 实际 y=${r.y}`);
+});
+
+test('opts.deep 模式在双活二结构上制造双活三', () => {
+  const b = empty();
+  for (const [x, y] of [[4,5],[6,5],[5,4],[5,6]]) b[idx(x, y)] = 1;
+  b[idx(0,0)] = 2; b[idx(14,14)] = 2;
+  const r = computeBest(b, 1, { deep: true });
+  assert.equal(r.x, 5);
+  assert.equal(r.y, 5);
+});

@@ -10,47 +10,18 @@ const path = require('node:path');
 
 const HINT_PATH = path.join(workerData.publicDir, 'hint.js');
 
-// 两个档位的引擎模块缓存 (vm 编译一次, 之后复用)
-const engineCache = { normal: null, deep: null };
-
-function loadEngine(deep) {
-  const key = deep ? 'deep' : 'normal';
-  if (engineCache[key]) return engineCache[key];
+// v45: 引擎模块缓存(单实例) —— 编译一次, 后续请求复用。
+// 原"两档分别缓存"是因为深度档通过字符串替换升级预算才需要两套实例;
+// 现在 opts.deep 在引擎内部原生支持, 一份引擎模块就够, 减少 VM 内存占用。
+let cachedEngine = null;
+function loadEngine() {
+  if (cachedEngine) return cachedEngine;
   let src;
   try {
     src = fs.readFileSync(HINT_PATH, 'utf8');
   } catch (e) {
     return { error: '引擎文件读取失败: ' + e.message };
   }
-  // 预算替换: 普通 3s/100万节点, 深度 15s/1000万节点
-  // v11: 深度版深度 6 → 10 (配合深层威胁过滤 ONLY_THREE_THRESHOLD)
-  const [fromNodes, toNodes, fromMs, toMs, fromDepth, toDepth] = deep
-    ? ['maxNodes: 400000', 'maxNodes: 10000000', 'maxMs: 1500', 'maxMs: 15000',
-       'const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);',
-       'const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 10);']
-    : ['maxNodes: 400000', 'maxNodes: 1000000', 'maxMs: 1500', 'maxMs: 3000', null, null];
-  const origSrc = src; // 替换前原文 —— 命中检查必须对照它
-  src = src.replace(fromNodes, toNodes).replace(fromMs, toMs);
-  if (fromDepth) src = src.replace(fromDepth, toDepth);
-  // 预算替换命中检查 —— 替换静默失效会让"深度档"悄悄退回普通档。
-  // 注意不能查 !src.includes(fromMs): 'maxMs: 15000' 包含子串 'maxMs: 1500',
-  // 用替换前的原文判断 from 存在、替换后 to 已出现。
-  // to 值检查用数字词边界: 'maxNodes: 10000000' 整体作为 token 检查,
-  // 避免 '1000000' 命中 '10000000' 之类的子串误判。
-  const numRe = (n) => new RegExp('(^|[^0-9])' + n + '([^0-9]|$)');
-  const expected = [fromNodes, fromMs, ...(deep ? [fromDepth] : [])].filter(Boolean);
-  const actual = deep ? [toNodes, toMs, toDepth] : [toNodes, toMs];
-  const hit = expected.every((f) => origSrc.includes(f))
-    && actual.every((t) => {
-      const m = t.match(/(\d+)/);
-      return m ? numRe(m[1]).test(src) : src.includes(t);
-    });
-  if (!hit) {
-    console.error(`[hint] 预算替换未命中: ${key} 档 —— 档位预算失效!`);
-  } else {
-    console.log(`[hint] 引擎加载: ${key} 档 (${deep ? '15s/1000万节点/深度10' : '3s/100万节点/深度6'})`);
-  }
-
   const sandbox = {
     module: { exports: {} },
     exports: {},
@@ -62,12 +33,12 @@ function loadEngine(deep) {
   sandbox.globalThis = sandbox;
   try {
     vm.createContext(sandbox);
-    vm.runInContext(src, sandbox, { timeout: deep ? 30000 : 10000 });
+    vm.runInContext(src, sandbox, { timeout: 30000 });
     const mod = sandbox.module.exports;
     if (!mod || typeof mod.computeBest !== 'function') {
       return { error: '引擎加载异常' };
     }
-    engineCache[key] = mod;
+    cachedEngine = mod;
     return mod;
   } catch (e) {
     return { error: '引擎编译失败: ' + e.message };
@@ -76,9 +47,10 @@ function loadEngine(deep) {
 
 parentPort.on('message', (msg) => {
   const stones = msg.board ? msg.board.filter((c) => c !== 0).length : -1;
-  // v11.2: 请求/完成日志 —— 服务端日志只看到总耗时, worker 侧能定位档位分配
-  console.log(`[hint] 开始: id=${msg.id} deep=${msg.deep === true} 棋子=${stones}`);
-  const engine = loadEngine(msg.deep === true);
+  // v45: deep 模式由引擎原生 opts.deep 控制 —— 不再需要字符串替换升预算
+  const deep = msg.deep === true;
+  console.log(`[hint] 开始: id=${msg.id} deep=${deep} 棋子=${stones}`);
+  const engine = loadEngine();
   if (engine.error) {
     console.log(`[hint] 失败: id=${msg.id} ${engine.error}`);
     parentPort.postMessage({ id: msg.id, error: engine.error });
@@ -87,9 +59,8 @@ parentPort.on('message', (msg) => {
   const t0 = Date.now();
   let r;
   try {
-    // v11.2: skipHardRules 只跳过可选反推(2c); 硬性防守(2b)在引擎内无条件执行
     r = engine.computeBest(msg.board, msg.color,
-      msg.deep === true ? { skipHardRules: true } : undefined);
+      deep ? { deep: true } : undefined);
   } catch (e) {
     console.log(`[hint] 失败: id=${msg.id} 计算失败: ${e.message}`);
     parentPort.postMessage({ id: msg.id, error: '计算失败: ' + e.message });
@@ -101,6 +72,6 @@ parentPort.on('message', (msg) => {
     x: r.x,
     y: r.y,
     ms: Date.now() - t0,
-    deep: msg.deep === true,
+    deep,
   });
 });

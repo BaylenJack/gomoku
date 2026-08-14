@@ -385,6 +385,14 @@
   const MAX = 1000000000;
   const CACHE_MAX = 8000;
 
+  // v45: history 启发 —— 走法按"历史剪枝分"降序排列, 让 alpha-beta 优先试
+  //   历史上剪过枝的格子。同深度的 killer 只覆盖本层; history 跨深度累计,
+  //   对深层搜索增益更显著(浅层 killer 已重置, history 保留累计经验)。
+  //   用 to-square 单 key(而非 from→to 对), 225 格的 Int32Array 足够,
+  //   数据局部性更好(L1 命中率高)。
+  const HISTORY = new Int32Array(SIZE * SIZE);
+  function resetHistory() { HISTORY.fill(0); }
+
   // onlyThree: VCT 变体(只搜活三+/冲四); onlyFour: VCF 变体(只搜四/五)
   // v10 (PentaZen 剪枝): 杀手走法 + 静态搜索 + Razoring/Futility
   function makeMinmax(onlyThree = false, onlyFour = false) {
@@ -422,6 +430,10 @@
           prev.onlyThree === onlyThree && prev.onlyFour === onlyFour) {
         return [prev.value, prev.move, [...path, ...prev.path]];
       }
+      // v45: 缓存命中(深度够/必胜)的已 early-return; 此处的 prev 不一定命中,
+      //   但 TT 里仍可能存着"换变体/换深度没命中"的记录 —— 它的 best.move
+      //   仍然是最优候选, 提取出来放进走法排序。
+      const ttMove = prev && prev.move ? prev.move : null;
 
       // gobang_AI order: 离最后落子近的点优先搜索(Alpha-Beta 剪枝效率关键)
       let points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour, lastMove);
@@ -439,6 +451,21 @@
                    ...points.filter((p) => killerSet.has(p[0] * SIZE + p[1]))];
         }
       }
+      // v45: TT best-move 提到次位(杀手之后) —— 同层有 caching 复用价值
+      if (ttMove) {
+        const i = points.findIndex(p => p[0] === ttMove[0] && p[1] === ttMove[1]);
+        if (i > 0) {
+          points = [points[i], ...points.slice(0, i), ...points.slice(i + 1)];
+        } else if (i === -1) {
+          // getValuableMoves 浅层筛选把 ttMove 砍了: 它是"理论上好但本
+          // 层不重要"的格子 —— 不强插, history 排序会自然处理
+          points = points.slice();
+        }
+      }
+      // v45: history 启发 —— 按历史剪枝分降序, 让 alpha-beta 优先试
+      //   历史上成功剪过枝的点。注意杀手 / ttMove 已被推到前面, sort
+      //   是稳定的(只重排剩余部分的相对顺序)。
+      points.sort((a, b) => HISTORY[b[0] * SIZE + b[1]] - HISTORY[a[0] * SIZE + a[1]]);
 
       let value = -MAX;
       let move = null;
@@ -477,6 +504,9 @@
               killers[cDepth][1] = killers[cDepth][0];
               killers[cDepth][0] = x * SIZE + y;
             }
+            // v45: history 表累加 —— 剩余深度的平方(深层剪枝更值钱,
+            //   加平方放大). 简单剪枝给 1, 深层导致整子树剪掉给 9-25.
+            HISTORY[x * SIZE + y] += (depth - cDepth) * (depth - cDepth);
             break;
           }
           if (alpha >= FIVE) { breakAll = true; break; } // 自己赢了就结束
@@ -515,6 +545,7 @@
       return [value, move, bestPath];
     }
     helper.resetKillers = resetKillers;
+    helper.resetHistory = resetHistory;
     return helper;
   }
 
@@ -916,7 +947,14 @@ function oppLineBlocks(board, opp, minN = 3) {
     // killers 不重置会让结果依赖请求历史(同一棋盘不同答案)。
     vct.resetKillers();
     _minmax.resetKillers();
+    vct.resetHistory();
+    _minmax.resetHistory();
     const skipHard = opts && opts.skipHardRules === true;
+    // v45: 原生 deep 模式 —— 走 opts.deep=true, 深度预算大幅提升
+    // (替代 hint-worker.cjs 的字符串替换 hack)。MAX_BUDGET 是 2^28,
+    // 实际预算由 ONLY_THREE_THRESHOLD / move 生成层限制, 永不会触顶;
+    // 保留 BUDGET throwable 用于边界保护(如递归异常时强制退出)。
+    const isDeep = !!(opts && opts.deep === true);
     const opp = other(color);
 
     // 1. 直接成五
@@ -1042,7 +1080,11 @@ function oppLineBlocks(board, opp, minN = 3) {
     let stoneCount = 0;
     for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
     // v11: 深度参数化 —— 服务器端通过替换把 6 提到 10-12(深度版)
-    const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);
+    // v45: 普通档深度保持 6, deep 档深度提到 10-12(原 worker 字符串替换
+    //   的 10, 这里把残局/开局的边界稍微放宽, 让深搜索覆盖更多阶段)
+    const depth = isDeep
+      ? (stoneCount < 8 ? 2 : (stoneCount > 190 ? 12 : 10))
+      : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
 
     // v11.7: 开局定式扩展 —— 覆盖常见的黑 3 手 / 白 2 手 / 黑 3 手 三个节点
     //   旧版只处理"黑天元 + 白斜邻"一种, 其他开局都靠 2 层搜索。
@@ -1129,7 +1171,18 @@ function oppLineBlocks(board, opp, minN = 3) {
     const lastMove = null;
     // v9: Web Worker 后台跑 — 3 秒 / 80 万节点(主线程同步调用时仍会回退)
     // v11: budget.best 记录最优-so-far —— 超时也能返回部分搜索的最佳结果
-    const budget = { nodes: 0, maxNodes: 400000, t0: performance.now(), maxMs: 1500, visited: null, best: null };
+    // v45: deep 档用 MAX_BUDGET(2^28)作"无上限"占位 —— ONLY_THREE_THRESHOLD
+    //   把深层搜索的分支砍到极小, 实际节点数远低; 即使触顶, BUDGET 抛出会
+    //   被各阶段 try/catch 兜住, 不会把整个搜索崩溃。
+    const MAX_BUDGET = 1 << 28;
+    const budget = {
+      nodes: 0,
+      maxNodes: isDeep ? MAX_BUDGET : 400000,
+      t0: performance.now(),
+      maxMs: isDeep ? MAX_BUDGET : 1500,
+      visited: null,
+      best: null,
+    };
     try {
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
