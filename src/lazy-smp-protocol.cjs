@@ -13,8 +13,10 @@ function pickBest(results) {
 }
 
 function cmpResult(a, b) {
-  const aWin = Math.abs(a.value) >= FIVE;
-  const bWin = Math.abs(b.value) >= FIVE;
+  // v46: 必胜 = 己方 value >= FIVE(正数, 我方能赢); 异方必胜(value <= -FIVE)
+  //   是"我方输"的最差解, 不应优选。逻辑: 正向必胜 > 一般 value > path 短 > workerId 小。
+  const aWin = a.value >= FIVE;
+  const bWin = b.value >= FIVE;
   if (aWin !== bWin) return aWin ? -1 : 1;
   if (a.value !== b.value) return b.value - a.value;
   const al = (a.path || []).length;
