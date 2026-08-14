@@ -66,3 +66,25 @@ test('computeBest 在深档 + workerId>0 时记录抖动被使用', () => {
   const r = engine.computeBest(b, 1, { deep: true, workerId: 2, jitterSeed: 0xDEADBEEF });
   assert.equal(r.jitterUsed, true);
 });
+
+test('hint-worker-search.cjs 启动并返回 shape 正确的结果', async () => {
+  const { Worker } = await import('node:worker_threads');
+  const w = new Worker('./src/hint-worker-search.cjs', {
+    workerData: {
+      publicDir: path.resolve('public'),
+      workerId: 1,
+      jitterSeed: 0x12345,
+    },
+  });
+  const b = makeMidBoard();
+  const result = await new Promise((resolve, reject) => {
+    w.on('message', (msg) => msg.id === 1 ? resolve(msg) : null);
+    w.on('error', reject);
+    w.postMessage({ id: 1, board: b, color: 1, deep: true });
+  });
+  await w.terminate();
+  assert.equal(typeof result.x, 'number');
+  assert.equal(typeof result.y, 'number');
+  assert.equal(typeof result.value, 'number');
+  assert.equal(result.workerId, 1);
+});
