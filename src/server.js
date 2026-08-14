@@ -26,6 +26,8 @@ import {
   newGame,
   publicView,
   seatCount,
+  BLACK,
+  WHITE,
 } from './room.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
