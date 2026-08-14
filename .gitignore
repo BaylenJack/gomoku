@@ -3,3 +3,4 @@ data/
 *.log
 .env
 .tmp_v4_hint.js
+.worktrees/
