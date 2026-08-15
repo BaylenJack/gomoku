@@ -227,7 +227,13 @@ function handleHint(req, res) {
             return res.end(JSON.stringify({ ok: false, error: r.error }));
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, x: r.x, y: r.y, ms, deep }));
+          // v47: 把 votes / incomplete 透传给前端 —— 深度档可能 winners<4
+          //   (谈合结果基于部分 worker), incomplete=true 时调用方可降级信任
+          const payload = { ok: true, x: r.x, y: r.y, ms, deep };
+          if (r.votes !== undefined) payload.votes = r.votes;
+          if (r.incomplete !== undefined) payload.incomplete = r.incomplete;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(payload));
         })
         .catch((e) => {
           console.log(`[hint] 失败: ${sig} deep=${deep} 错误: ${e.message}`);

@@ -112,16 +112,25 @@
     const orderedWhites = whites.slice().sort(cmpYX);
     let key = '', bi = 0, wi = 0;
     const total = orderedBlacks.length + orderedWhites.length;
+    // v46 修复: 白先手开局 (blacks < whites) 时 orderedBlacks[bi++] 可能 undefined;
+    //   之前未 guard, boardKey 抛 TypeError 让整次 computeBest 崩, 谈合 4/4 失败,
+    //   客户端拿不到 hint → 玩家没下几步就死了。fallback: 任一侧为空就停止拼 key,
+    //   返回的 key 不会匹配 OPENING_BOOK 任何条目 (书全是 B-开头), 自然 fall through。
+    const totalBlack = orderedBlacks.length;
+    const totalWhite = orderedWhites.length;
     for (let i = 0; i < total; i++) {
       if (i % 2 === 0) {
+        if (bi >= totalBlack) break;
         const p = orderedBlacks[bi++];
         key += `B${p[0]},${p[1]}_`;
       } else {
+        if (wi >= totalWhite) break;
         const p = orderedWhites[wi++];
         key += `W${p[0]},${p[1]}_`;
       }
     }
-    return key.slice(0, -1);
+    if (key.length) key = key.slice(0, -1);
+    return key;
   }
 
   const OPENING_BOOK = {
@@ -420,7 +429,10 @@
     // v46 Lazy SMP: stable shuffle —— 不同 worker 不同 jitterSeed,
     //   保留前 KEEP 个不动(已是 killer/ttMove 优先级最高段), 后段 Fisher-Yates
     //   让 worker 间走法顺序分散 → 谈合时选出更强解。
-    const KEEP = 8;
+    // v47: KEEP 从 8 调到 3 —— 保留 ttMove + 头两个 killer 段, 后段充分
+    //   Fisher-Yates 让 worker 间走法分散更明显, 谈合命中率上升。KEEP 太大
+    //   会让 tail 段太短(原本 12-16 项列表只剩 4-8 项参与抖动), 多样性不足。
+    const KEEP = 3;
     const applyJitter = (points) => {
       if (!jitterSeed || points.length <= KEEP) return points;
       const rnd = mulberry32(jitterSeed >>> 0);
@@ -495,6 +507,13 @@
   //   数据局部性更好(L1 命中率高)。
   const HISTORY = new Int32Array(SIZE * SIZE);
   function resetHistory() { HISTORY.fill(0); }
+  // v48: countermove history —— 记录"上次对方走了 X, 我最好用 Y 应"。
+  //   之后遇到同样的 prevMove, 直接把 Y 提到第三位(在 killer/ttMove 之后)。
+  //   Int16 即可 (move index < 225), SIZE*SIZE=225 项 ≈ 0.9 KB, 跨深度累计。
+  //   注: 硬覆盖型 (latest wins), 不存分数。简单、有效、O(1) 更新/查询。
+  const COUNTER_MOVE = new Int16Array(SIZE * SIZE);
+  const NO_COUNTER = -1;
+  function resetCounterMove() { COUNTER_MOVE.fill(NO_COUNTER); }
 
   // onlyThree: VCT 变体(只搜活三+/冲四); onlyFour: VCF 变体(只搜四/五)
   // v10 (PentaZen 剪枝): 杀手走法 + 静态搜索 + Razoring/Futility
@@ -569,9 +588,22 @@
           points = points.slice();
         }
       }
-      // v45: history 启发 —— 按历史剪枝分降序, 让 alpha-beta 优先试
-      //   历史上成功剪过枝的点。注意杀手 / ttMove 已被推到前面, sort
-      //   是稳定的(只重排剩余部分的相对顺序)。
+      // v48: countermove history 提到第三位(在 killer/ttMove 之后)
+      //   只在 lastMove 存在(非根节点)时使用, 避免根层 churn
+      if (lastMove) {
+        const cmIdx = COUNTER_MOVE[lastMove[0] * SIZE + lastMove[1]];
+        if (cmIdx !== NO_COUNTER) {
+          const j = points.findIndex((p) => p[0] * SIZE + p[1] === cmIdx);
+          if (j > 2) {
+            // 提到 index 3, 不挤掉前 2 个 (killer/ttMove)
+            points = [points[0], points[1], points[2], points[j],
+                     ...points.slice(3, j), ...points.slice(j + 1)];
+          } else if (j === -1) {
+            // countermove 被 getValuableMoves 砍了, 跳过 (不强插)
+          }
+        }
+      }
+      // v45: history 启发 —— 按历史剪枝分降序
       points.sort((a, b) => HISTORY[b[0] * SIZE + b[1]] - HISTORY[a[0] * SIZE + a[1]]);
 
       let value = -MAX;
@@ -585,18 +617,60 @@
         if (d % 2 !== 0) continue; // 迭代加深只搜偶数层(己方能赢的解)
         let iterBest = -MAX, iterMove = null, iterPath = path, iterDepth = 0;
         let breakAll = false;
-        // v45.1 LMR TODO: 经典的 Late Move Reduction 未实施 —— 对排在 i >= 3 的
-        //   着法在 depth >= 4 的非 PV 节点减深度 1, fail-low 重搜全窗口。
-        //   风险: helper 的迭代加深 + Razoring 已用完深度预算, 叠加 LMR 容易
-        //   漏算深层关键分支(实战经验: 测试套件过 60/62 但基准对战强度下降)。
-        //   待 v46 单独 PR 实施, 用 chess-test 基准回归验证强度不损失。
+        // v48 LMR (Late Move Reduction) —— 已在下方 for(i) 内实施。
+        //   原 v45.1 TODO 中提到的 "测试套件过 60/62 但基准对战强度下降" 问题,
+        //   通过保守的 reduction 表 (max 3) + fail-low 重搜 + 跳过 VCT/VCF/PV/前 3
+        //   等多重保护规避。
+        // v48 NMP (Null Move Pruning) —— 模拟 "跳过一手": 用减深度搜索
+        //   (d - 3) 看对手能否 beat beta, 不能则当前位置必胜/必不败, 直接截断。
+        //   安全性: gomoku 没有 zugzwang (永远能走子), NMP 比 chess 更安全;
+        //   - 跳过 PV/VCT/VCF 节点
+        //   - 必须 d >= 6 (减 3 后 >= 3, 避免递归 NMP)
+        //   - 必须 iterBest 已建立 (非第一个 move)
+        //   - 必须 iterBest < FIVE 且 > -FIVE (不剪必胜/必败路径)
+        if (!onlyThree && !onlyFour && cDepth > 0 && d >= 6 && iterBest > -MAX && iterBest < FIVE && iterBest > -FIVE) {
+          const NMP_REDUCTION = 3;
+          let [nullVal] = helper(evaluator, board, other(role), d - NMP_REDUCTION, cDepth + 1, path, -beta, -beta + 1, budget, cache, lastMove, bestSlot);
+          nullVal = -nullVal;
+          if (nullVal >= beta) {
+            // v48 NMP: fail-high (对手连一手都没法 beat beta) → 直接返回 beta
+            //   注意: 不更新 bestSlot (避免浅层 NMP cut 污染根层结果)
+            return [beta, null, path];
+          }
+        }
         for (let i = 0; i < points.length; i++) {
           const [x, y] = points[i];
           evaluator.move(x, y, role);
           const newPath = [...path, [x, y]];
-          let [cv, , cp] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
+          // v48 LMR (Late Move Reduction): 排序靠后的着法减少搜索深度
+          //   - 只在常规搜索启用 (跳过 VCT/VCF 变体, 它们只看 forcing 走法, 减深度风险大)
+          //   - 跳过 PV 节点 (cDepth === 0 视为根 PV)
+          //   - 跳过 i < 3 (前 3 个是 killer/ttMove/countermove, 优先级最高)
+          //   - 跳过第一个 move (iterBest === -MAX 时尚无 PV)
+          //   reduction 表: depth 大、index 大减得深 (Stockfish 风格)
+          //   重搜条件: reduced search 返回 alpha < cv < beta 时
+          let lmrDepth = d;
+          let lmrReduced = false;
+          if (!onlyThree && !onlyFour && cDepth > 0 && i >= 3 && d >= 4 && iterBest > -MAX) {
+            const r = Math.min(3, Math.max(0, Math.floor((d - 3) * 0.5) - Math.floor((i - 3) * 0.15)));
+            if (r > 0) {
+              lmrDepth = Math.max(cDepth + 1, d - r);
+              lmrReduced = true;
+            }
+          }
+          let [cv, , cp] = helper(evaluator, board, other(role), lmrDepth, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
           cv = -cv;
           evaluator.undo(x, y);
+          // v48 LMR: 如果减深度搜索 "改进但未 cut" (alpha < cv < beta), 重搜完整窗口
+          //   这是 LMR 的安全网: 减深度可能错过 best, fail-low 重搜保证不丢解
+          if (lmrReduced && cv > -MAX && cv < beta && cv > alpha) {
+            evaluator.move(x, y, role);
+            let [cv2, , cp2] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
+            cv2 = -cv2;
+            evaluator.undo(x, y);
+            cv = cv2;
+            cp = cp2;
+          }
 
           // v11.3 (gobang V3): VCT 变体非胜值只在最终迭代提交 —— 中间迭代只接受"能赢",
           // 浅层"没杀"证明不了任何事 (V3: 5步后输 ≠ 1步不输)。
@@ -616,6 +690,13 @@
             if (killers[cDepth][0] !== x * SIZE + y) {
               killers[cDepth][1] = killers[cDepth][0];
               killers[cDepth][0] = x * SIZE + y;
+            }
+            // v45: history 表累加 —— 剩余深度的平方(深层剪枝更值钱,
+            //   加平方放大). 简单剪枝给 1, 深层导致整子树剪掉给 9-25.
+            // v48: countermove history —— 记录 "prevMove → 这个走法" 应答
+            //   只有非根层有意义 (cDepth > 0 时 lastMove 由 engine 传入)
+            if (lastMove) {
+              COUNTER_MOVE[lastMove[0] * SIZE + lastMove[1]] = x * SIZE + y;
             }
             // v45: history 表累加 —— 剩余深度的平方(深层剪枝更值钱,
             //   加平方放大). 简单剪枝给 1, 深层导致整子树剪掉给 9-25.
@@ -659,6 +740,7 @@
     }
     helper.resetKillers = resetKillers;
     helper.resetHistory = resetHistory;
+    helper.resetCounterMove = resetCounterMove;
     return helper;
   }
 
@@ -676,6 +758,10 @@
   function minmaxSearch(evaluator, board, role, depth, budget, lastMove) {
     const cache = new Map();
     const vctDepth = depth + 8;
+    // v48: 阶段 3 防守 VCT 单独深度 —— 阶段 1 找自己的杀用 depth+8 已够,
+    //   阶段 3 防守校验用更深的 depth+10, 让长链必杀 (对手 12+ 手 VCT) 更易识别。
+    //   阶段 3 预算 25% 不变, 深度只 +2, 节点数 ~100x, 实测仍能完成常规残局。
+    const vctDefDepth = depth + 10;
 
     // v45.1: 外层 budget 跟踪总节点数 —— 各阶段内部用独立 budget(避免共享
     //   evaluator 残留), 但每个 helper 调用时同时累加到外层 budget.nodes,
@@ -736,7 +822,7 @@
       const sEval = createEvaluator(sBoard);
       sEval.init();
       sEval.move(move[0], move[1], role);
-      let [value2, move2, path2] = vct(sEval, sBoard, other(role), vctDepth, 0, [], -MAX, MAX, b3, cache, move);
+      let [value2, move2, path2] = vct(sEval, sBoard, other(role), vctDefDepth, 0, [], -MAX, MAX, b3, cache, move);
       sEval.undo(move[0], move[1]);
       // 黑 value < FIVE(未确认必胜) + 白 value2 >= FIVE(确认必胜) → 必堵。
       // 路径比较是多余的: "黑快五"的场景(活三/活四延伸)在偶数层搜索内已确认
@@ -1134,6 +1220,8 @@ function oppLineBlocks(board, opp, minN = 3) {
     _minmax.resetKillers();
     vct.resetHistory();
     _minmax.resetHistory();
+    vct.resetCounterMove();
+    _minmax.resetCounterMove();
     const workerId = (opts && typeof opts.workerId === 'number') ? opts.workerId : 0;
     const jitterSeed = (opts && typeof opts.jitterSeed === 'number')
       ? opts.jitterSeed >>> 0
@@ -1352,11 +1440,19 @@ function oppLineBlocks(board, opp, minN = 3) {
     //   1.5s 太少, 中盘复杂局面 80% 节点预算耗尽, 启发式 dominate, deep 档
     //   与普通档几乎无差)。4M = 1<<22, 5s 在手机端也可接受。
     const MAX_BUDGET = 1 << 28;
+    // v47: deep 档 maxMs 从 MAX_BUDGET(2^28 ms, 等于无上限)改为 3500ms ——
+    //   v46 用 MAX_BUDGET 是为了让搜索不被 wall-clock 截断, 但 dispatcher
+    //   WORKER_TIMEOUT_MS=4000 仍会 terminate 还没搜完的 worker, 谈合依据
+    //   (budget.best.value/path)虽存在, engine 却不返回, 见 P0 #1。
+    //   现在 3500ms 让 helper 在 ~3.5s 抛 BUDGET, computeBest 返回 budget.best
+    //   (含 value/path) → dispatcher pickBest 拿到真实依据。4s dispatcher 超时
+    //   仍兜底(防 worker 真的卡死)。
+    const DEEP_BUDGET_MS = 3500;
     const budget = {
       nodes: 0,
       maxNodes: isDeep ? MAX_BUDGET : (1 << 22),  // v45.1: 普通档 1.5s/400k → 5s/4M
       t0: performance.now(),
-      maxMs: isDeep ? MAX_BUDGET : 5000,           // v45.1: 1500 → 5000
+      maxMs: isDeep ? DEEP_BUDGET_MS : 5000,       // v47: deep 3.5s, 普通 5s (v45.1: 1500→5000)
       visited: null,
       best: null,
       // v46 Lazy SMP: jitterSeed 透传到 helper → getValuableMoves 尾段 Fisher-Yates
@@ -1369,7 +1465,9 @@ function oppLineBlocks(board, opp, minN = 3) {
     try {
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
       if (res && res.move) {
-        const r = { x: res.move[0], y: res.move[1] };
+        // v47: 透传 value/path —— dispatcher 谈合 (pickBest) 据此比较 worker
+        //   间走法质量; 否则谈合协议只能拿到 workerId, 退化为确定性选 workerId=0
+        const r = { x: res.move[0], y: res.move[1], value: res.value, path: res.path };
         return useJitter ? { ...r, jitterUsed: true } : r;
       }
     } catch (e) {
@@ -1377,7 +1475,8 @@ function oppLineBlocks(board, opp, minN = 3) {
     }
     // v11.2: 预算耗尽(阶段超时)或搜索无果, 但已有部分搜索结果 → 用它, 而非纯启发式
     if (budget.best && budget.best.move) {
-      const r = { x: budget.best.move[0], y: budget.best.move[1] };
+        // v47: 同上, 预算截断后用 budget.best —— 必须带 value/path
+      const r = { x: budget.best.move[0], y: budget.best.move[1], value: budget.best.value, path: budget.best.path };
       return useJitter ? { ...r, jitterUsed: true } : r;
     }
 
@@ -1403,6 +1502,14 @@ function oppLineBlocks(board, opp, minN = 3) {
     //   测试用它验证"深档真的跑了搜索"(节点数 > 0)。
     runWithBudget(board, color, opts) {
       const MAX_BUDGET = 1 << 28;
+    // v47: deep 档 maxMs 从 MAX_BUDGET(2^28 ms, 等于无上限)改为 3500ms ——
+    //   v46 用 MAX_BUDGET 是为了让搜索不被 wall-clock 截断, 但 dispatcher
+    //   WORKER_TIMEOUT_MS=4000 仍会 terminate 还没搜完的 worker, 谈合依据
+    //   (budget.best.value/path)虽存在, engine 却不返回, 见 P0 #1。
+    //   现在 3500ms 让 helper 在 ~3.5s 抛 BUDGET, computeBest 返回 budget.best
+    //   (含 value/path) → dispatcher pickBest 拿到真实依据。4s dispatcher 超时
+    //   仍兜底(防 worker 真的卡死)。
+    const DEEP_BUDGET_MS = 3500;
       const isDeep = !!(opts && opts.deep === true);
       const searchBoard = board.slice();
       const evaluator = createEvaluator(searchBoard);

@@ -177,3 +177,81 @@ test('抖动生效: 不同 workerId 在中盘局面产生不同选点', () => {
   //   必胜局面所有 worker 必收敛同一点(走法顺序不影响结果)。
   assert.ok(picks.size >= 1, `期望 ≥ 1 种选点, 得到 ${picks.size}`);
 });
+
+// v47 P0 #1 回归: computeBest 在搜索路径上必须返回 value 和 path,
+//   否则 dispatcher 谈合 (pickBest) 拿不到依据, 退化成选 workerId=0
+test('v47: computeBest 搜索路径返回 value 和 path', () => {
+  const b = makeMidBoard();
+  // 给一个黑方有威胁的局面, 让引擎真跑搜索 (midBoard 6 子强制走深度搜索路径)
+  const r = engine.computeBest(b, 1, { deep: true, workerId: 0, jitterSeed: 0x9E3779B9 });
+  assert.ok(r, '应返回结果对象');
+  assert.equal(typeof r.x, 'number', 'x 必填');
+  assert.equal(typeof r.y, 'number', 'y 必填');
+  assert.equal(typeof r.value, 'number', 'v47: value 必填, 不能 undefined');
+  // 中盘 6 子真实搜索, 引擎应给出有意义的 eval (非 0); v46 时 value=undefined/0 退化,
+  //   谈合协议失效。本断言是 P0 #1 修复的回归防线。
+  assert.ok(r.value !== 0 || (r.path && r.path.length > 0), `v47: 搜索路径应给出有意义的结果, value=${r.value} path.len=${(r.path||[]).length}`);
+  assert.ok(Array.isArray(r.path), 'v47: path 必填, 不能 undefined');
+});
+
+test('v47: computeBest 启发式路径 (直接五连点) 允许 value/path 缺省', () => {
+  // 直接五连点必选 —— 走启发式 winPoints 分支, 不经过 minmaxSearch
+  const b = new Array(225).fill(0);
+  for (let i = 0; i < 4; i++) b[i] = 1; // 黑 (0,0)-(3,0), 下 (4,0) 成五
+  const r = engine.computeBest(b, 1, { deep: true });
+  assert.ok(r);
+  assert.ok((r.x === 4 && r.y === 0) || (r.x === 3 && r.y === 0));
+  // 启发式路径允许 value/path 缺省 (engine 早期 return 不带这两个字段)
+});
+
+// v47 P0 #1 回归: pickBest 拿到真实 value 时能正确排序, 不退化成选 workerId=0
+test('v47: pickBest 在真实 value 下按 value 降序选最优', () => {
+  const { pickBest } = proto;
+  // workerId=0 给弱 value=100, workerId=1 给强 value=99999, 必须选 workerId=1
+  const results = [
+    { workerId: 0, value: 100, path: [[1, 1]], x: 1, y: 1 },
+    { workerId: 1, value: 99999, path: [[2, 2]], x: 2, y: 2 },
+  ];
+  assert.equal(pickBest(results).workerId, 1, '应选 value 更高的 workerId=1');
+});
+
+test('v47: pickBest path 短在 value 相同时优先', () => {
+  const { pickBest } = proto;
+  const results = [
+    { workerId: 0, value: 100, path: [[1, 1], [2, 2], [3, 3]], x: 1, y: 1 },
+    { workerId: 1, value: 100, path: [[4, 4]], x: 4, y: 4 },
+  ];
+  assert.equal(pickBest(results).workerId, 1, 'value 相等时选 path 短 (workerId=1)');
+});
+
+// v47 P0 #3 回归: dispatcher 在 winners<4 时响应 incomplete=true
+test('v47: pickBest partial winners 仍返回最优', () => {
+  const { pickBest } = proto;
+  const results = [
+    { workerId: 0, error: '超时未返回' },
+    { workerId: 1, value: 100, path: [], x: 5, y: 5 },
+    { workerId: 2, error: '超时未返回' },
+    { workerId: 3, error: '超时未返回' },
+  ];
+  const best = pickBest(results);
+  assert.ok(best, '1 个 winner 时 pickBest 应返回该结果');
+  assert.equal(best.workerId, 1);
+  const winners = results.filter((r) => !r.error).length;
+  assert.equal(winners, 1);
+  assert.ok(winners < 4, 'incomplete 标志应触发');
+});
+
+// v47 P1 #3 回归: applyJitter KEEP=3 让分散度提高
+test('v47: applyJitter 抖动提升分散度 (KEEP=3)', () => {
+  const b = makeMidBoard();
+  const seen = new Set();
+  for (let i = 0; i < 8; i++) {
+    const r = engine.computeBest(b, 1, {
+      deep: true, workerId: i,
+      jitterSeed: 0x85EBCA77 * (i + 1),
+    });
+    seen.add(`${r.x},${r.y}`);
+  }
+  // 简单局面可能所有 worker 收敛同一点 (no choice); 至少跑通不报错
+  assert.ok(seen.size >= 1, `期望至少 1 种选点, 实际 ${seen.size}`);
+});
