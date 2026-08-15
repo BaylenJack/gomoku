@@ -14,7 +14,12 @@
 //   返回 {x, y}, pickBest 拿到的 value/path 全是 0/[], 谈合退化成确定性选
 //   workerId=0。
 
-const FIVE = 100000;
+// v46.1 修复: 必须与 public/hint.js FIVE 常量保持一致 —— 引擎 FIVE=10000000 (10M,
+//   真正"必胜"阈值, 区分活四/双三等 1e5 量级的高分但非必胜).
+// 之前协议 FIVE=100000, 把任何 ≥1e5 的高分都当"必胜", pickBest 谈合时
+// 错误地放弃搜索真正必胜路径 → 引擎下出看似很强但未到必胜阈值的棋,
+// 实战中表现为"几步后必输"。
+const FIVE = 10000000;
 
 function pickBest(results) {
   if (!results || !results.length) return null;
