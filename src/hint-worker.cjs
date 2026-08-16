@@ -16,10 +16,10 @@ const path = require('node:path');
 const HINT_PATH = path.join(workerData.publicDir, 'hint.js');
 const SEARCH_WORKER_PATH = path.join(__dirname, 'hint-worker-search.cjs');
 const NUM_WORKERS = 4;
-// v47: engine deep 档 wall-clock 上限是 3500ms (public/hint.js DEEP_BUDGET_MS),
-//   dispatcher WORKER_TIMEOUT_MS 给 4s, 留 500ms 缓冲覆盖 postMessage 序列化、
+// v47.2: engine deep 档 wall-clock 上限是 10000ms (public/hint.js DEEP_BUDGET_MS),
+//   dispatcher WORKER_TIMEOUT_MS 给 10.5s, 留 500ms 缓冲覆盖 postMessage 序列化、
 //   pickBest 调度等开销, 同时仍能在 worker 真卡死时兜底 terminate。
-const WORKER_TIMEOUT_MS = 4000;
+const WORKER_TIMEOUT_MS = 10500;
 // v47: 独立常量, 避免与 ZB 种子 (0x9E3779B9/0x243F6A88) 撞 —— 同一颗 mulberry32
 //   在不同上下文仍确定, 但分散度依赖种子的'独立性', 独立常量让 worker 抖动
 //   序列不被 ZB 比特模式支配。

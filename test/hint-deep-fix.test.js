@@ -22,7 +22,8 @@ const empty = () => new Array(225).fill(E);
 const fastCode = code
   .replace(/maxNodes: isDeep \? MAX_BUDGET : \(1 << 22\),/g, 'maxNodes: isDeep ? 200000 : (1 << 22),')
   .replace(/maxMs: isDeep \? MAX_BUDGET : 5000,/g, 'maxMs: isDeep ? 800 : 5000,')
-  .replace('const DEEP_BUDGET_MS = 3500;', 'const DEEP_BUDGET_MS = 800;');
+  .replace('const DEEP_BUDGET_MS = 10000;', 'const DEEP_BUDGET_MS = 800;')
+  .replace(/\? \(stoneCount < 8 \? 2 : 12\)/g, '? (stoneCount < 8 ? 2 : 10)'); // fast 变体深度 12→10 (800ms 跑不动 12 层)
 const fsb = { self: {}, performance: { now: () => Date.now() } };
 vm.runInNewContext(fastCode, fsb);
 const fastTest = fsb.self.GomokuHint.__test__;
@@ -69,7 +70,7 @@ test('FIX2: 安静防守点 —— 对手聚集时选纯防守点 (真实对局�
   // 真实对局: 黑 (10,7) 后白第 9 手。黑威胁: 横三 (7,7)(7,8)(7,9) 延伸点 (7,10)
   // + 斜二 (10,7)(9,8) 延伸 (8,9)。旧引擎走 (6,5)/(11,6) → 黑 (7,10)→(8,9)
   // 活四 → 杀。唯一活路是安静防守点 (8,9)/(7,10) —— 不产生己方棋形的纯防守。
-  // 用真实 3.5s 预算 (800ms 变体预算碎片化, 验证找不到深杀链)。
+  // 用真实 10s 预算 (800ms 变体预算碎片化, 验证找不到深杀链)。
   // 断言: 引擎建议落子后黑无 VCT 强制杀。
   const b = empty();
   for (const [x, y] of [[7,7],[7,8],[8,8],[9,8],[9,7],[8,6],[9,9],[7,9],[10,7]]) b[idx(x, y)] = 2; // 黑

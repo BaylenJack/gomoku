@@ -253,7 +253,9 @@
       case SH.THREE_THREE: return THREE_THREE / 10;
       case SH.BLOCK_THREE: return BLOCK_TWO;
       case SH.TWO: return ONE;
-      case SH.TWO_TWO: return TWO_TWO / 10;
+      // v47.2: 双活二交点 20 → 200 —— 原值比单活二 (ONE=10) 还低, 搜索评估
+      // 看不见"双活二集结"的结构潜力 (一步双威胁之源), 预防性防守无评估基础。
+      case SH.TWO_TWO: return TWO_TWO;
       default: return 0;
     }
   }
@@ -293,7 +295,9 @@
       } else if (threeCnt >= 2) {
         total += THREE_THREE * 0.4;
       } else if (twoCnt >= 2) {
-        total += TWO_TWO * 0.4;
+        // v47.2: 双活二复合加分 0.4 → 1.0 —— 与 shapeScore(TWO_TWO) 同步提高,
+        // 双活二交点 (可延伸成双威胁的结构) 在搜索评估里真正可见
+        total += TWO_TWO;
       }
       scores[rIdx][c] = total;
     }
@@ -350,6 +354,8 @@
         return Math.max(-(FIVE - 1), Math.min(FIVE - 1, s));
       },
       shapeAt(x, y, d, role) { return shapeCache[role - 1][idx(x, y) * 4 + d]; },
+      // v47.2: 测试钩子 —— 返回空位点分 (搜索评估里该点的潜力值)
+      pointScore(x, y, role) { return scores[role - 1][idx(x, y)]; },
     };
   }
 
@@ -779,7 +785,7 @@
   // v11.2: bestSlot = 外层 budget —— 各阶段根层搜索结果写入同一槽, 超时能回取。
   function minmaxSearch(evaluator, board, role, depth, budget, lastMove) {
     const cache = new Map();
-    const vctDepth = depth + 8;
+    const vctDepth = depth + 12;
     // v48: 阶段 3 防守 VCT 单独深度 —— 阶段 1 找自己的杀用 depth+8 已够,
     //   阶段 3 防守校验用更深的 depth+10, 让长链必杀 (对手 12+ 手 VCT) 更易识别。
     //   阶段 3 预算 25% 不变, 深度只 +2, 节点数 ~100x, 实测仍能完成常规残局。
@@ -847,9 +853,10 @@
     //     判定不再被静态高分污染 (这是引擎"下出看似必胜实则必输"的根因)。
     // 单候选 + 全预算: 多候选切片实测预算碎片化, 深杀链在切片内找不到,
     // 验证失真; 单候选拿满预算, 堵杀棋起点本身已是最优防守。
+    // v47.2: 无进攻点时阶段 3 预算 45% → 55% (阶段 1 跳过转来), 深杀链验证更充分
     const b3 = {
-      nodes: 0, maxNodes: Math.floor(budget.maxNodes * (hasAttack ? 0.25 : 0.45)),
-      t0: performance.now(), maxMs: budget.maxMs * (hasAttack ? 0.25 : 0.45),
+      nodes: 0, maxNodes: Math.floor(budget.maxNodes * (hasAttack ? 0.25 : 0.55)),
+      t0: performance.now(), maxMs: budget.maxMs * (hasAttack ? 0.25 : 0.55),
       incOuter,
     };
     if (value < FIVE) {
@@ -1482,7 +1489,10 @@ function oppLineBlocks(board, opp, minN = 3) {
     //   现在 3500ms 让 helper 在 ~3.5s 抛 BUDGET, computeBest 返回 budget.best
     //   (含 value/path) → dispatcher pickBest 拿到真实依据。4s dispatcher 超时
     //   仍兜底(防 worker 真的卡死)。
-    const DEEP_BUDGET_MS = 3500;
+    // v47.2: 深档 wall-clock 3500ms → 10000ms —— 用户接受增加延迟换取棋力。
+    // 预算翻倍让深度 14 的迭代加深真正完成 (原 3.5s 内常只完成浅层迭代,
+    // 有效深度远低于声明值); 10s 上限由 dispatcher WORKER_TIMEOUT_MS 兜底。
+    const DEEP_BUDGET_MS = 10000;
     const budget = {
       nodes: 0,
       maxNodes: isDeep ? MAX_BUDGET : (1 << 22),  // v45.1: 普通档 1.5s/400k → 5s/4M
@@ -1494,8 +1504,11 @@ function oppLineBlocks(board, opp, minN = 3) {
       jitterSeed: useJitter ? jitterSeed : 0,
     };
     // v45.2: depth 沿用 v11 参数化 (v45 普通 6, deep 10-12)
+    // v47.2: deep 中盘 10 → 12 —— 深度 14 在 10s 内跑不完, 迭代加深停在
+    // 中间迭代导致结果非确定性 (偶发丢失防守校验结果); 12 层在 10s 内
+    // 完成概率高, 结果稳定且棋力接近。
     const depth = isDeep
-      ? (stoneCount < 8 ? 2 : (stoneCount > 190 ? 12 : 10))
+      ? (stoneCount < 8 ? 2 : 12)
       : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
     try {
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
@@ -1544,7 +1557,10 @@ function oppLineBlocks(board, opp, minN = 3) {
     //   现在 3500ms 让 helper 在 ~3.5s 抛 BUDGET, computeBest 返回 budget.best
     //   (含 value/path) → dispatcher pickBest 拿到真实依据。4s dispatcher 超时
     //   仍兜底(防 worker 真的卡死)。
-    const DEEP_BUDGET_MS = 3500;
+    // v47.2: 深档 wall-clock 3500ms → 10000ms —— 用户接受增加延迟换取棋力。
+    // 预算翻倍让深度 14 的迭代加深真正完成 (原 3.5s 内常只完成浅层迭代,
+    // 有效深度远低于声明值); 10s 上限由 dispatcher WORKER_TIMEOUT_MS 兜底。
+    const DEEP_BUDGET_MS = 10000;
       const isDeep = !!(opts && opts.deep === true);
       const searchBoard = board.slice();
       const evaluator = createEvaluator(searchBoard);
@@ -1560,7 +1576,7 @@ function oppLineBlocks(board, opp, minN = 3) {
       let stoneCount = 0;
       for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
       const depth = isDeep
-        ? (stoneCount < 8 ? 2 : (stoneCount > 190 ? 12 : 10))
+        ? (stoneCount < 8 ? 2 : 12)
         : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
       try {
         minmaxSearch(evaluator, searchBoard, color, depth, budget, null);
@@ -1568,6 +1584,13 @@ function oppLineBlocks(board, opp, minN = 3) {
         if (e !== BUDGET) throw e;
       }
       return { nodes: budget.nodes, best: budget.best, stageNodes: budget.stageNodes };
+    },
+    // v47.2: 评估钩子 —— 返回 (x,y) 落 color 后该点的搜索评估潜力分
+    evalPoint(board, x, y, color) {
+      const searchBoard = board.slice();
+      const evaluator = createEvaluator(searchBoard);
+      evaluator.init();
+      return evaluator.pointScore(x, y, color);
     },
     // v47.1: 对手 color 是否有 VCT 强制杀 (阶段 3 防守校验同款搜索)
     // 预算内未确认杀返回 false (与阶段 3 语义一致: 宁可不堵也不乱堵)
