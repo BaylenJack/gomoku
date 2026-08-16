@@ -267,10 +267,14 @@
     const scores = [new Float64Array(NN), new Float64Array(NN)];
     const shapeCache = [new Int8Array(NN * 4), new Int8Array(NN * 4)];
     const fiveCnt = [0, 0]; // v11.2: 各色盘面实际五连数 —— 增量维护, evaluate 直接判胜负
+    // v47.4: 增量评估总和 totals[role] = Σ 空位点分; 增量 Zobrist hash1/hash2
+    const totals = [0, 0];
+    let hash1 = 0, hash2 = 0;
 
     function updatePoint(x, y, role) {
       const rIdx = role - 1;
       const c = idx(x, y);
+      const old = scores[rIdx][c]; // v47.4: 旧分 (增量 totals 用)
       let total = 0;
       let fourCnt = 0, blockFourCnt = 0, threeCnt = 0, twoCnt = 0;
       for (let d = 0; d < 4; d++) {
@@ -300,6 +304,8 @@
         total += TWO_TWO;
       }
       scores[rIdx][c] = total;
+      // v47.4: 增量评估总和 —— 该点分数变化量同步到 totals[role]
+      totals[rIdx] += total - old;
     }
 
     function refresh(x, y) {
@@ -320,31 +326,47 @@
     return {
       init() {
         for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-          if (board[idx(x, y)] === EMPTY) { updatePoint(x, y, 1); updatePoint(x, y, 2); }
+          const v = board[idx(x, y)];
+          if (v !== EMPTY) {
+            // v47.4: 已有棋子必须 XOR 进增量 hash, 否则与 boardHash 全盘不一致
+            const c = idx(x, y);
+            hash1 = (hash1 ^ ZB[c * 2 + (v - 1)]) >>> 0;
+            hash2 = (hash2 ^ ZB2[c * 2 + (v - 1)]) >>> 0;
+          } else {
+            updatePoint(x, y, 1);
+            updatePoint(x, y, 2);
+          }
         }
       },
       move(x, y, role) {
-        board[idx(x, y)] = role;
+        const c = idx(x, y);
+        // v47.4: 该点将被占用, 从空位评估和中移除 (两色)
+        totals[0] -= scores[0][c];
+        totals[1] -= scores[1][c];
+        // v47.4: 增量 Zobrist —— boardHash 全盘扫描 O(225) → O(1)
+        hash1 = (hash1 ^ ZB[c * 2 + (role - 1)]) >>> 0;
+        hash2 = (hash2 ^ ZB2[c * 2 + (role - 1)]) >>> 0;
+        board[c] = role;
         if (winsAfter(board, x, y, role)) fiveCnt[role - 1]++;
         refresh(x, y);
       },
       undo(x, y) {
         const role = board[idx(x, y)];
         if (role !== EMPTY && winsAfter(board, x, y, role)) fiveCnt[role - 1]--;
-        board[idx(x, y)] = EMPTY;
-        refresh(x, y);
+        const c = idx(x, y);
+        // v47.4: 增量 Zobrist 还原 (XOR 两次 = 复位)
+        hash1 = (hash1 ^ ZB[c * 2 + (role - 1)]) >>> 0;
+        hash2 = (hash2 ^ ZB2[c * 2 + (role - 1)]) >>> 0;
+        board[c] = EMPTY;
+        refresh(x, y); // refresh 会重新计算该点分并加回 totals
       },
       evaluate(role) {
         const rIdx = role - 1, oIdx = 1 - rIdx;
         // v11.2: 盘面已有成五 → 直接判胜负(搜索的获胜判定必须真实可达)
         if (fiveCnt[rIdx]) return FIVE;
         if (fiveCnt[oIdx]) return -FIVE;
-        let s = 0;
-        // v11.2: 跳过已占据格子 —— 原实现把残留的"空位潜力分"也计入(陈旧分数)
-        for (let i = 0; i < NN; i++) {
-          if (board[i] !== EMPTY) continue;
-          s += scores[rIdx][i] - scores[oIdx][i];
-        }
+        // v47.4: 增量总和 —— 原实现每叶子全盘扫描 O(225), 现在 O(1)
+        const s = totals[rIdx] - totals[oIdx];
         // v47.1 FIX5: 静态评估饱和 —— 活四/双四/冲四活三级单点分 (1e8/5e8)
         // 远超 FIVE 阈值 (1e7), 不饱和时搜索把"静态高分"误判为"强制必胜"
         // (value >= FIVE 判定命中) —— 阶段 1 VCT 报假杀、引擎下出看似必胜
@@ -356,6 +378,8 @@
       shapeAt(x, y, d, role) { return shapeCache[role - 1][idx(x, y) * 4 + d]; },
       // v47.2: 测试钩子 —— 返回空位点分 (搜索评估里该点的潜力值)
       pointScore(x, y, role) { return scores[role - 1][idx(x, y)]; },
+      // v47.4: 增量 Zobrist (测试钩子 hash 一致性校验用)
+      hash() { return [hash1, hash2]; },
     };
   }
 
@@ -471,14 +495,24 @@
       }
       return [...points.slice(0, KEEP), ...tail];
     };
+    // v47.4: 段内距离排序 —— 同类别内按"距最后落子"切比雪夫距离升序,
+    // 恢复 gobang 的局部性剪枝 (五子棋着法强局部性, 近点先搜剪枝效率高)。
+    // 只在同一类别段内排序, 不跨类别 (类别优先级由拼接顺序保证)。
+    const segSort = (arr) => {
+      if (!lastMove || arr.length < 2) return arr;
+      const lx = lastMove[0], ly = lastMove[1];
+      return arr.slice().sort((a, b) =>
+        Math.max(Math.abs(a[0] - lx), Math.abs(a[1] - ly)) -
+        Math.max(Math.abs(b[0] - lx), Math.abs(b[1] - ly)));
+    };
 
-    if (sets.five.length || sets.blockFive.length) return applyJitter(orderNear([...sets.five, ...sets.blockFive], 8));
-    if (onlyFour || sets.four.length) return applyJitter(orderNear([...sets.four, ...sets.blockFour], 12));
-    if (sets.fourFour.length) return applyJitter(orderNear([...sets.fourFour, ...sets.blockFour], 12));
-    if (sets.fourThree.length) return applyJitter(orderNear([...sets.fourThree, ...sets.blockFour, ...sets.three], 14));
-    if (sets.threeThree.length) return applyJitter(orderNear([...sets.threeThree, ...sets.blockFour, ...sets.three], 14));
-    if (onlyThree) return applyJitter(orderNear([...sets.blockFour, ...sets.three], 14));
-    return applyJitter(orderNear([...sets.blockFour, ...sets.three, ...sets.blockThree, ...sets.twoTwo, ...sets.two], 16));
+    if (sets.five.length || sets.blockFive.length) return applyJitter(orderNear([...segSort(sets.five), ...segSort(sets.blockFive)], 8));
+    if (onlyFour || sets.four.length) return applyJitter(orderNear([...segSort(sets.four), ...segSort(sets.blockFour)], 12));
+    if (sets.fourFour.length) return applyJitter(orderNear([...segSort(sets.fourFour), ...segSort(sets.blockFour)], 12));
+    if (sets.fourThree.length) return applyJitter(orderNear([...segSort(sets.fourThree), ...segSort(sets.blockFour), ...segSort(sets.three)], 14));
+    if (sets.threeThree.length) return applyJitter(orderNear([...segSort(sets.threeThree), ...segSort(sets.blockFour), ...segSort(sets.three)], 14));
+    if (onlyThree) return applyJitter(orderNear([...segSort(sets.blockFour), ...segSort(sets.three)], 14));
+    return applyJitter(orderNear([...segSort(sets.blockFour), ...segSort(sets.three), ...segSort(sets.blockThree), ...segSort(sets.twoTwo), ...segSort(sets.two)], 16));
   }
 
   function hasNeighbor(board, x, y) {
@@ -526,7 +560,8 @@
 
   // ---------- MiniMax + Alpha-Beta + 迭代加深 (gobang minmax.js) ----------
   const MAX = 1000000000;
-  const CACHE_MAX = 8000;
+  const CACHE_MAX = 200000; // v47.4: 8000 → 200000 —— 深度 12-14 搜索百万节点,
+  // 原缓存 8000 条在迭代前几轮就被挤光, TT 基本失效 → 跨迭代/跨分支重复搜索。
 
   // v45: history 启发 —— 走法按"历史剪枝分"降序排列, 让 alpha-beta 优先试
   //   历史上剪过枝的格子。同深度的 killer 只覆盖本层; history 跨深度累计,
@@ -570,7 +605,8 @@
         }
       }
 
-      const [h1, h2] = boardHash(board);
+      // v47.4: 增量 Zobrist (O(1)) —— 原 boardHash 每节点全盘扫描 O(225)
+      const [h1, h2] = evaluator.hash ? evaluator.hash() : boardHash(board);
       // v8: 缓存 key 含变体标志 —— VCT/VCF 与常规搜索的缓存不通用(gobang)
       // v11.5: 53 位 key —— 高 32 位 h2 纯位段(<<21) + 低 21 位 mix
       // (mix 把 role/深度/变体混合进 h1), 位段无重叠 → 无进位歧义。
@@ -632,7 +668,14 @@
         }
       }
       // v45: history 启发 —— 按历史剪枝分降序
-      points.sort((a, b) => HISTORY[b[0] * SIZE + b[1]] - HISTORY[a[0] * SIZE + a[1]]);
+      // v47.4: 同分时按距 lastMove 距离升序 (局部性 tiebreak, 剪枝更高效)
+      points.sort((a, b) => {
+        const ha = HISTORY[b[0] * SIZE + b[1]] - HISTORY[a[0] * SIZE + a[1]];
+        if (ha !== 0 || !lastMove) return ha;
+        const la = Math.max(Math.abs(a[0] - lastMove[0]), Math.abs(a[1] - lastMove[1]));
+        const lb = Math.max(Math.abs(b[0] - lastMove[0]), Math.abs(b[1] - lastMove[1]));
+        return la - lb;
+      });
 
       let value = -MAX;
       let move = null;
@@ -686,11 +729,13 @@
               lmrReduced = true;
             }
           }
+          // v47.4 (回退): PVS 实测 1:5 棋力退化 —— null-window 不写缓存导致
+          // TT 复用率骤降, 低预算下完成的迭代深度反而变浅。恢复全窗口
+          // alpha-beta (保留增量 hash/eval、CACHE_MAX、距离排序)。
           let [cv, , cp] = helper(evaluator, board, other(role), lmrDepth, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
           cv = -cv;
           evaluator.undo(x, y);
           // v48 LMR: 如果减深度搜索 "改进但未 cut" (alpha < cv < beta), 重搜完整窗口
-          //   这是 LMR 的安全网: 减深度可能错过 best, fail-low 重搜保证不丢解
           if (lmrReduced && cv > -MAX && cv < beta && cv > alpha) {
             evaluator.move(x, y, role);
             let [cv2, , cp2] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
@@ -753,6 +798,7 @@
         if (breakAll) break;
       }
 
+      // v47.4 (回退): PVS 放弃后恢复无条件写缓存 (全窗口搜索的值精确)
       if (cache.size < CACHE_MAX && (!prev || prev.depth < depth - cDepth)) {
         cache.set(key, {
           depth: depth - cDepth,
@@ -1626,6 +1672,48 @@ function oppLineBlocks(board, opp, minN = 3) {
       const evaluator = createEvaluator(searchBoard);
       evaluator.init();
       return evaluator.pointScore(x, y, color);
+    },
+    // v47.4: 增量一致性钩子 —— 验证增量 hash/evaluate 与全盘重算一致
+    incrementalConsistency(board) {
+      const vb = board.slice();
+      const ev = createEvaluator(vb);
+      ev.init();
+      const eqHash = () => {
+        const h = boardHash(vb);
+        const g = ev.hash();
+        return g[0] === h[0] && g[1] === h[1];
+      };
+      let ok = eqHash();
+      // 走 5 手 (找空位)
+      const placed = [];
+      for (let i = 0; i < 5; i++) {
+        let done = false;
+        for (let c = 0; c < vb.length && !done; c++) {
+          if (vb[c] !== EMPTY) continue;
+          const x = c % SIZE, y = Math.floor(c / SIZE);
+          const role = (i % 2) + 1;
+          ev.move(x, y, role);
+          vb[c] = role;
+          placed.push([x, y]);
+          done = true;
+        }
+        if (!eqHash()) ok = false;
+        // evaluate 增量 vs 全盘求和
+        const e1 = ev.evaluate(1);
+        let sum = 0;
+        for (let c = 0; c < vb.length; c++) {
+          if (vb[c] !== EMPTY) continue;
+          sum += ev.pointScore(c % SIZE, Math.floor(c / SIZE), 1) - ev.pointScore(c % SIZE, Math.floor(c / SIZE), 2);
+        }
+        if (e1 !== Math.max(-(FIVE - 1), Math.min(FIVE - 1, sum))) ok = false;
+      }
+      // undo 全部后 hash 应复原
+      for (const [x, y] of placed.reverse()) {
+        ev.undo(x, y);
+        vb[idx(x, y)] = EMPTY;
+      }
+      if (!eqHash()) ok = false;
+      return ok;
     },
     // v47.1: 对手 color 是否有 VCT 强制杀 (阶段 3 防守校验同款搜索)
     // 预算内未确认杀返回 false (与阶段 3 语义一致: 宁可不堵也不乱堵)

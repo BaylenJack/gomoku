@@ -79,6 +79,17 @@ test('FIX2: 对手活三时立即硬堵端点 (v11.5 融合)', () => {
   assert.ok(r.x === 3 || r.x === 7, `应堵活三端点 (3,7)/(7,7), 实际 x=${r.x}`);
 });
 
+test('v47.4 增量 hash/evaluate 与全盘重算一致', () => {
+  // 验证性能优化的正确性: 增量维护的 Zobrist hash 与 evaluate 总和
+  // 在 move/undo 后必须与全盘重算完全一致 (否则缓存/评估被污染)
+  const b = empty();
+  const seed = [7,7,1, 7,6,2, 6,8,1, 8,8,2, 5,6,1, 9,7,2, 5,5,1, 9,9,2];
+  for (let i = 0; i < seed.length; i += 3) b[idx(seed[i], seed[i+1])] = seed[i+2];
+  assert.equal(__test__.incrementalConsistency(b), true, '增量 hash/evaluate 与全盘重算不一致!');
+  // 空盘也要一致
+  assert.equal(__test__.incrementalConsistency(empty()), true);
+});
+
 test('FIX2: 防守校验通过时保持阶段2原着法', () => {
   // 白活三, 黑无近处威胁 → 阶段2建议继续延伸活三, 阶段3验证不杀 → 原着法
   const b = empty();
