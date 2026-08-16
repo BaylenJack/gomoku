@@ -341,7 +341,13 @@
           if (board[i] !== EMPTY) continue;
           s += scores[rIdx][i] - scores[oIdx][i];
         }
-        return s;
+        // v47.1 FIX5: 静态评估饱和 —— 活四/双四/冲四活三级单点分 (1e8/5e8)
+        // 远超 FIVE 阈值 (1e7), 不饱和时搜索把"静态高分"误判为"强制必胜"
+        // (value >= FIVE 判定命中) —— 阶段 1 VCT 报假杀、引擎下出看似必胜
+        // 实则几步后必输的着法 (用户"被绝杀"的根因之一, 与 v46.1 协议层
+        // FIVE 对齐同一问题在引擎内部的重现)。饱和后只有真实五连 (fiveCnt)
+        // 能产生 ±FIVE, 必胜判定不再被静态分数污染。
+        return Math.max(-(FIVE - 1), Math.min(FIVE - 1, s));
       },
       shapeAt(x, y, d, role) { return shapeCache[role - 1][idx(x, y) * 4 + d]; },
     };
@@ -404,7 +410,23 @@
             const fourPlus = cat === 'four' || cat === 'blockFour' || cat === 'fourFour' ||
                              cat === 'five' || cat === 'blockFive';
             const threePlus = cat === 'three' || cat === 'threeThree' || cat === 'fourThree' || fourPlus;
-            const keep = (r === role) === isAttackMove ? threePlus : fourPlus;
+            let keep = (r === role) === isAttackMove ? threePlus : fourPlus;
+            // v47.1: 防守节点的安静防守点 —— 邻接 ≥2 个对手子的"纯防守"点
+            // (拆对手聚集/堵活二延伸) 是 VCT 的盲区: 原实现防守方只许走
+            // 对手威胁点+己方四+, 漏掉这类关键堵点 → 杀棋链误报 (假阳性),
+            // 引擎被误导到错误堵点 (实测对 (7,10) 报假杀, 真活路 (8,9) 漏掉)。
+            // 只在防守方回合补, 进攻方回合不加 (保持杀棋链窄)。
+            if (!keep && !isAttackMove && r === role) {
+              let oppN = 0;
+              for (let dy = -1; dy <= 1 && oppN < 2; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                  if (dx === 0 && dy === 0) continue;
+                  const nx = x + dx, ny = y + dy;
+                  if (inB(nx, ny) && board[idx(nx, ny)] === other(role)) oppN++;
+                }
+              }
+              if (oppN >= 2) keep = true;
+            }
             if (!keep) continue;
           }
           sets[cat].push([x, y]);
@@ -767,26 +789,35 @@
     //   evaluator 残留), 但每个 helper 调用时同时累加到外层 budget.nodes,
     //   让 computeBest 能看到"搜索实际跑了多少节点"。
     const incOuter = () => { budget.nodes++; };
+    // v47.1: 各阶段节点数记录 —— 测试可断言"防守局面阶段 1 被跳过"(FIX1)
+    budget.stageNodes = { s1: 0, s2: 0, s3: 0 };
+
+    // v47.1 FIX1: 阶段 1 预检 —— 己方无活三+/冲四+ 进攻点时跳过 VCT。
+    //   VCT 根节点只搜进攻方自己的活三+ 点, 没有点必然空转烧预算
+    //   (实测防守局面白烧 1226ms/8177 节点一无所获), 预算转给阶段 3 防守校验。
+    //   有进攻点时行为不变 (35% 找杀)。
+    const hasAttack = getValuableMoves(evaluator, board, role, 0, true, false, lastMove, budget.jitterSeed).length > 0;
 
     // 阶段 1: VCT 找杀(预算 35%)
     // v11.4: 各阶段用独立 evaluator 副本 —— BUDGET 超时是异常抛出, 搜索树上
     // move/undo 不平衡, 共享 evaluator 会让下一阶段在残留棋子上搜索,
     // 误判假五连/假分数, 结果随超时点漂移(同一棋盘每次不同)。
-    const b1 = {
-      nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35),
-      t0: performance.now(), maxMs: budget.maxMs * 0.35,
-      incOuter,
-    };
+    const b1 = hasAttack
+      ? { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35), t0: performance.now(), maxMs: budget.maxMs * 0.35, incOuter }
+      : null;
     let value, move, bestPath;
-    try {
-      const vBoard = board.slice();
-      const vctEval = createEvaluator(vBoard);
-      vctEval.init();
-      [value, move, bestPath] = vct(vctEval, vBoard, role, vctDepth, 0, [], -MAX, MAX, b1, cache, lastMove, budget);
-      if (value >= FIVE && move) return { move, value, path: bestPath };
-    } catch (e) {
-      if (e !== BUDGET) throw e;
-      // 阶段 1 超时: 保留已搜到的部分结果, 继续阶段 2
+    if (b1) {
+      try {
+        const vBoard = board.slice();
+        const vctEval = createEvaluator(vBoard);
+        vctEval.init();
+        [value, move, bestPath] = vct(vctEval, vBoard, role, vctDepth, 0, [], -MAX, MAX, b1, cache, lastMove, budget);
+        budget.stageNodes.s1 = b1.nodes;
+        if (value >= FIVE && move) return { move, value, path: bestPath };
+      } catch (e) {
+        if (e !== BUDGET) throw e;
+        budget.stageNodes.s1 = b1.nodes;
+      }
     }
 
     // 阶段 2: 常规 minmax(预算 40%)
@@ -800,38 +831,42 @@
       const minEval = createEvaluator(mBoard);
       minEval.init();
       [value, move, bestPath] = _minmax(minEval, mBoard, role, depth, 0, [], -MAX, MAX, b2, cache, lastMove, budget);
+      budget.stageNodes.s2 = b2.nodes;
     } catch (e) {
       if (e !== BUDGET) throw e;
+      budget.stageNodes.s2 = b2.nodes;
     }
     if (!move) return null;
 
-    // 阶段 3: 防守校验(预算 25%) —— 我落 move 后对手能否 VCT 杀?
-    // 能且己方无必胜 → 改堵对方杀棋起点(防守妙手, 补 2b 的盲区:
-    // 2b 只拦 1-2 步的盘面威胁, 搜索级的强制杀链由这里拦截)。
-    // v11.5: 删第二次"确认"调用 —— 第一次 vct 已耗尽 b3, 第二次共享同一
-    // 预算必然立即超时, 让 path3.length 抛 TypeError(undefined.length) 沿
-    // catch 链上抛, computeBest 整个崩溃; 且 VCT 的 onlyThree 门控保证
-    // value2 >= FIVE 只在真找到杀时成立(中间迭代非胜值不提交), 无需确认。
+    // 阶段 3: 防守校验(预算: 有进攻点 25%, 无进攻点 45% —— 阶段 1 的预算转给这里)
+    // v47.1 FIX2: 我落 move 后对手能否 VCT 杀? 能且己方无必胜 → 改堵对方杀棋
+    // 起点(防守妙手)。原实现即此设计, v47.1 有两处增强:
+    //   - VCT 防守节点补"安静防守点"(邻接 ≥2 对手子) —— 消除误报杀棋,
+    //     验证结果可信;
+    //   - FIX5 静态评估饱和 —— 只有真实五连产生 ±FIVE, 阶段 1/3 的杀棋
+    //     判定不再被静态高分污染 (这是引擎"下出看似必胜实则必输"的根因)。
+    // 单候选 + 全预算: 多候选切片实测预算碎片化, 深杀链在切片内找不到,
+    // 验证失真; 单候选拿满预算, 堵杀棋起点本身已是最优防守。
     const b3 = {
-      nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.25),
-      t0: performance.now(), maxMs: budget.maxMs * 0.25,
+      nodes: 0, maxNodes: Math.floor(budget.maxNodes * (hasAttack ? 0.25 : 0.45)),
+      t0: performance.now(), maxMs: budget.maxMs * (hasAttack ? 0.25 : 0.45),
       incOuter,
     };
-    try {
-      const sBoard = board.slice();
-      const sEval = createEvaluator(sBoard);
-      sEval.init();
-      sEval.move(move[0], move[1], role);
-      let [value2, move2, path2] = vct(sEval, sBoard, other(role), vctDefDepth, 0, [], -MAX, MAX, b3, cache, move);
-      sEval.undo(move[0], move[1]);
-      // 黑 value < FIVE(未确认必胜) + 白 value2 >= FIVE(确认必胜) → 必堵。
-      // 路径比较是多余的: "黑快五"的场景(活三/活四延伸)在偶数层搜索内已确认
-      // value >= FIVE, 条件已排除; 黑未确认必胜时, 白的强制杀链必然先到。
-      if (value < FIVE && value2 >= FIVE && move2) {
-        return { move: move2, value, path: path2 }; // 改堵对方杀棋起点
+    if (value < FIVE) {
+      try {
+        const sBoard = board.slice();
+        const sEval = createEvaluator(sBoard);
+        sEval.init();
+        sEval.move(move[0], move[1], role);
+        const [value2, move2, path2] = vct(sEval, sBoard, other(role), vctDefDepth, 0, [], -MAX, MAX, b3, cache, move);
+        sEval.undo(move[0], move[1]);
+        budget.stageNodes.s3 = b3.nodes;
+        // 己方未确认必胜 + 对手确认必胜 → 改堵对手杀棋起点
+        if (value2 >= FIVE && move2) return { move: move2, value, path: path2 };
+      } catch (e) {
+        if (e !== BUDGET) throw e;
+        budget.stageNodes.s3 = b3.nodes;
       }
-    } catch (e) {
-      if (e !== BUDGET) throw e;
     }
     return { move, value, path: bestPath };
   }
@@ -1532,7 +1567,25 @@ function oppLineBlocks(board, opp, minN = 3) {
       } catch (e) {
         if (e !== BUDGET) throw e;
       }
-      return { nodes: budget.nodes, best: budget.best };
+      return { nodes: budget.nodes, best: budget.best, stageNodes: budget.stageNodes };
+    },
+    // v47.1: 对手 color 是否有 VCT 强制杀 (阶段 3 防守校验同款搜索)
+    // 预算内未确认杀返回 false (与阶段 3 语义一致: 宁可不堵也不乱堵)
+    hasVCTKill(board, color, opts) {
+      const MAX_BUDGET = 1 << 28;
+      const maxMs = (opts && opts.maxMs) || 2500;
+      const searchBoard = board.slice();
+      const evaluator = createEvaluator(searchBoard);
+      evaluator.init();
+      const b = { nodes: 0, maxNodes: MAX_BUDGET, t0: performance.now(), maxMs, incOuter: null };
+      try {
+        const [value, move, path] = vct(evaluator, searchBoard, color, 18, 0, [], -MAX, MAX, b, new Map(), null, null);
+        const kill = value >= FIVE;
+        return (opts && opts.withPath) ? { kill, value, path, move } : kill;
+      } catch (e) {
+        if (e !== BUDGET) throw e;
+        return (opts && opts.withPath) ? { kill: false, value: null, path: [], move: null } : false;
+      }
     },
   };
 
