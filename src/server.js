@@ -229,10 +229,12 @@ function handleHint(req, res) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           // v47: 把 votes / incomplete 透传给前端 —— 深度档可能 winners<4
           //   (谈合结果基于部分 worker), incomplete=true 时调用方可降级信任
+          // v47.3 修复: 原 264196c 误留两行 writeHead —— 第二次抛
+          //   ERR_HTTP_HEADERS_SENT, worker 算完但响应发不出去, 前端 fetch
+          //   失败回退本地普通档 → 深度模式永不常驻 (用户"深度不能长驻")。
           const payload = { ok: true, x: r.x, y: r.y, ms, deep };
           if (r.votes !== undefined) payload.votes = r.votes;
           if (r.incomplete !== undefined) payload.incomplete = r.incomplete;
-          res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(payload));
         })
         .catch((e) => {
