@@ -1589,7 +1589,7 @@ function oppLineBlocks(board, opp, minN = 3) {
     // v45.2: depth 沿用 v11 参数化 (v45 普通 6, deep 10-12)
     // v47.6: deep 12 → 10 (用户指定)
     const depth = isDeep
-      ? (stoneCount < 8 ? 2 : 10)
+      ? (stoneCount < 8 ? 2 : 12)
       : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
     try {
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
@@ -1657,7 +1657,7 @@ function oppLineBlocks(board, opp, minN = 3) {
       let stoneCount = 0;
       for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
       const depth = isDeep
-        ? (stoneCount < 8 ? 2 : 10)
+        ? (stoneCount < 8 ? 2 : 12)
         : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
       try {
         minmaxSearch(evaluator, searchBoard, color, depth, budget, null);
