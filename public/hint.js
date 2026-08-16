@@ -1239,6 +1239,34 @@ function oppLineBlocks(board, opp, minN = 3) {
     return bestByEval(board, color);
   }
 
+  // v47.3 融合 v11.5: 防守候选的 VCT 安全验证 —— 按评分取前 3, 逐个摆子跑
+  // 对手 VCT (深度 18), 第一个"对手杀不掉"的当选; 全被杀/预算耗尽 → 回退
+  // 评分最高的候选。预算固定 2s/20 万节点 —— 杀链验证通常 <200ms。
+  // 背景: 直接按评分返回可能选到被杀点 (实测 P6 局面 (8,9) 堵后黑仍可杀),
+  // v11.5 时代预算小对手弱, 该问题不显; 现在对手会用多线集结杀。
+  function safeDefensePick(board, color, scored, fallback) {
+    const opp = other(color);
+    const b = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 2000, incOuter: null };
+    for (let i = 0; i < Math.min(3, scored.length); i++) {
+      const p = scored[i].p;
+      const x = p[0] !== undefined ? p[0] : p.x;
+      const y = p[1] !== undefined ? p[1] : p.y;
+      const vb = board.slice();
+      vb[idx(x, y)] = color;
+      const ev = createEvaluator(vb);
+      ev.init();
+      try {
+        const [value2] = vct(ev, vb, opp, 18, 0, [], -MAX, MAX, b, new Map(), [x, y]);
+        if (value2 < FIVE) return { x, y };
+      } catch (e) {
+        if (e !== BUDGET) throw e;
+        break;
+      }
+    }
+    const f = fallback;
+    return { x: f[0] !== undefined ? f[0] : f.x, y: f[1] !== undefined ? f[1] : f.y };
+  }
+
   // ---------- 入口 ----------
   /**
    * 计算最佳落点
@@ -1358,44 +1386,54 @@ function oppLineBlocks(board, opp, minN = 3) {
       }
     }
 
-    // 2b-SOFT. 软性防守 (2 步到输, 允许被 kill 抢占): 对手活三 / 双威胁
+    // 2b-SOFT. 硬性防守 (v47.3 融合 v11.5): 对手活三 / 双威胁 → 立即必堵
     //   此时已确认: 对手无必堵威胁 + 我方无一步杀。
-    //   退到这里说明: 既没立刻要堵的, 也没立刻能杀的, 该堵就堵。
-    //   v45.1: 同上, 深档缓存候选但不立即返回。
+    //   v47.3 关键融合: v11.5 (用户实战明显更强) 对活三/双威胁无条件立即
+    //   返回, 深档缓存后继续搜索会让搜索选进攻点 → 对手活三延伸成活四 →
+    //   被绝杀。恢复硬堵 (killInOne 已在前面处理, 不损失杀棋机会)。
+    //   紧迫度排序同步 v11.5: 活三已成形 (2 步到五) > 双威胁 (潜在, 3 步)。
+    //   (当前版本原为活三 1 < 双威胁 2, 顺序反了。)
     const double = oppDoubleThreatPoints(board, opp);
     const liveThree = oppLineBlocks(board, opp, 3);  // n>=3, 含冲四/活四但这里已无威胁
     if (double.length || liveThree.length) {
       const cands = [...double, ...liveThree];
       const urgency = new Map();
-      // 双威胁(对方落子即成 2 个 3+)次之
+      // 活三端点最高紧迫度 (已成形, 2 步到五)
+      for (const p of liveThree) {
+        const k = p.y * SIZE + p.x;
+        if (!urgency.has(k) || urgency.get(k) < 3) urgency.set(k, 3);
+      }
+      // 双威胁(对方落子即成 2 个 3+)次之 (潜在, 3 步)
       for (const p of double) {
         const k = p.y * SIZE + p.x;
         if (!urgency.has(k) || urgency.get(k) < 2) urgency.set(k, 2);
       }
-      // 活三端点最低紧迫度 (仍需堵, 但比双威胁低)
-      for (const p of liveThree) {
-        const k = p.y * SIZE + p.x;
-        if (!urgency.has(k) || urgency.get(k) < 1) urgency.set(k, 1);
-      }
-      let best = cands[0], bestScore = -Infinity;
-      for (const b of cands) {
+      // 候选评分: 紧迫度权重 + 攻守兼备加成, 按分排序后 VCT 验证
+      const scored = cands.map((p) => {
         const b2 = board.slice();
-        b2[idx(b.x, b.y)] = color;
+        b2[idx(p[0], p[1])] = color;
         let s = evalBoardConn(b2, color);
-        const u = urgency.get(b.y * SIZE + b.x) || 0;
+        const u = urgency.get(p[1] * SIZE + p[0]) || 0;
         s += u * 8e6;
         if (liveThreeBlocks(b2, color).length) s += 3e6;
         else {
           let conn = 0;
           for (const [dx, dy] of DIRS) {
-            if (dirThreat(b2, b.x, b.y, dx, dy, color) >= 2) conn++;
+            if (dirThreat(b2, p[0], p[1], dx, dy, color) >= 2) conn++;
           }
           if (conn >= 2) s += 8e5;
         }
-        if (s > bestScore) { bestScore = s; best = b; }
+        return { p, s };
+      }).sort((a, b) => b.s - a.s);
+      // v47.3: 普通档立即返回 (v11.5 融合, 快且稳);
+      // 深档缓存堵点引导搜索, 强制深算 —— 用户要求所有局面深算 (预算可无限),
+      // 搜索深度 12-14 能看穿活三杀棋链, 阶段 3 验证兜底改堵。
+      const pick = safeDefensePick(board, color, scored, scored[0].p);
+      if (isDeep) {
+        setPick(pick);
+      } else {
+        return pick;
       }
-      setPick(best);
-      if (!isDeep) return { x: best.x, y: best.y };
     }
 
     // v45.2: 开局定式库 —— 覆盖前 5 手常见定式 (~3KB 静态数据, 5 手内生效)
@@ -1424,9 +1462,8 @@ function oppLineBlocks(board, opp, minN = 3) {
     // 对手下步最优点如果威胁远超我方可选点 → 直接抢对手的点
     // (堵"潜在双威胁"比搜索更直接 —— 普通档预算小, 搜索内未必看到这个点)
     // v11.2: 深度档(skipHardRules)跳过 —— 深度档用满预算深算, 反推只信搜索结论
-    // v45.1: 同上, 但 deep 档(opts.deep) ≠ skipHardRules;deep 档仍走 2c
-    //   (因为不冲突: deep 是更长预算, 2c 是启发式快速路径), 但缓存候选。
-    if (!skipHard) {
+    // v47.3: 深档同样跳过 (v11.5 语义) —— 深档强制深算, 不需要启发式反推
+    if (!skipHard && !isDeep) {
       const myBest = bestByEval(board, color);
       const oppBest = bestByEval(board, opp);
       if (oppBest.score > myBest.score + 4000 && oppBest.score !== -Infinity) {
@@ -1489,10 +1526,10 @@ function oppLineBlocks(board, opp, minN = 3) {
     //   现在 3500ms 让 helper 在 ~3.5s 抛 BUDGET, computeBest 返回 budget.best
     //   (含 value/path) → dispatcher pickBest 拿到真实依据。4s dispatcher 超时
     //   仍兜底(防 worker 真的卡死)。
-    // v47.2: 深档 wall-clock 3500ms → 10000ms —— 用户接受增加延迟换取棋力。
-    // 预算翻倍让深度 14 的迭代加深真正完成 (原 3.5s 内常只完成浅层迭代,
-    // 有效深度远低于声明值); 10s 上限由 dispatcher WORKER_TIMEOUT_MS 兜底。
-    const DEEP_BUDGET_MS = 10000;
+    // v47.3: 深档 wall-clock 10s → 60s (用户要求预算可无限大) ——
+    // 深档强制深算 (除 1 步输赢硬门外), 60s 让深度 14 的迭代加深完成;
+    // dispatcher WORKER_TIMEOUT_MS (60.5s) 兜底。
+    const DEEP_BUDGET_MS = 60000;
     const budget = {
       nodes: 0,
       maxNodes: isDeep ? MAX_BUDGET : (1 << 22),  // v45.1: 普通档 1.5s/400k → 5s/4M
@@ -1504,11 +1541,9 @@ function oppLineBlocks(board, opp, minN = 3) {
       jitterSeed: useJitter ? jitterSeed : 0,
     };
     // v45.2: depth 沿用 v11 参数化 (v45 普通 6, deep 10-12)
-    // v47.2: deep 中盘 10 → 12 —— 深度 14 在 10s 内跑不完, 迭代加深停在
-    // 中间迭代导致结果非确定性 (偶发丢失防守校验结果); 12 层在 10s 内
-    // 完成概率高, 结果稳定且棋力接近。
+    // v47.3: deep 12 → 14 —— 60s 预算下深度 14 迭代可完成, 更深看穿杀棋链
     const depth = isDeep
-      ? (stoneCount < 8 ? 2 : 12)
+      ? (stoneCount < 8 ? 2 : 14)
       : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
     try {
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
@@ -1557,10 +1592,10 @@ function oppLineBlocks(board, opp, minN = 3) {
     //   现在 3500ms 让 helper 在 ~3.5s 抛 BUDGET, computeBest 返回 budget.best
     //   (含 value/path) → dispatcher pickBest 拿到真实依据。4s dispatcher 超时
     //   仍兜底(防 worker 真的卡死)。
-    // v47.2: 深档 wall-clock 3500ms → 10000ms —— 用户接受增加延迟换取棋力。
-    // 预算翻倍让深度 14 的迭代加深真正完成 (原 3.5s 内常只完成浅层迭代,
-    // 有效深度远低于声明值); 10s 上限由 dispatcher WORKER_TIMEOUT_MS 兜底。
-    const DEEP_BUDGET_MS = 10000;
+    // v47.3: 深档 wall-clock 10s → 60s (用户要求预算可无限大) ——
+    // 深档强制深算 (除 1 步输赢硬门外), 60s 让深度 14 的迭代加深完成;
+    // dispatcher WORKER_TIMEOUT_MS (60.5s) 兜底。
+    const DEEP_BUDGET_MS = 60000;
       const isDeep = !!(opts && opts.deep === true);
       const searchBoard = board.slice();
       const evaluator = createEvaluator(searchBoard);
@@ -1576,7 +1611,7 @@ function oppLineBlocks(board, opp, minN = 3) {
       let stoneCount = 0;
       for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
       const depth = isDeep
-        ? (stoneCount < 8 ? 2 : 12)
+        ? (stoneCount < 8 ? 2 : 14)
         : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
       try {
         minmaxSearch(evaluator, searchBoard, color, depth, budget, null);

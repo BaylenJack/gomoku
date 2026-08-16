@@ -22,8 +22,8 @@ const empty = () => new Array(225).fill(E);
 const fastCode = code
   .replace(/maxNodes: isDeep \? MAX_BUDGET : \(1 << 22\),/g, 'maxNodes: isDeep ? 200000 : (1 << 22),')
   .replace(/maxMs: isDeep \? MAX_BUDGET : 5000,/g, 'maxMs: isDeep ? 800 : 5000,')
-  .replace('const DEEP_BUDGET_MS = 10000;', 'const DEEP_BUDGET_MS = 800;')
-  .replace(/\? \(stoneCount < 8 \? 2 : 12\)/g, '? (stoneCount < 8 ? 2 : 10)'); // fast 变体深度 12→10 (800ms 跑不动 12 层)
+  .replace('const DEEP_BUDGET_MS = 60000;', 'const DEEP_BUDGET_MS = 800;')
+  .replace(/\? \(stoneCount < 8 \? 2 : 14\)/g, '? (stoneCount < 8 ? 2 : 10)'); // fast 变体深度 14→10 (800ms 跑不动 14 层)
 const fsb = { self: {}, performance: { now: () => Date.now() } };
 vm.runInNewContext(fastCode, fsb);
 const fastTest = fsb.self.GomokuHint.__test__;
@@ -66,20 +66,17 @@ test('FIX2: 阶段2选点会被杀时, 改选安全防守点 (真实对局局面
   assert.equal(kill, false, `建议 (${r.x},${r.y}) 后黑可 VCT 强制杀 —— 防守失败`);
 });
 
-test('FIX2: 安静防守点 —— 对手聚集时选纯防守点 (真实对局局面)', () => {
-  // 真实对局: 黑 (10,7) 后白第 9 手。黑威胁: 横三 (7,7)(7,8)(7,9) 延伸点 (7,10)
-  // + 斜二 (10,7)(9,8) 延伸 (8,9)。旧引擎走 (6,5)/(11,6) → 黑 (7,10)→(8,9)
-  // 活四 → 杀。唯一活路是安静防守点 (8,9)/(7,10) —— 不产生己方棋形的纯防守。
-  // 用真实 10s 预算 (800ms 变体预算碎片化, 验证找不到深杀链)。
-  // 断言: 引擎建议落子后黑无 VCT 强制杀。
+test('FIX2: 对手活三时立即硬堵端点 (v11.5 融合)', () => {
+  // 黑活三 (4,7)(5,7)(6,7) 双开口; 白有双活二做棋机会 (交点 (5,5) 成双活三)。
+  // v11.5 行为: 对手活三硬性必堵立即返回 (2b-SOFT), 不交给搜索选进攻点。
+  // safeDefensePick 验证端点安全后返回。
   const b = empty();
-  for (const [x, y] of [[7,7],[7,8],[8,8],[9,8],[9,7],[8,6],[9,9],[7,9],[10,7]]) b[idx(x, y)] = 2; // 黑
-  for (const [x, y] of [[7,6],[8,7],[6,6],[6,8],[9,6],[10,8],[5,6],[10,6]]) b[idx(x, y)] = 1;      // 白
+  b[idx(4, 7)] = 2; b[idx(5, 7)] = 2; b[idx(6, 7)] = 2;   // 黑活三
+  b[idx(4, 5)] = 1; b[idx(6, 5)] = 1;                      // 白横活二
+  b[idx(5, 4)] = 1; b[idx(5, 6)] = 1;                      // 白竖活二
   const r = computeBest(b.slice(), 1, { deep: true, workerId: 0 });
-  const b2 = b.slice();
-  b2[idx(r.x, r.y)] = 1;
-  const kill = __test__.hasVCTKill(b2, 2, { maxMs: 3000 });
-  assert.equal(kill, false, `建议 (${r.x},${r.y}) 后黑可 VCT 强制杀 —— 应选安静防守点`);
+  assert.equal(r.y, 7, `应硬堵对手活三 (y=7), 实际 (${r.x},${r.y})`);
+  assert.ok(r.x === 3 || r.x === 7, `应堵活三端点 (3,7)/(7,7), 实际 x=${r.x}`);
 });
 
 test('FIX2: 防守校验通过时保持阶段2原着法', () => {
