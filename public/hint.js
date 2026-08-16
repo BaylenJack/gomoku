@@ -865,7 +865,30 @@
         vctEval.init();
         [value, move, bestPath] = vct(vctEval, vBoard, role, vctDepth, 0, [], -MAX, MAX, b1, cache, lastMove, budget);
         budget.stageNodes.s1 = b1.nodes;
-        if (value >= FIVE && move) return { move, value, path: bestPath };
+        // v47.9: 假杀验证 —— VCT 杀棋链假设对手必须回应, 但对手可能有更快
+        // 杀 (实测: 白活三造点报假杀, 黑活三 2 步反杀更快)。己方走 move 后
+        // 验证对手能否 VCT 杀; 对手杀链不短于己方 → 假杀, 落到阶段 2/3
+        // 由防守校验改堵 (用户实战两局赢 AI 的破绽根因)。
+        if (value >= FIVE && move) {
+          let oppVal = 0, oppPathLen = 0, isFake = false;
+          const vb = board.slice();
+          vb[idx(move[0], move[1])] = role;
+          const ve = createEvaluator(vb);
+          ve.init();
+          const vbudget = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 1000, incOuter: null };
+          try {
+            const [ov, , op] = vct(ve, vb, other(role), 18, 0, [], -MAX, MAX, vbudget, new Map(), move);
+            oppVal = ov; oppPathLen = op.length;
+          } catch (e) {
+            if (e !== BUDGET) throw e;
+          }
+          if (oppVal >= FIVE && bestPath.length >= oppPathLen) isFake = true;
+          if (!isFake) return { move, value, path: bestPath };
+          if (budget.best && budget.best.move &&
+              budget.best.move[0] === move[0] && budget.best.move[1] === move[1]) {
+            budget.best = null; // 清掉假杀, 防止搜索无果时回退
+          }
+        }
       } catch (e) {
         if (e !== BUDGET) throw e;
         budget.stageNodes.s1 = b1.nodes;
@@ -1412,7 +1435,13 @@ function oppLineBlocks(board, opp, minN = 3) {
         }
         if (s > bestScore) { bestScore = s; best = b; }
       }
-      return { x: best.x, y: best.y };
+      // v47.9: 深档强制深算 —— 活四/冲四造点必堵但堵哪个端点/有无反杀
+      // 由 12 层搜索决定 (阶段 3 兜底保证改堵); 普通档秒回
+      if (isDeep) {
+        setPick(best);
+      } else {
+        return { x: best.x, y: best.y };
+      }
     }
 
     // 1.5. 己方一步杀 —— 必堵威胁已处理, 对手只有慢威胁(活三, 2 步到五),
@@ -1489,7 +1518,8 @@ function oppLineBlocks(board, opp, minN = 3) {
     //   - 3-5 手: 关键决策点的 B/W 推荐
     //   5 手之后落入深度 6/10 搜索。命中即返回 (与旧版语义一致),
     //   未命中继续走搜索 —— 完全是 ADDITIVE 行为。
-    if (stoneCount >= 1 && stoneCount <= 5) {
+    // v47.9: 深档跳过开局库 —— 用户要求每步相同深度思考, 开局也深算
+    if (!isDeep && stoneCount >= 1 && stoneCount <= 5) {
       const blacks = [], whites = [];
       for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
         const v = board[idx(x, y)];
@@ -1524,7 +1554,7 @@ function oppLineBlocks(board, opp, minN = 3) {
     // 白 2 手兜底 (应对黑非中心开局) —— 白方贴近黑子, 找不到库时落入搜索
     //   v45.2: 这是 OPENING_BOOK 未命中时的 fallback, 让"黑开远端 + 白 2"的
     //   边角情况也有合理启发式 (贴邻而非跑搜索)。
-    if (stoneCount === 1 && color === WHITE) {
+    if (!isDeep && stoneCount === 1 && color === WHITE) {
       const stones = [];
       for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
         if (board[idx(x, y)] !== EMPTY) stones.push([x, y, board[idx(x, y)]]);
@@ -1588,8 +1618,9 @@ function oppLineBlocks(board, opp, minN = 3) {
     };
     // v45.2: depth 沿用 v11 参数化 (v45 普通 6, deep 10-12)
     // v47.6: deep 12 → 10 (用户指定)
+    // v47.9: 深度统一 12 (含开局) —— 用户要求每步相同深度思考, 去掉开局特判
     const depth = isDeep
-      ? (stoneCount < 8 ? 2 : 12)
+      ? 12
       : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
     try {
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
@@ -1657,7 +1688,7 @@ function oppLineBlocks(board, opp, minN = 3) {
       let stoneCount = 0;
       for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
       const depth = isDeep
-        ? (stoneCount < 8 ? 2 : 12)
+        ? 12
         : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
       try {
         minmaxSearch(evaluator, searchBoard, color, depth, budget, null);
