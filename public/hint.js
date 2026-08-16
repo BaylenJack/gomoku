@@ -1605,7 +1605,7 @@ function oppLineBlocks(board, opp, minN = 3) {
     // v47.3: 深档 wall-clock 10s → 60s (用户要求预算可无限大) ——
     // 深档强制深算 (除 1 步输赢硬门外), 60s 让深度 14 的迭代加深完成;
     // dispatcher WORKER_TIMEOUT_MS (60.5s) 兜底。
-    const DEEP_BUDGET_MS = 60000;
+    const DEEP_BUDGET_MS = 15000;
     const budget = {
       nodes: 0,
       maxNodes: isDeep ? MAX_BUDGET : (1 << 22),  // v45.1: 普通档 1.5s/400k → 5s/4M
@@ -1672,7 +1672,7 @@ function oppLineBlocks(board, opp, minN = 3) {
     // v47.3: 深档 wall-clock 10s → 60s (用户要求预算可无限大) ——
     // 深档强制深算 (除 1 步输赢硬门外), 60s 让深度 14 的迭代加深完成;
     // dispatcher WORKER_TIMEOUT_MS (60.5s) 兜底。
-    const DEEP_BUDGET_MS = 60000;
+    const DEEP_BUDGET_MS = 15000;
       const isDeep = !!(opts && opts.deep === true);
       const searchBoard = board.slice();
       const evaluator = createEvaluator(searchBoard);
