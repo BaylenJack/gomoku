@@ -23,7 +23,7 @@ const fastCode = code
   .replace(/maxNodes: isDeep \? MAX_BUDGET : \(1 << 22\),/g, 'maxNodes: isDeep ? 200000 : (1 << 22),')
   .replace(/maxMs: isDeep \? MAX_BUDGET : 5000,/g, 'maxMs: isDeep ? 800 : 5000,')
   .replace('const DEEP_BUDGET_MS = 15000;', 'const DEEP_BUDGET_MS = 800;')
-  .replace(/\? 10/g, '? 8'); // fast 变体深度 10→8 (800ms 跑不动 10 层)
+  .replace(/\? 12/g, '? 8'); // fast 变体深度 12→8 (800ms 跑不动 12/10 层)
 const fsb = { self: {}, performance: { now: () => Date.now() } };
 vm.runInNewContext(fastCode, fsb);
 const fastTest = fsb.self.GomokuHint.__test__;
