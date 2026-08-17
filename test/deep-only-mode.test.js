@@ -7,6 +7,7 @@ import { Worker } from 'node:worker_threads';
 const app = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
 const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
 const dispatcher = fs.readFileSync(new URL('../src/hint-worker.cjs', import.meta.url), 'utf8');
+const engine = fs.readFileSync(new URL('../public/hint.js', import.meta.url), 'utf8');
 
 test('提示按钮单击直接启动唯一的深度模式', () => {
   assert.match(app, /btn\.addEventListener\('click'/);
@@ -24,6 +25,15 @@ test('服务端忽略客户端档位并固定返回深度结果', () => {
 test('dispatcher 只保留 Lazy SMP 深度路径', () => {
   assert.match(dispatcher, /w\.postMessage\(\{ id: msg\.id, board: msg\.board, color: msg\.color, deep: true \}\)/);
   assert.doesNotMatch(dispatcher, /msg\.deep|loadEngine|computeBest\(msg\.board/);
+});
+
+test('深度模式固定为 10 层、3000 万节点并受 10 秒端到端窗口约束', () => {
+  assert.match(engine, /v11\.5-tuned/);
+  assert.match(engine, /const depth = 10;/);
+  assert.match(engine, /maxNodes: 30000000/);
+  assert.match(engine, /maxMs: 9000/);
+  assert.match(dispatcher, /const WORKER_TIMEOUT_MS = 9500;/);
+  assert.match(app, /const timeoutMs = 10000;/);
 });
 
 test('dispatcher 收到不带 deep 的请求仍执行深度搜索', async () => {

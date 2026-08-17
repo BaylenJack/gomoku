@@ -1,4 +1,4 @@
-// 五子棋提示引擎 v6 — 借鉴 gobang (lihongxun945) 的 MiniMax + Alpha-Beta + VCT/VCF
+// 五子棋提示引擎 v11.5-tuned — 3000 万节点 / 固定深度 10 / 10 秒响应窗
 //
 // 架构来源: https://github.com/lihongxun945/gobang
 //   1. 增量点位评估: 每个空位缓存四方向棋形分数, 落子只更新周围 5 格,
@@ -1016,8 +1016,9 @@
     // 开局(<8 子)深度 2, 中盘 8, 残局(>190 子)深度 4。
     let stoneCount = 0;
     for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
-    // v11: 深度参数化 —— 服务器端通过替换把 6 提到 10-12(深度版)
-    const depth = stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6);
+    // v11.5-tuned: 全局固定 10 层深度。开局、中盘、残局使用同一搜索深度，
+    // 节点与墙钟预算负责在复杂局面中安全截断。
+    const depth = 10;
 
     // 开局定式: 仅黑第 3 手(天元 + 白 1 子)用严格定式 ——
     // 黑天元开局理论必胜, 白 1 子在斜对角时, 黑应下与天元相邻的活 2 点
@@ -1051,9 +1052,10 @@
         if (board[idx(x, y)] !== EMPTY) { lastMove = [x, y]; break; }
       }
     }
-    // v9: Web Worker 后台跑 — 3 秒 / 80 万节点(主线程同步调用时仍会回退)
-    // v11: budget.best 记录最优-so-far —— 超时也能返回部分搜索的最佳结果
-    const budget = { nodes: 0, maxNodes: 400000, t0: performance.now(), maxMs: 1500, visited: null, best: null };
+    // v11.5-tuned: 3000 万节点硬上限；引擎最多占用 9 秒，给 dispatcher、HTTP
+    // 与公网传输预留约 1 秒，保证端到端 10 秒窗口。budget.best 让截断时
+    // 仍返回最后一次完成迭代的结果。
+    const budget = { nodes: 0, maxNodes: 30000000, t0: performance.now(), maxMs: 9000, visited: null, best: null };
     try {
       const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
       if (res && res.move) return { x: res.move[0], y: res.move[1] };
