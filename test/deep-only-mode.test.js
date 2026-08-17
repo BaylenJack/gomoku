@@ -48,3 +48,29 @@ test('dispatcher 收到不带 deep 的请求仍执行深度搜索', async () => 
     await worker.terminate();
   }
 });
+
+test('四路深度 dispatcher 不会被己方做棋诱惑带离对手三连', async () => {
+  const worker = new Worker(new URL('../src/hint-worker.cjs', import.meta.url), {
+    workerData: { publicDir: path.resolve('public') },
+  });
+  const board = new Array(225).fill(0);
+  const idx = (x, y) => y * 15 + x;
+  board[idx(3, 7)] = 1;
+  for (const x of [4,5,6]) board[idx(x, 7)] = 2;
+  for (const [x, y] of [[9,5],[11,5],[10,4],[10,6]]) board[idx(x, y)] = 1;
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('三连 dispatcher 测试超时')), 20000);
+      worker.once('error', reject);
+      worker.once('message', (message) => {
+        clearTimeout(timer);
+        resolve(message);
+      });
+      worker.postMessage({ id: 'three-defense-test', board, color: 1 });
+    });
+    assert.deepEqual([result.x, result.y], [7, 7]);
+    assert.equal(result.deep, true);
+  } finally {
+    await worker.terminate();
+  }
+});

@@ -1,4 +1,4 @@
-// 五子棋提示引擎 v50 — 单一深度档 + 精确战术层 + MiniMax/Alpha-Beta + VCT/VCF
+// 五子棋提示引擎 v51 — 三连安全层 + MiniMax/Alpha-Beta + VCT/VCF
 //
 // 架构来源: https://github.com/lihongxun945/gobang
 //   1. 增量点位评估: 每个空位缓存四方向棋形分数, 落子只更新周围 5 格,
@@ -1114,6 +1114,24 @@
     return out;
   }
 
+  // 对方下一手能够制造至少一个“立即成五点”的位置。它精确覆盖连续三、
+  // 眠三、边界三和跳三的成四点，不依赖容易漏形的正则棋形分类。
+  // replies>=2 是两手必胜启动点；replies===1 也是必须高度重视的成四先手。
+  function fourLaunchPoints(board, color) {
+    const out = [];
+    for (let c = 0; c < board.length; c++) {
+      if (board[c] !== EMPTY) continue;
+      const x = c % SIZE, y = Math.floor(c / SIZE);
+      board[c] = color;
+      if (!winsAfter(board, x, y, color)) {
+        const replies = winPoints(board, color).length;
+        if (replies > 0) out.push({ x, y, replies });
+      }
+      board[c] = EMPTY;
+    }
+    return out;
+  }
+
   // v11.5: 一步杀扫描 —— 落子即成活四/双活三/冲四活三/双四 → 对手一步堵不完, 直接杀。
   // 原放在 2b 内(对手活三/双威胁时才查), 且"堵对手成五"在它之前 —— 对手只有
   // 冲四时先被迫堵棋, 漏掉必胜杀(杀棋链迫使对手全程应挡, 其冲四永远走不完)。
@@ -1143,32 +1161,6 @@
     return best;
   }
 
-  // 两个成五点是否同一活四的两端(相距 5、中间 4 子连续)。
-  // 活四下一手必胜, 己方杀来不及; 双冲四(两个独立成五点)不是一步杀,
-  // 己方一步杀先手必胜, 仍应优先杀。
-  function sameLiveFour(board, opp, a, b) {
-    const dx = Math.abs(a.x - b.x), dy = Math.abs(a.y - b.y);
-    if (!((dx === 5 && dy === 0) || (dx === 0 && dy === 5) || (dx === 5 && dy === 5))) return false;
-    const sx = dx === 0 ? 0 : (b.x - a.x) / dx;
-    const sy = dy === 0 ? 0 : (b.y - a.y) / dy;
-    for (let i = 1; i <= 4; i++) {
-      if (board[idx(a.x + sx * i, a.y + sy * i)] !== opp) return false;
-    }
-    return true;
-  }
-
-  // 对手"落子即成活四/冲四"的点(必要防守的候选)
-  function oppOpenFourPoints(board, opp) {
-    const pts = new Set();
-    for (const [x, y] of nearCells(board)) {
-      for (const [dx, dy] of DIRS) {
-        const s = scanLine(board, x, y, dx, dy, opp);
-        if (s.n === 4 && s.open === 2) { pts.add(y * SIZE + x); break; }
-      }
-    }
-    return [...pts].map((i) => ({ x: i % SIZE, y: Math.floor(i / SIZE) }));
-  }
-
   // 对手"落子即形成双威胁"(双活三/活三+冲四)的点 —— 必争点
   function oppDoubleThreatPoints(board, opp) {
     const pts = [];
@@ -1184,11 +1176,9 @@
     return pts;
   }
 
-  // 对手同线聚子 → 堵端点防成杀
-//   v11.7: minN 参数拆分必堵/软堵:
-//     minN=4: 只返回冲四/活四端点 (1 步就输, 必须立即处理)
-//     minN=3: 还包含活三端点 (2 步到输, 可被 killInOne 抢占)
-function oppLineBlocks(board, opp, minN = 3) {
+  // 对手连续聚子 → 返回所有开放端点。三连即使只有单开口也必须进入根节点
+  // 安全层；旧版刻意忽略眠三，正是“对方三连了还继续进攻”的来源之一。
+  function establishedThreeBlocks(board, opp) {
     const blocks = new Set();
     for (let y = 0; y < SIZE; y++) {
       for (let x = 0; x < SIZE; x++) {
@@ -1198,13 +1188,9 @@ function oppLineBlocks(board, opp, minN = 3) {
           if (inB(px, py) && board[idx(px, py)] === opp) continue;
           let n = 0, cx = x, cy = y;
           while (inB(cx, cy) && board[idx(cx, cy)] === opp) { n++; cx += dx; cy += dy; }
-          if (n < minN) continue;
+          if (n < 3) continue;
           const o1 = inB(x - dx, y - dy) && board[idx(x - dx, y - dy)] === EMPTY;
           const o2 = inB(cx, cy) && board[idx(cx, cy)] === EMPTY;
-          // v11.4: 眠三(单开口)端点不再硬性必堵 —— 不堵不会立刻输, 却会把 2b
-          // 提前截断, 让引擎只顾防守放弃进攻(搜索被架空)。保留活三(双开口)
-          // 与冲四/活四(n=4)端点 —— 这两类不堵就输。
-          if (n === 3 && !(o1 && o2)) continue;
           if (o1) blocks.add((y - dy) * SIZE + (x - dx));
           if (o2) blocks.add(cy * SIZE + cx);
         }
@@ -1436,6 +1422,40 @@ function oppLineBlocks(board, opp, minN = 3) {
     return { x: f[0] !== undefined ? f[0] : f.x, y: f[1] !== undefined ? f[1] : f.y };
   }
 
+  // 根节点防守统一决策：先去重，再用“堵后剩余的精确威胁数”排序，最后用
+  // VCT 排除表面上堵住一条线、实际仍被另一条线杀掉的伪防守。
+  function chooseForcedDefense(board, color, candidates, urgency = new Map(), verify = true) {
+    const opp = other(color);
+    const unique = new Map();
+    for (const p of candidates) {
+      if (!p || !Number.isInteger(p.x) || !Number.isInteger(p.y)) continue;
+      unique.set(p.y * SIZE + p.x, p);
+    }
+    const scored = [...unique.values()].map((p) => {
+      const b2 = board.slice();
+      b2[idx(p.x, p.y)] = color;
+      const immediate = winPoints(b2, opp).length;
+      const forcedTwo = forcedWinInTwoPoints(b2, opp).length;
+      const launches = fourLaunchPoints(b2, opp).length;
+      let adjacent = 0;
+      for (const [dx, dy] of DIRS) {
+        for (const sign of [-1, 1]) {
+          const nx = p.x + dx * sign, ny = p.y + dy * sign;
+          if (inB(nx, ny) && b2[idx(nx, ny)] === opp) adjacent++;
+        }
+      }
+      // 风险使用远大于局面评估的字典序权重：先消灭立即输/两手杀/成四点，
+      // 再偏好贴住现有三连的直观堵点，最后才比较攻守兼备价值。
+      const riskPenalty = immediate * 1e18 + forcedTwo * 1e15 + launches * 1e12;
+      const priority = (urgency.get(p.y * SIZE + p.x) || 0) * 1e9;
+      const s = priority + adjacent * 1e6 + evalBoardConn(b2, color) - riskPenalty;
+      return { p, s };
+    }).sort((a, b) => b.s - a.s);
+    if (!scored.length) return null;
+    if (!verify) return { x: scored[0].p.x, y: scored[0].p.y };
+    return safeDefensePick(board, color, scored, scored[0].p);
+  }
+
   // ---------- 入口 ----------
   /**
    * 计算最佳落点
@@ -1538,107 +1558,55 @@ function oppLineBlocks(board, opp, minN = 3) {
       return { x: best.x, y: best.y, tactical: 'block-win-in-two' };
     }
 
-    // 2b-MUST. 必堵 (1 步就输): 对手活四 + 冲四
-    //   v11.7: 与慢威胁(活三/双威胁)分开 —— 冲四不堵必输, 活三可被 killInOne 抢占
-    //   v45.1: 同上, 硬性 1 步输仍立即返回, 两档都执行
-    const urgent = oppOpenFourPoints(board, opp);   // 活四端点 (n=4, open=2)
-    const rushFour = oppLineBlocks(board, opp, 4);  // 冲四/活四端点 (n>=4)
-    if (urgent.length || rushFour.length) {
-      const cands = [...urgent, ...rushFour];
+    // 5. 三连根节点安全层。旧结构只缓存堵点，随后仍允许主搜索覆盖；而且
+    // 候选对象被误按数组读取，评分实际使用 undefined。现在统一做精确威胁
+    // 枚举并立即返回，除非前面已经证明己方能在两手内获胜。
+    const launches = fourLaunchPoints(board, opp);
+    const establishedThree = establishedThreeBlocks(board, opp);
+    if (establishedThree.length) {
+      const cands = [...establishedThree, ...launches];
       const urgency = new Map();
-      for (const p of rushFour) urgency.set(p.y * SIZE + p.x, 3);
-      for (const p of urgent) urgency.set(p.y * SIZE + p.x, 3);
-      let best = cands[0], bestScore = -Infinity;
-      for (const b of cands) {
-        const b2 = board.slice();
-        b2[idx(b.x, b.y)] = color;
-        let s = evalBoardConn(b2, color);
-        const u = urgency.get(b.y * SIZE + b.x) || 0;
-        s += u * 8e6;
-        if (liveThreeBlocks(b2, color).length) s += 3e6;
-        else {
-          let conn = 0;
-          for (const [dx, dy] of DIRS) {
-            if (dirThreat(b2, b.x, b.y, dx, dy, color) >= 2) conn++;
-          }
-          if (conn >= 2) s += 8e5;
-        }
-        if (s > bestScore) { bestScore = s; best = b; }
+      for (const p of establishedThree) {
+        urgency.set(p.y * SIZE + p.x, 5);
       }
-      // v47.9: 深档强制深算 —— 活四/冲四造点必堵但堵哪个端点/有无反杀
-      // 由 12 层搜索决定 (阶段 3 兜底保证改堵); 普通档秒回
-      if (isDeep) {
-        setPick(best);
-      } else {
-        return { x: best.x, y: best.y, tactical: 'forced-defense' };
+      for (const p of launches) {
+        const k = p.y * SIZE + p.x;
+        urgency.set(k, Math.max(urgency.get(k) || 0, 3 + Math.min(2, p.replies)));
       }
+      const pick = chooseForcedDefense(board, color, cands, urgency);
+      if (pick) return { ...pick, tactical: 'block-three-threat' };
     }
 
-    // 1.5. 己方一步杀 —— 必堵威胁已处理, 对手只有慢威胁(活三, 2 步到五),
-    //   可放心走"必胜"杀棋链, 对手被迫全程应挡, 我方先到。
-    //   白成五点多(≥3)时白多路必胜, 已方杀来不及 —— 这种情况已被步骤 2 截住。
-    //   2 个成五点是同一活四两端时, 实际只有 1 路威胁, 杀棋链足以覆盖。
-    //   v45.1: 深档不再立即返回 —— 保留启发式点为兜底, 继续走搜索验证
-    //   (搜索可能给出更优解, 例如先手抢对方双威胁交点)。
-    if (oppWins.length <= 2) {
-      const liveFour = oppWins.length === 2 && sameLiveFour(board, opp, oppWins[0], oppWins[1]);
-      if (!liveFour) {
-        const kill = killInOne(board, color);
-        if (kill) {
-          setPick(kill);
-          if (!isDeep) return { x: kill.x, y: kill.y };
-        }
-      }
-    }
-
-    // 2b-SOFT. 硬性防守 (v47.3 融合 v11.5): 对手活三 / 双威胁 → 立即必堵
-    //   此时已确认: 对手无必堵威胁 + 我方无一步杀。
-    //   v47.3 关键融合: v11.5 (用户实战明显更强) 对活三/双威胁无条件立即
-    //   返回, 深档缓存后继续搜索会让搜索选进攻点 → 对手活三延伸成活四 →
-    //   被绝杀。恢复硬堵 (killInOne 已在前面处理, 不损失杀棋机会)。
-    //   紧迫度排序同步 v11.5: 活三已成形 (2 步到五) > 双威胁 (潜在, 3 步)。
-    //   (当前版本原为活三 1 < 双威胁 2, 顺序反了。)
-    const double = oppDoubleThreatPoints(board, opp);
-    const liveThree = oppLineBlocks(board, opp, 3);  // n>=3, 含冲四/活四但这里已无威胁
-    if (double.length || liveThree.length) {
-      const cands = [...double, ...liveThree];
-      const urgency = new Map();
-      // 活三端点最高紧迫度 (已成形, 2 步到五)
-      for (const p of liveThree) {
-        const k = p.y * SIZE + p.x;
-        if (!urgency.has(k) || urgency.get(k) < 3) urgency.set(k, 3);
-      }
-      // 双威胁(对方落子即成 2 个 3+)次之 (潜在, 3 步)
-      for (const p of double) {
-        const k = p.y * SIZE + p.x;
-        if (!urgency.has(k) || urgency.get(k) < 2) urgency.set(k, 2);
-      }
-      // 候选评分: 紧迫度权重 + 攻守兼备加成, 按分排序后 VCT 验证
-      const scored = cands.map((p) => {
-        const b2 = board.slice();
-        b2[idx(p[0], p[1])] = color;
-        let s = evalBoardConn(b2, color);
-        const u = urgency.get(p[1] * SIZE + p[0]) || 0;
-        s += u * 8e6;
-        if (liveThreeBlocks(b2, color).length) s += 3e6;
-        else {
-          let conn = 0;
-          for (const [dx, dy] of DIRS) {
-            if (dirThreat(b2, p[0], p[1], dx, dy, color) >= 2) conn++;
-          }
-          if (conn >= 2) s += 8e5;
-        }
-        return { p, s };
-      }).sort((a, b) => b.s - a.s);
-      // v47.3: 普通档立即返回 (v11.5 融合, 快且稳);
-      // 深档缓存堵点引导搜索, 强制深算 —— 用户要求所有局面深算 (预算可无限),
-      // 搜索深度 12-14 能看穿活三杀棋链, 阶段 3 验证兜底改堵。
-      const pick = safeDefensePick(board, color, scored, scored[0].p);
-      if (isDeep) {
+    // 跳三/多线局面仅凭一个成四点未必能挡住真正杀棋起点（实战中可能应
+    // 先堵另一条集结线）。把精确成四点作为强引导，但仍让阶段 3 VCT 选择
+    // 唯一安全防守；连续三连则已在上面无条件硬堵。
+    if (launches.length) {
+      const urgency = new Map(launches.map((p) => [p.y * SIZE + p.x, 3 + Math.min(2, p.replies)]));
+      const pick = chooseForcedDefense(board, color, launches, urgency, false);
+      if (pick) {
         setPick(pick);
-      } else {
-        return { ...pick, tactical: 'forced-defense' };
+        if (!isDeep) return { ...pick, tactical: 'block-four-launch' };
       }
+    }
+
+    // 尚未形成三连的“下一手双威胁”仍交给完整搜索验证。它只是潜在杀点，
+    // 不能像已成形三连那样硬返回，否则会错过更深的唯一防守手。
+    const double = oppDoubleThreatPoints(board, opp);
+    if (double.length) {
+      const urgency = new Map(double.map((p) => [p.y * SIZE + p.x, 2]));
+      const pick = chooseForcedDefense(board, color, double, urgency, false);
+      if (pick) {
+        setPick(pick);
+        if (!isDeep) return { ...pick, tactical: 'potential-defense' };
+      }
+    }
+
+    // 己方近似一步杀仅作为搜索异常时的进攻兜底；它不再有权越过上面的
+    // 对方三连安全层。
+    const kill = killInOne(board, color);
+    if (kill) {
+      setPick(kill);
+      if (!isDeep) return { x: kill.x, y: kill.y };
     }
 
     // v45.2: 开局定式库 —— 覆盖前 5 手常见定式 (~3KB 静态数据, 5 手内生效)
@@ -1777,6 +1745,7 @@ function oppLineBlocks(board, opp, minN = 3) {
     countForcing,         // 双活三威胁统计
     immediateWinningMoves: winPoints,
     forcedWinInTwoPoints,
+    fourLaunchPoints,
     // runWithBudget —— 直接跑搜索并返回 budget 节点数, 不走启发式门。
     //   测试用它验证"深档真的跑了搜索"(节点数 > 0)。
     runWithBudget(board, color, opts) {

@@ -85,6 +85,82 @@ test('v49: 精确两手求解器既会反先，也会封住对手启动点', () 
   assert.ok(block.x === 5 || block.x === 9);
 });
 
+test('v51: 单开口和边界三连在四个方向都立即封堵', () => {
+  const directions = [[1,0],[0,1],[1,1],[1,-1]];
+  for (const [dx, dy] of directions) {
+    for (const closedSide of [-1, 1]) {
+      const b = empty();
+      const sx = 6, sy = dy < 0 ? 9 : 5;
+      for (let t = 0; t < 3; t++) b[idx(sx + dx * t, sy + dy * t)] = 2;
+      const closedT = closedSide < 0 ? -1 : 3;
+      const blockT = closedSide < 0 ? 3 : -1;
+      b[idx(sx + dx * closedT, sy + dy * closedT)] = 1;
+      const before = b.slice();
+      const r = computeBest(b, 1, { deep: true, workerId: 0 });
+      assert.deepEqual([r.x, r.y], [sx + dx * blockT, sy + dy * blockT],
+        `方向(${dx},${dy}) 封闭侧=${closedSide} 漏看三连: (${r.x},${r.y})`);
+      assert.equal(r.tactical, 'block-three-threat');
+      assert.deepEqual(b, before, '三连安全扫描不得污染棋盘');
+    }
+  }
+});
+
+test('v51: XX_X 与 X_XX 跳三在四个方向都封住成五路线', () => {
+  const directions = [[1,0],[0,1],[1,1],[1,-1]];
+  for (const [dx, dy] of directions) {
+    for (const gap of [1, 2]) {
+      const b = empty();
+      const sx = 6, sy = dy < 0 ? 9 : 5;
+      for (let t = 0; t < 4; t++) {
+        if (t !== gap) b[idx(sx + dx * t, sy + dy * t)] = 2;
+      }
+      // 封住一侧，另一侧保留成五点；填缺口会形成必须回应的冲四。
+      b[idx(sx - dx, sy - dy)] = 1;
+      const before = b.slice();
+      const r = computeBest(b, 1, { deep: true, workerId: 0 });
+      const blocksGap = r.x === sx + dx * gap && r.y === sy + dy * gap;
+      const sealsEnd = r.x === sx + dx * 4 && r.y === sy + dy * 4;
+      assert.ok(blocksGap || sealsEnd,
+        `方向(${dx},${dy}) gap=${gap} 未封住跳三: (${r.x},${r.y})`);
+      assert.deepEqual(b, before, '跳三安全扫描不得污染棋盘');
+    }
+  }
+});
+
+test('v51: 精确成四启动点覆盖三连且不改变原棋盘', () => {
+  const b = empty();
+  b[idx(3, 7)] = 1;
+  for (const x of [4,5,6]) b[idx(x, 7)] = 2;
+  const before = b.slice();
+  const launches = sandbox.self.GomokuHint.__test__.fourLaunchPoints(b, 2);
+  assert.ok(launches.some((p) => p.x === 7 && p.y === 7), '应识别三连的直接成四点');
+  assert.deepEqual(b, before, '精确成四扫描不得污染棋盘');
+});
+
+test('v51: 棋盘边界三连和己方做棋诱惑都不能绕过防守', () => {
+  const edgeLines = [
+    { stones: [[0,7],[1,7],[2,7]], block: [3,7] },
+    { stones: [[7,0],[7,1],[7,2]], block: [7,3] },
+    { stones: [[0,0],[1,1],[2,2]], block: [3,3] },
+    { stones: [[0,14],[1,13],[2,12]], block: [3,11] },
+  ];
+  for (const { stones, block } of edgeLines) {
+    const b = empty();
+    for (const [x, y] of stones) b[idx(x, y)] = 2;
+    const r = computeBest(b, 1, { deep: true, workerId: 0 });
+    assert.deepEqual([r.x, r.y], block, `边界三连未封堵: (${r.x},${r.y})`);
+  }
+
+  const tempted = empty();
+  tempted[idx(3, 7)] = 1;
+  for (const x of [4,5,6]) tempted[idx(x, 7)] = 2;
+  // (10,5) 可制造己方双三，是旧版最容易被主搜索选中的“做机会”点。
+  for (const [x, y] of [[9,5],[11,5],[10,4],[10,6]]) tempted[idx(x, y)] = 1;
+  const r = computeBest(tempted, 1, { deep: true, workerId: 0 });
+  assert.deepEqual([r.x, r.y], [7,7], `不应去 (10,5) 做棋而放任三连，实际 (${r.x},${r.y})`);
+  assert.equal(r.tactical, 'block-three-threat');
+});
+
 test('v2 识别跳三并优先冲四', () => {
   const b = empty();
   // 黑跳三: X_X 形状 (3,3)(5,3), 落在 (4,3) 即成活三
