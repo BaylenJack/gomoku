@@ -614,9 +614,20 @@
       const mix = (h1 ^ Math.imul(role + (depth - cDepth) * 4 + (onlyThree ? 2 : 0) + (onlyFour ? 1 : 0), 0x9E3779B1)) >>> 0;
       const key = h2 * 2097152 + (mix >>> 11);
       const prev = cache.get(key);
-      if (prev && (Math.abs(prev.value) >= FIVE || prev.depth >= depth - cDepth) &&
-          prev.onlyThree === onlyThree && prev.onlyFour === onlyFour) {
-        return [prev.value, prev.move, [...path, ...prev.path]];
+      // v47.14 TT 边界标记修复: 缓存条目标记 flag(0=精确, 1=剪枝下界)。
+      // 原实现无边界标记 —— fail-high 剪枝(alpha>=beta)时返回的是"最后着法的
+      // 值", 对深度要求低的节点它是下界而非精确值; 被当精确值缓存后, 后续
+      // 更深搜索命中该条目会把乐观值(可能含 LMR 减深误差)当作必胜传播,
+      // 引擎下出"幻觉假杀"(实测 15s 自对弈白第 28 手 (8,4) 声称必胜实为败着,
+      // 幻觉 PV 里黑方已五连仍标白胜)。
+      if (prev && prev.onlyThree === onlyThree && prev.onlyFour === onlyFour) {
+        const enough = prev.depth >= depth - cDepth;
+        // 精确值: FIVE 任意深度可信, 其余需深度足够; 下界: 仅当 >= beta 时
+        // 可直接 fail-high (标准 alpha-beta TT 语义), 否则不采信其值
+        if ((prev.flag !== 1 && (Math.abs(prev.value) >= FIVE || enough)) ||
+            (prev.flag === 1 && prev.value >= beta)) {
+          return [prev.value, prev.move, [...path, ...prev.path]];
+        }
       }
       // v45: 缓存命中(深度够/必胜)的已 early-return; 此处的 prev 不一定命中,
       //   但 TT 里仍可能存着"换变体/换深度没命中"的记录 —— 它的 best.move
@@ -681,6 +692,7 @@
       let move = null;
       let bestPath = path;
       let bestDepth = 0;
+      let didCut = false; // v47.14: 剪枝退出 → 缓存标记下界
 
       // v11.2: 迭代加深 —— 每轮迭代记录"该深度最优", 迭代结束时提交, 更深迭代优先。
       // (v11 回归: 每层每步直接覆盖, 浅层 d=2 的乐观值永远压住深层准确值, 有效深度≈2)
@@ -719,13 +731,15 @@
           //   - 跳过 i < 3 (前 3 个是 killer/ttMove/countermove, 优先级最高)
           //   - 跳过第一个 move (iterBest === -MAX 时尚无 PV)
           //   reduction 表: depth 大、index 大减得深 (Stockfish 风格)
-          //   重搜条件: reduced search 返回 alpha < cv < beta 时
+          //   v47.13 重搜条件: reduced search 返回 cv > alpha (含 fail-high) 且
+          //   r >= 2 时重搜完整窗口 (见下方修复注释)
           let lmrDepth = d;
           let lmrReduced = false;
+          let lmrR = 0;
           if (!onlyThree && !onlyFour && cDepth > 0 && i >= 3 && d >= 4 && iterBest > -MAX) {
-            const r = Math.min(3, Math.max(0, Math.floor((d - 3) * 0.5) - Math.floor((i - 3) * 0.15)));
-            if (r > 0) {
-              lmrDepth = Math.max(cDepth + 1, d - r);
+            lmrR = Math.min(3, Math.max(0, Math.floor((d - 3) * 0.5) - Math.floor((i - 3) * 0.15)));
+            if (lmrR > 0) {
+              lmrDepth = Math.max(cDepth + 1, d - lmrR);
               lmrReduced = true;
             }
           }
@@ -735,8 +749,12 @@
           let [cv, , cp] = helper(evaluator, board, other(role), lmrDepth, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
           cv = -cv;
           evaluator.undo(x, y);
-          // v48 LMR: 如果减深度搜索 "改进但未 cut" (alpha < cv < beta), 重搜完整窗口
-          if (lmrReduced && cv > -MAX && cv < beta && cv > alpha) {
+          // v47.13 LMR 修复: 原条件 (cv < beta) 把 fail-high 排除在重搜外 ——
+          // 减深度搜索的 fail-high 是乐观上界, 3 层减深度可能高估着法 (对手
+          // 深层的防守没被看到), 直接截断会让根层候选错误地 cut, 引擎下出
+          // 深度 9 的"假杀" (根层排序靠后的着法只搜到 d-3)。改为 cv > alpha
+          // 即重搜 (含 fail-high), r >= 2 才重搜 (r=1 误差极小, 省节点)。
+          if (lmrReduced && cv > alpha && lmrR >= 2) {
             evaluator.move(x, y, role);
             let [cv2, , cp2] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
             cv2 = -cv2;
@@ -759,6 +777,7 @@
           alpha = Math.max(alpha, iterBest);
           // v10: Alpha-Beta 剪枝命中 → 记录杀手走法(PentaZen update_killers)
           if (alpha >= beta) {
+            didCut = true; // v47.14: 剪枝退出, 当前 value 是下界非精确值
             if (!killers[cDepth]) killers[cDepth] = [null, null];
             if (killers[cDepth][0] !== x * SIZE + y) {
               killers[cDepth][1] = killers[cDepth][0];
@@ -799,6 +818,7 @@
       }
 
       // v47.4 (回退): PVS 放弃后恢复无条件写缓存 (全窗口搜索的值精确)
+      // v47.14: 剪枝退出(didCut)的值是下界, 标记 flag=1 防被当精确值复用
       if (cache.size < CACHE_MAX && (!prev || prev.depth < depth - cDepth)) {
         cache.set(key, {
           depth: depth - cDepth,
@@ -808,6 +828,7 @@
           // v8: 缓存区分变体 —— VCT/VCF 与常规搜索的缓存不通用(gobang)
           onlyThree,
           onlyFour,
+          flag: didCut ? 1 : 0,
         });
       }
       return [value, move, bestPath];
@@ -855,7 +876,7 @@
     // move/undo 不平衡, 共享 evaluator 会让下一阶段在残留棋子上搜索,
     // 误判假五连/假分数, 结果随超时点漂移(同一棋盘每次不同)。
     const b1 = hasAttack
-      ? { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.35), t0: performance.now(), maxMs: budget.maxMs * 0.35, incOuter }
+      ? { nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.2), t0: performance.now(), maxMs: budget.maxMs * 0.2, incOuter }
       : null;
     let value, move, bestPath;
     if (b1) {
@@ -875,7 +896,12 @@
           vb[idx(move[0], move[1])] = role;
           const ve = createEvaluator(vb);
           ve.init();
-          const vbudget = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 1000, incOuter: null };
+          // v47.13: 验证预算自适应 —— 原固定 1s, 阶段 1 预算从 35% 降到 20% 后
+          // VCT 在预算尾部找到杀时 (杀棋链找到得晚), 固定 1s 验证会把总耗时
+          // 推到 dispatcher 超时线 (15.5s) 之外, 4 个 worker 同时超时 → 请求失败。
+          // 改为吃阶段 1 剩余预算, 地板 150ms (实战杀棋链通常 <200ms 验证完)。
+          const verifyMs = Math.min(1000, Math.max(150, b1.maxMs - (performance.now() - b1.t0)));
+          const vbudget = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: verifyMs, incOuter: null };
           try {
             const [ov, , op] = vct(ve, vb, other(role), 18, 0, [], -MAX, MAX, vbudget, new Map(), move);
             oppVal = ov; oppPathLen = op.length;
@@ -895,10 +921,12 @@
       }
     }
 
-    // 阶段 2: 常规 minmax(预算 40%)
+    // 阶段 2: 常规 minmax(预算 55% —— v47.13 从 40% 上调: 阶段 1 VCT 35% → 20%,
+    // 找不到杀时省下的时间转给深度 12 主战场。实测复杂中盘 40% 下深度 12 常
+    // 跑不完只提交 d=10, 55% 下完成度显著提升, 且找杀/验证不受影响)
     const b2 = {
-      nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.4),
-      t0: performance.now(), maxMs: budget.maxMs * 0.4,
+      nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.55),
+      t0: performance.now(), maxMs: budget.maxMs * 0.55,
       incOuter,
     };
     try {
@@ -910,6 +938,37 @@
     } catch (e) {
       if (e !== BUDGET) throw e;
       budget.stageNodes.s2 = b2.nodes;
+    }
+    // v47.14: 阶段 2 的 FIVE 声称也必须假杀验证 —— 阶段 1 有验证, 阶段 2
+    // (常规 minmax) 的必胜声称此前直接信任。TT 边界污染 (已修复) 与 LMR
+    // 减深残差可能让阶段 2 报出幻觉假杀 (实测白 (8,4) 声称必胜, 黑活三
+    // 3 手反杀更快)。验证逻辑与阶段 1 一致: 落子后查对手 VCT 杀, 对手杀
+    // 链不短于己方 → 假杀, 清掉 best 提交, 落到阶段 3 改堵对手杀棋起点。
+    if (move && value >= FIVE) {
+      let oppVal = 0, oppPathLen = 0, isFake = false;
+      const vb = board.slice();
+      vb[idx(move[0], move[1])] = role;
+      const ve = createEvaluator(vb);
+      ve.init();
+      // 验证预算 ≤400ms: 假杀必被杀链通常是短链(≤5 手), VCT 秒级找到;
+      // 深度杀链由阶段 3 (depth+10) 兜底。预算受总墙钟约束, 防把总耗时
+      // 推出 dispatcher 超时线 (15.5s)。
+      const verifyMs = Math.min(400, Math.max(150, budget.maxMs - (performance.now() - budget.t0)));
+      const vbudget = { nodes: 0, maxNodes: 150000, t0: performance.now(), maxMs: verifyMs, incOuter: null };
+      try {
+        const [ov, , op] = vct(ve, vb, other(role), 18, 0, [], -MAX, MAX, vbudget, new Map(), move);
+        oppVal = ov; oppPathLen = op.length;
+      } catch (e) {
+        if (e !== BUDGET) throw e;
+      }
+      if (oppVal >= FIVE && bestPath.length >= oppPathLen) isFake = true;
+      if (isFake) {
+        if (budget.best && budget.best.move &&
+            budget.best.move[0] === move[0] && budget.best.move[1] === move[1]) {
+          budget.best = null; // 清掉假杀, 防止搜索无果时回退
+        }
+        value = 0; // 强制走阶段 3 防守校验 (改堵对手杀棋起点)
+      }
     }
     if (!move) return null;
 
@@ -923,9 +982,11 @@
     // 单候选 + 全预算: 多候选切片实测预算碎片化, 深杀链在切片内找不到,
     // 验证失真; 单候选拿满预算, 堵杀棋起点本身已是最优防守。
     // v47.2: 无进攻点时阶段 3 预算 45% → 55% (阶段 1 跳过转来), 深杀链验证更充分
+    // v47.13: 无进攻点时阶段 3 预算 55% → 45% (阶段 2 已从 40% 升到 55%,
+    // 防守校验 45% + 阶段 2 的深度优势仍能覆盖长杀链; 三阶段总和回到 100%)
     const b3 = {
-      nodes: 0, maxNodes: Math.floor(budget.maxNodes * (hasAttack ? 0.25 : 0.55)),
-      t0: performance.now(), maxMs: budget.maxMs * (hasAttack ? 0.25 : 0.55),
+      nodes: 0, maxNodes: Math.floor(budget.maxNodes * (hasAttack ? 0.25 : 0.45)),
+      t0: performance.now(), maxMs: budget.maxMs * (hasAttack ? 0.25 : 0.45),
       incOuter,
     };
     if (value < FIVE) {
