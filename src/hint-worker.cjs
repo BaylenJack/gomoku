@@ -11,8 +11,8 @@ const path = require('node:path');
 
 const SEARCH_WORKER_PATH = path.join(__dirname, 'hint-worker-search.cjs');
 const NUM_WORKERS = 4;
-// 引擎从 computeBest 入口最多 9s，dispatcher 留 0.5s 给 IPC 和谈合。
-const WORKER_TIMEOUT_MS = 9500;
+// 引擎从 computeBest 入口最多 7s，dispatcher 留 0.5s 给 IPC 和谈合。
+const WORKER_TIMEOUT_MS = 7500;
 // v47: 独立常量, 避免与 ZB 种子 (0x9E3779B9/0x243F6A88) 撞 —— 同一颗 mulberry32
 //   在不同上下文仍确定, 但分散度依赖种子的'独立性', 独立常量让 worker 抖动
 //   序列不被 ZB 比特模式支配。

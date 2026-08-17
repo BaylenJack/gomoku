@@ -105,7 +105,7 @@ const MIME = {
 
 // ---------- 服务器端 AI 提示引擎 ----------
 // 用 worker_threads 跑引擎(独立线程), 主进程事件循环不被阻塞。
-// 只保留 10 秒深度档，所有提示请求统一走 Lazy SMP。
+// 只保留 8 秒深度档，所有提示请求统一走 Lazy SMP。
 // 特权 token 才允许调用(沿用 HINT_TOKEN / claim 兑换机制)。
 
 import { Worker } from 'node:worker_threads';
@@ -146,7 +146,7 @@ for (let i = 0; i < HINT_WORKER_COUNT; i++) hintWorkers.push(spawnHintWorker());
 
 function requestHint(board, color) {
   return new Promise((resolve, reject) => {
-    // 不排队：只有立即开算才能保证端到端不超过 10 秒。4 路全忙时快速失败，
+    // 不排队：只有立即开算才能保证端到端不超过 8 秒。4 路全忙时快速失败，
     // 避免旧棋盘请求在后台积压并继续吞掉 CPU。
     const entry = hintWorkers.find((w) => !w.busy);
     if (!entry) return reject(new Error('引擎忙, 请稍后再试'));
@@ -254,7 +254,7 @@ const server = http.createServer((req, res) => {
     }
 
     // 服务器端 AI 提示: POST /hint { board, color, token }
-    // 特权 token 校验 → 10 秒深度搜索 → 返回 { x, y, ms, deep: true }
+    // 特权 token 校验 → 8 秒深度搜索 → 返回 { x, y, ms, deep: true }
     if (pathname === '/hint' && req.method === 'POST') {
       handleHint(req, res);
       return;

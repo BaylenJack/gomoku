@@ -27,13 +27,13 @@ test('dispatcher 只保留 Lazy SMP 深度路径', () => {
   assert.doesNotMatch(dispatcher, /msg\.deep|loadEngine|computeBest\(msg\.board/);
 });
 
-test('深度模式固定为 10 层、3000 万节点并受 10 秒端到端窗口约束', () => {
-  assert.match(engine, /v11\.7/);
+test('深度模式固定为 10 层、3000 万节点并受 8 秒端到端窗口约束', () => {
+  assert.match(engine, /v11\.8/);
   assert.match(engine, /const depth = 10;/);
   assert.match(engine, /const nodeBudget = 30000000;/);
-  assert.match(engine, /const timeBudgetMs = 9000;/);
-  assert.match(dispatcher, /const WORKER_TIMEOUT_MS = 9500;/);
-  assert.match(app, /const timeoutMs = 10000;/);
+  assert.match(engine, /const timeBudgetMs = 7000;/);
+  assert.match(dispatcher, /const WORKER_TIMEOUT_MS = 7500;/);
+  assert.match(app, /const timeoutMs = 8000;/);
 });
 
 test('dispatcher 收到不带 deep 的请求仍执行深度搜索', async () => {

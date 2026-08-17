@@ -1,4 +1,4 @@
-// 五子棋提示引擎 v11.7 — 三连深析 / 完整迭代预测 / 3000 万节点 / 深度 10 / 10 秒
+// 五子棋提示引擎 v11.8 — 三连深析 / 完整迭代预测 / 3000 万节点 / 深度 10 / 8 秒
 //
 // 架构来源: https://github.com/lihongxun945/gobang
 //   1. 增量点位评估: 每个空位缓存四方向棋形分数, 落子只更新周围 5 格,
@@ -1190,7 +1190,7 @@
     // 节点与墙钟预算负责在复杂局面中安全截断。
     const depth = 10;
     const nodeBudget = 30000000;
-    const timeBudgetMs = 9000;
+    const timeBudgetMs = 7000;
     const testConfig = opts && opts.__testConfig;
     const effectiveDepth = testConfig && Number.isInteger(testConfig.depth)
       ? Math.max(2, Math.min(depth, testConfig.depth))
@@ -1228,8 +1228,8 @@
         if (board[idx(x, y)] !== EMPTY) { lastMove = [x, y]; break; }
       }
     }
-    // v11.5-tuned: 3000 万节点硬上限；引擎最多占用 9 秒，给 dispatcher、HTTP
-    // 与公网传输预留约 1 秒，保证端到端 10 秒窗口。budget.best 让截断时
+    // v11.8: 3000 万节点硬上限；引擎最多占用 7 秒，给 dispatcher、HTTP
+    // 与公网传输预留约 1 秒，保证端到端 8 秒窗口。budget.best 让截断时
     // 仍返回最后一次完成迭代的结果。
     const budget = {
       nodes: 0,

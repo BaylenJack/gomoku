@@ -758,9 +758,9 @@ function createHintButton() {
 
 let hintRequestSeq = 0;     // 只允许最新棋盘的提示结果落到 UI
 let hintAbort = null;       // 新棋局状态到达时取消旧 HTTP 响应
-// 唯一提示档位: 服务端 10 秒深度搜索。失败时不降级成普通档。
+// 唯一提示档位: 服务端 8 秒深度搜索。失败时不降级成普通档。
 function computeHintAsync(board, color, controller) {
-  const timeoutMs = 10000;
+  const timeoutMs = 8000;
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
