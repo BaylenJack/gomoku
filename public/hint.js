@@ -1,4 +1,4 @@
-// 五子棋提示引擎 v49 — 精确战术层 + MiniMax/Alpha-Beta + VCT/VCF
+// 五子棋提示引擎 v50 — 单一深度档 + 精确战术层 + MiniMax/Alpha-Beta + VCT/VCF
 //
 // 架构来源: https://github.com/lihongxun945/gobang
 //   1. 增量点位评估: 每个空位缓存四方向棋形分数, 落子只更新周围 5 格,
@@ -1718,9 +1718,9 @@ function oppLineBlocks(board, opp, minN = 3) {
     const lastMove = null;
     // 节点上限只作异常保护，实际由墙钟截止；budget.best 保留最后完整迭代。
     const MAX_BUDGET = 1 << 28;
-    // v49: 14.5s 引擎硬预算 + 0.5s IPC/序列化余量，保证公网响应在 15s 内。
+    // v50: 14s 引擎硬预算 + 1s IPC/序列化余量，保证公网响应在 15s 内。
     // 预算从 computeBest 入口计时，前置棋形分析也计入总延迟。
-    const DEEP_BUDGET_MS = 14500;
+    const DEEP_BUDGET_MS = 14000;
     const totalBudgetMs = isDeep ? DEEP_BUDGET_MS : 5000;
     const remainingBudgetMs = Math.max(50, totalBudgetMs - (performance.now() - computeStartedAt));
     const budget = {
@@ -1789,7 +1789,7 @@ function oppLineBlocks(board, opp, minN = 3) {
         nodes: 0,
         maxNodes: (opts && opts.maxNodes) || (isDeep ? MAX_BUDGET : (1 << 22)),
         t0: performance.now(),
-        maxMs: (opts && opts.maxMs) || (isDeep ? 14500 : 5000),
+        maxMs: (opts && opts.maxMs) || (isDeep ? 14000 : 5000),
         visited: null,
         best: null,
       };

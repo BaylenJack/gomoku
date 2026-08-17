@@ -77,10 +77,9 @@ let winAnim = null;     // { start }
 let dpr = 1, cell = 0, pad = 0, boardPx = 0;
 
 // 提示引擎状态
-let hintOn = false;          // 提示开关
+let hintOn = false;          // 深度提示开关
 let hintMark = null;         // { x, y }  本地计算的推荐落点, 仅本地渲染
 let hintHighlightUntil = 0;  // 显示持续到某时刻(给"闪烁"留时间)
-let hintDeep = false;        // 深度模式(长按触发, 常驻直到关闭/落子)
 
 // 计时
 let timerDeadline = null;
@@ -739,122 +738,29 @@ function createHintButton() {
   const btn = document.createElement('button');
   btn.id = 'hintBtn';
   btn.className = 'btn-hint';
-  btn.textContent = '💡 提示';
-  btn.title = '点击: 普通提示(快) · 长按: 深度提示(最强)';
-
-  function setDeepUI(on) {
-    btn.classList.toggle('deep', on);
-    btn.textContent = on ? '🧠 深度 开' : (hintOn ? '💡 提示 开' : '💡 提示');
-  }
-
-  // 长按 600ms → 深度提示; 松开早于 600ms → 普通提示
-  let pressTimer = null;
-  let longPressFired = false;
-  btn.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    longPressFired = false;
-    pressTimer = setTimeout(() => {
-      longPressFired = true;
-      hintDeep = true;
-      hintOn = false;
-      btn.classList.add('deep-press');
-      btn.textContent = '🧠 深度计算中…';
-      showHint(true);
-    }, 600);
-  });
-  btn.addEventListener('pointerup', () => {
-    clearTimeout(pressTimer);
-    if (!longPressFired) {
-      // 单击 → 开关/普通提示
-      if (hintDeep) {
-        // 深度模式开着, 单击关闭
-        resetHint();
-        draw();
-        return;
-      }
-      if (!hintOn) {
-        hintOn = true;
-        btn.classList.add('active');
-        btn.textContent = '💡 提示 开';
-      } else {
-        resetHint();
-        draw();
-        return;
-      }
-      showHint(false);
-    } else {
-      btn.classList.remove('deep-press');
-      // 深度计算成功后由 showHint 设置常驻 UI, 这里只清掉"计算中"临时态
-      if (!hintDeep) setDeepUI(false);
+  btn.textContent = '🧠 深度提示';
+  btn.title = '单击开启或关闭深度提示';
+  btn.addEventListener('click', () => {
+    if (hintOn) {
+      resetHint();
+      draw();
+      return;
     }
-  });
-  btn.addEventListener('pointerleave', () => {
-    clearTimeout(pressTimer);
-    btn.classList.remove('deep-press');
-    if (!longPressFired && !hintDeep && !hintOn) btn.textContent = '💡 提示';
-  });
-  btn.addEventListener('pointercancel', () => {
-    clearTimeout(pressTimer);
-    btn.classList.remove('deep-press');
+    hintOn = true;
+    btn.classList.add('active', 'deep', 'calculating');
+    btn.textContent = '🧠 深度计算中…';
+    showHint();
   });
   row.appendChild(btn);
   document.querySelector('.toolbar').after(row);
   return btn;
 }
 
-// 按需加载提示引擎(只有特权用户才会触发)
-// v9: Web Worker 后台搜索 — 主线程不卡, 预算 3 秒, 深度 8
-let hintWorker = null;
-let hintWorkerBusy = false;
-let hintWorkerQueue = null; // 排队中的请求 { board, color, resolve }
 let hintRequestSeq = 0;     // 只允许最新棋盘的提示结果落到 UI
 let hintAbort = null;       // 新棋局状态到达时取消旧 HTTP 响应
-function loadHintEngine() {
-  return new Promise((resolve, reject) => {
-    if (self.GomokuHint && hintWorker) return resolve();
-    if (!hintWorker) {
-      try {
-        hintWorker = new Worker('/worker.js?v=49');
-        hintWorker.onmessage = (ev) => {
-          hintWorkerBusy = false;
-          const { x, y, error } = ev.data || {};
-          if (hintWorkerQueue) {
-            const q = hintWorkerQueue;
-            hintWorkerQueue = null;
-            if (error) q.reject(new Error(error));
-            else q.resolve({ x, y });
-          }
-        };
-        hintWorker.onerror = () => {
-          hintWorkerBusy = false;
-          if (hintWorkerQueue) {
-            const q = hintWorkerQueue;
-            hintWorkerQueue = null;
-            q.reject(new Error('Worker 错误'));
-          }
-        };
-      } catch {
-        hintWorker = null;
-      }
-    }
-    // 同步引擎(备用, Worker 不可用时回退)
-    if (!hintWorker) {
-      if (self.GomokuHint) return resolve();
-      const s = document.createElement('script');
-      s.src = '/hint.js?v=49';
-      s.onload = () => resolve();
-      s.onerror = () => reject(new Error('引擎加载失败'));
-      document.head.appendChild(s);
-      return;
-    }
-    resolve();
-  });
-}
-
-// 计算最佳落点: 服务器端 AI 优先(3s 普通 / 15s 深度), 失败/超时回退本地 Worker
-function computeHintAsync(board, color, deep, controller) {
-  // 深度请求绝不静默降级成弱本地档；16s 仍无服务端结果就终止本次显示。
-  const timeoutMs = deep ? 16000 : 8000;
+// 唯一提示档位: 服务端 15 秒深度搜索。失败时不降级成普通档。
+function computeHintAsync(board, color, controller) {
+  const timeoutMs = 15000;
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
@@ -866,7 +772,7 @@ function computeHintAsync(board, color, deep, controller) {
     fetch('/hint', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ board, color, token: TOKEN, deep: deep === true }),
+      body: JSON.stringify({ board, color, token: TOKEN }),
       signal: controller.signal,
     })
       .then((resp) => {
@@ -875,35 +781,10 @@ function computeHintAsync(board, color, deep, controller) {
       })
       .then((data) => {
         if (!data.ok || typeof data.x !== 'number' || typeof data.y !== 'number') throw new Error('hint bad');
-        return { x: data.x, y: data.y, server: true, deep: data.deep === true };
+        return { x: data.x, y: data.y };
       }),
     timeout,
-  ])
-    .catch((e) => {
-      if (e && e.name === 'AbortError') throw e;
-      if (deep) throw e;
-      // 回退本地 Worker (断网 / 服务器挂了 / 无权限 / 超时都走这里)
-      return computeHintLocal(board, color).then((r) => ({ ...r, server: false }));
-    })
-    .finally(() => clearTimeout(timer));
-}
-
-// 原本地 Worker 计算逻辑 (兜底)
-function computeHintLocal(board, color) {
-  return new Promise((resolve, reject) => {
-    if (!hintWorker) {
-      // 回退同步
-      try {
-        const r = self.GomokuHint.computeBest(board, color);
-        resolve(r);
-      } catch (e) { reject(e); }
-      return;
-    }
-    if (hintWorkerBusy) { reject(new Error('搜索进行中')); return; }
-    hintWorkerBusy = true;
-    hintWorkerQueue = { resolve, reject };
-    hintWorker.postMessage({ board, color });
-  });
+  ]).finally(() => clearTimeout(timer));
 }
 
 // 重置提示状态(落子/新对局/胜负/关闭时调用)
@@ -913,17 +794,16 @@ function resetHint() {
   hintAbort = null;
   hintMark = null;
   hintHighlightUntil = 0;
-  hintDeep = false;
   hintOn = false;
   const btn = document.getElementById('hintBtn');
   if (btn) {
-    btn.classList.remove('active', 'deep', 'deep-press');
-    btn.textContent = '💡 提示';
+    btn.classList.remove('active', 'deep', 'calculating');
+    btn.textContent = '🧠 深度提示';
   }
 }
 
-// 显示提示: 服务器优先, 本地回退
-async function showHint(deep) {
+// 显示深度提示
+async function showHint() {
   if (!hintEnabled) return;
   if (!state || state.status !== 'playing') {
     toast('对局未开始'); return;
@@ -935,10 +815,7 @@ async function showHint(deep) {
   const boardSnapshot = state.board.slice();
   const colorSnapshot = state.turn;
   try {
-    await loadHintEngine();
-    const { x, y, server, deep: isDeep } = await computeHintAsync(
-      boardSnapshot, colorSnapshot, deep, controller,
-    );
+    const { x, y } = await computeHintAsync(boardSnapshot, colorSnapshot, controller);
     // 搜索期间棋盘可能已经变化。旧结果即使落点现在仍为空，也绝不能覆盖
     // 新棋盘提示；否则就会出现“对方四连了还显示上一回合进攻点”。
     if (requestSeq !== hintRequestSeq || !state || state.turn !== colorSnapshot ||
@@ -946,25 +823,23 @@ async function showHint(deep) {
         state.board.some((v, i) => v !== boardSnapshot[i])) return;
     if (state.board[y * SIZE + x] !== EMPTY) { toast('提示暂不可用'); return; }
     hintMark = { x, y };
-    if (isDeep) {
-      // 深度模式: 提示常驻显示(不自动消失), 按钮切到"深度 开"
-      hintDeep = true;
-      hintHighlightUntil = Infinity;
-      const btn = document.getElementById('hintBtn');
-      if (btn) {
-        btn.classList.remove('deep-press');
-        btn.classList.add('active', 'deep');
-        btn.textContent = '🧠 深度 开';
-      }
-    } else {
-      hintHighlightUntil = performance.now() + 8000;
+    hintHighlightUntil = Infinity;
+    const btn = document.getElementById('hintBtn');
+    if (btn) {
+      btn.classList.remove('calculating');
+      btn.classList.add('active', 'deep');
+      btn.textContent = '🧠 深度 开';
     }
-    const tag = server ? (isDeep ? '🧠 深度' : '🤖 普通') : '📱 本地';
-    toast(`${tag} 建议 (${x + 1}, ${y + 1})`, 2500);
+    toast(`🧠 深度建议 (${x + 1}, ${y + 1})`, 2500);
     draw();
     loop();
   } catch (e) {
     if (requestSeq !== hintRequestSeq || (e && e.name === 'AbortError')) return;
+    const btn = document.getElementById('hintBtn');
+    if (btn) {
+      btn.classList.remove('calculating');
+      btn.textContent = '🧠 深度 开';
+    }
     toast('提示引擎不可用');
   } finally {
     if (requestSeq === hintRequestSeq) hintAbort = null;
@@ -973,10 +848,13 @@ async function showHint(deep) {
 
 // 每次 state 更新后, 若提示开着则自动刷新
 function autoRefreshHint() {
-  // 提示开着才自动刷新(落子后)
-  if (!hintEnabled || !(hintOn || hintDeep) || !state || state.status !== 'playing') return;
-  // 深度模式: 每次落子自动重新深算(常驻, 不重置按钮)
-  showHint(hintDeep);
+  if (!hintEnabled || !hintOn || !state || state.status !== 'playing') return;
+  const btn = document.getElementById('hintBtn');
+  if (btn) {
+    btn.classList.add('calculating');
+    btn.textContent = '🧠 深度计算中…';
+  }
+  showHint();
 }
 
 // ================= 表情 =================

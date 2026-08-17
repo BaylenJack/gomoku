@@ -1,0 +1,50 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { Worker } from 'node:worker_threads';
+
+const app = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+const dispatcher = fs.readFileSync(new URL('../src/hint-worker.cjs', import.meta.url), 'utf8');
+
+test('提示按钮单击直接启动唯一的深度模式', () => {
+  assert.match(app, /btn\.addEventListener\('click'/);
+  assert.match(app, /JSON\.stringify\(\{ board, color, token: TOKEN \}\)/);
+  assert.doesNotMatch(app, /pointerdown|pointerup|longPressFired|hintDeep/);
+  assert.doesNotMatch(app, /普通提示|🤖 普通|computeHintLocal|hintWorker/);
+});
+
+test('服务端忽略客户端档位并固定返回深度结果', () => {
+  assert.match(server, /requestHint\(board, color\)/);
+  assert.match(server, /deep: true/);
+  assert.doesNotMatch(server, /body\.deep/);
+});
+
+test('dispatcher 只保留 Lazy SMP 深度路径', () => {
+  assert.match(dispatcher, /w\.postMessage\(\{ id: msg\.id, board: msg\.board, color: msg\.color, deep: true \}\)/);
+  assert.doesNotMatch(dispatcher, /msg\.deep|loadEngine|computeBest\(msg\.board/);
+});
+
+test('dispatcher 收到不带 deep 的请求仍执行深度搜索', async () => {
+  const worker = new Worker(new URL('../src/hint-worker.cjs', import.meta.url), {
+    workerData: { publicDir: path.resolve('public') },
+  });
+  const board = new Array(225).fill(0);
+  for (let x = 3; x < 7; x++) board[7 * 15 + x] = 1;
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('dispatcher 测试超时')), 20000);
+      worker.once('error', reject);
+      worker.once('message', (message) => {
+        clearTimeout(timer);
+        resolve(message);
+      });
+      worker.postMessage({ id: 'deep-only-test', board, color: 1 });
+    });
+    assert.equal(result.deep, true);
+    assert.ok((result.x === 2 || result.x === 7) && result.y === 7);
+  } finally {
+    await worker.terminate();
+  }
+});

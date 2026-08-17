@@ -105,25 +105,24 @@ const MIME = {
 
 // ---------- 服务器端 AI 提示引擎 ----------
 // 用 worker_threads 跑引擎(独立线程), 主进程事件循环不被阻塞。
-// 普通版: 3s/100万节点; 深度版: 15s/1000万节点(deep:true 时)。
+// 只保留 15 秒深度档，所有提示请求统一走 Lazy SMP。
 // 特权 token 才允许调用(沿用 HINT_TOKEN / claim 兑换机制)。
 
 import { Worker } from 'node:worker_threads';
 
-const HINT_WORKER_COUNT = 4; // 4 个 worker 分担并发; 深度档单请求 5-15s, 太少会积压
-const QUEUE_TIMEOUT_MS = 40000; // 深度档最长 30s, 排队超过 40s 直接放弃(返回"引擎忙")—— 排队几分钟的响应早已过时
-const hintWorkers = []; // { worker, busy, queue }
+const HINT_WORKER_COUNT = 4; // 4 个 dispatcher 分担并发; 每个深度请求内部用 4 路 Lazy SMP
+const hintWorkers = []; // { worker, busy, current }
 
 function spawnHintWorker() {
   const worker = new Worker(new URL('./hint-worker.cjs', import.meta.url), {
     workerData: { publicDir: PUBLIC_DIR },
   });
-  const entry = { worker, busy: false, queue: [] };
+  const entry = { worker, busy: false, current: null };
   worker.on('message', (m) => {
-    const q = entry.queue.shift();
+    const q = entry.current;
+    entry.current = null;
     entry.busy = false;
-    if (q) { clearTimeout(q.timer); q.resolve(m); }
-    else processHintQueue(entry);
+    if (q) q.resolve(m);
   });
   worker.on('error', (e) => respawnHintWorker(entry, `错误: ${e.message}`));
   worker.on('exit', (code) => respawnHintWorker(entry, code === 0 ? '正常退出' : `异常退出 code=${code}`));
@@ -135,8 +134,8 @@ function spawnHintWorker() {
 // 崩 2 次后 /hint 全部 500)
 function respawnHintWorker(entry, reason) {
   console.error(`[hint] worker ${reason}: 重建中`);
-  for (const q of entry.queue) { clearTimeout(q.timer); q.reject(new Error('引擎不可用')); }
-  entry.queue = [];
+  if (entry.current) entry.current.reject(new Error('引擎不可用'));
+  entry.current = null;
   const i = hintWorkers.indexOf(entry);
   if (i < 0) return; // 已处理过(error 与 exit 可能先后触发)
   hintWorkers.splice(i, 1);
@@ -145,30 +144,22 @@ function respawnHintWorker(entry, reason) {
 
 for (let i = 0; i < HINT_WORKER_COUNT; i++) hintWorkers.push(spawnHintWorker());
 
-function processHintQueue(entry) {
-  if (entry.busy || entry.queue.length === 0) return;
-  const q = entry.queue[0];
-  entry.busy = true;
-  entry.worker.postMessage({ id: q.id, board: q.board, color: q.color, deep: q.deep });
-}
-
-function requestHint(board, color, deep) {
+function requestHint(board, color) {
   return new Promise((resolve, reject) => {
-    // 深度请求优先找空闲的 worker; 否则轮询第一个
-    const entry = hintWorkers.find((w) => !w.busy && w.queue.length === 0) || hintWorkers[0];
-    if (!entry) return reject(new Error('引擎暂不可用,请稍后重试'));
+    // 不排队：只有立即开算才能保证端到端不超过 15 秒。4 路全忙时快速失败，
+    // 避免旧棋盘请求在后台积压并继续吞掉 CPU。
+    const entry = hintWorkers.find((w) => !w.busy);
+    if (!entry) return reject(new Error('引擎忙, 请稍后再试'));
     const id = Math.random().toString(36).slice(2);
-    const q = { id, board, color, deep, resolve, reject, timer: null };
-    // 排队看门狗: 积压太久响应早已过时, 放弃比无限等更有用
-    q.timer = setTimeout(() => {
-      const i = entry.queue.indexOf(q);
-      if (i < 0) return; // 已被 worker 取走, 正常处理中
-      entry.queue.splice(i, 1);
-      console.log(`[hint] 排队超时: id=${id} 放弃 (队列还有 ${entry.queue.length} 个)`);
-      reject(new Error('引擎忙, 请稍后再试'));
-    }, QUEUE_TIMEOUT_MS);
-    entry.queue.push(q);
-    processHintQueue(entry);
+    entry.busy = true;
+    entry.current = { id, resolve, reject };
+    try {
+      entry.worker.postMessage({ id, board, color });
+    } catch (e) {
+      entry.busy = false;
+      entry.current = null;
+      reject(e);
+    }
   });
 }
 
@@ -212,33 +203,28 @@ function handleHint(req, res) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: '参数不合法' }));
       }
-      const deep = body.deep === true;
       const sig = hintBoardSig(board);
       // v11.2: /hint 请求日志 —— 之前完全无日志, 问题再发生无从追溯
-      console.log(`[hint] 请求: token=${token.slice(0, 8)}… color=${color} deep=${deep} ${sig}`);
+      console.log(`[hint] 深度请求: token=${token.slice(0, 8)}… color=${color} ${sig}`);
       const t0 = Date.now();
-      requestHint(board, color, deep)
+      requestHint(board, color)
         .then((r) => {
           const ms = Date.now() - t0;
-          console.log(`[hint] 完成: ${sig} deep=${deep} ms=${ms} → ${
+          console.log(`[hint] 深度完成: ${sig} ms=${ms} → ${
             r.error ? '错误: ' + r.error : `(${r.x},${r.y})`}`);
           if (r.error) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok: false, error: r.error }));
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          // v47: 把 votes / incomplete 透传给前端 —— 深度档可能 winners<4
-          //   (谈合结果基于部分 worker), incomplete=true 时调用方可降级信任
-          // v47.3 修复: 原 264196c 误留两行 writeHead —— 第二次抛
-          //   ERR_HTTP_HEADERS_SENT, worker 算完但响应发不出去, 前端 fetch
-          //   失败回退本地普通档 → 深度模式永不常驻 (用户"深度不能长驻")。
-          const payload = { ok: true, x: r.x, y: r.y, ms, deep };
+          // 把 votes / incomplete 透传给前端；部分 worker 超时时仍可使用谈合结果。
+          const payload = { ok: true, x: r.x, y: r.y, ms, deep: true };
           if (r.votes !== undefined) payload.votes = r.votes;
           if (r.incomplete !== undefined) payload.incomplete = r.incomplete;
           res.end(JSON.stringify(payload));
         })
         .catch((e) => {
-          console.log(`[hint] 失败: ${sig} deep=${deep} 错误: ${e.message}`);
+          console.log(`[hint] 深度失败: ${sig} 错误: ${e.message}`);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: '计算失败: ' + e.message }));
         });
@@ -263,7 +249,7 @@ const server = http.createServer((req, res) => {
     }
 
     // 服务器端 AI 提示: POST /hint { board, color, token }
-    // 特权 token 校验 → vm 沙箱跑引擎(预算 3s/100万节点) → 返回 { x, y, ms }
+    // 特权 token 校验 → 15 秒深度搜索 → 返回 { x, y, ms, deep: true }
     if (pathname === '/hint' && req.method === 'POST') {
       handleHint(req, res);
       return;

@@ -315,7 +315,7 @@ body { display: flex; flex-direction: column; align-items: center;
 .btn-hint:hover { color: var(--gold); border-color: rgba(216, 166, 87, .5); background: rgba(216,166,87,.06); }
 .btn-hint.active { color: var(--gold); border-style: solid; border-color: rgba(216, 166, 87, .5); }
 
-/* 深度模式: 紫色强调 */
+/* 深度提示: 紫色强调 */
 .btn-hint.deep {
   color: #c084fc;
   border-style: solid;
@@ -323,7 +323,7 @@ body { display: flex; flex-direction: column; align-items: center;
   background: rgba(168, 85, 247, .08);
 }
 .btn-hint.deep:hover { color: #c084fc; border-color: rgba(168, 85, 247, .8); }
-.btn-hint.deep-press {
+.btn-hint.calculating {
   color: #c084fc !important;
   border-color: rgba(168, 85, 247, .8) !important;
   background: rgba(168, 85, 247, .12) !important;

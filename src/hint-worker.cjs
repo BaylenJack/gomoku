@@ -1,63 +1,22 @@
-// 五子棋 AI 提示 worker — 在独立线程跑引擎, 不阻塞主进程事件循环
-// 主进程把棋盘发进来, 算完把落点发回。支持普通(5s) / 深度(3.5s wall clock) 两档预算。
-// v47 Lazy SMP: 深度档 (msg.deep=true) 用 4 search worker 的 warm pool 并行
+// 五子棋 AI 深度提示 dispatcher — 在独立线程跑引擎, 不阻塞主进程事件循环。
+// 所有请求统一用 4 search worker 的 warm pool 并行
 //   (跨请求复用, 避免每次 new Worker 的 VM 编译开销), 不同 jitterSeed 让走法
 //   顺序分散, pickBest 选全局最优 (必胜 > value 降序 > path 短 > workerId 小)。
-//   普通档保持单 worker 路径不变。
 
 'use strict';
 
 const { parentPort, workerData, Worker } = require('node:worker_threads');
 const { pickBest } = require('./lazy-smp-protocol.cjs');
-const vm = require('node:vm');
-const fs = require('node:fs');
 const path = require('node:path');
 
-const HINT_PATH = path.join(workerData.publicDir, 'hint.js');
 const SEARCH_WORKER_PATH = path.join(__dirname, 'hint-worker-search.cjs');
 const NUM_WORKERS = 4;
-// v49: 引擎从 computeBest 入口起算 14.5s，dispatcher 留 0.5s 给 IPC 和谈合，
-// 确保单次深度提示在 15s 内结束。
-const WORKER_TIMEOUT_MS = 15000;
+// 引擎从 computeBest 入口起算 14s，dispatcher 再留 0.5s 给 IPC 和谈合。
+const WORKER_TIMEOUT_MS = 14500;
 // v47: 独立常量, 避免与 ZB 种子 (0x9E3779B9/0x243F6A88) 撞 —— 同一颗 mulberry32
 //   在不同上下文仍确定, 但分散度依赖种子的'独立性', 独立常量让 worker 抖动
 //   序列不被 ZB 比特模式支配。
 const BASE_SEED = 0x85EBCA77;
-
-// v45: 引擎模块缓存(单实例) —— 编译一次, 后续请求复用。
-// 原"两档分别缓存"是因为深度档通过字符串替换升级预算才需要两套实例;
-// 现在 opts.deep 在引擎内部原生支持, 一份引擎模块就够, 减少 VM 内存占用。
-let cachedEngine = null;
-function loadEngine() {
-  if (cachedEngine) return cachedEngine;
-  let src;
-  try {
-    src = fs.readFileSync(HINT_PATH, 'utf8');
-  } catch (e) {
-    return { error: '引擎文件读取失败: ' + e.message };
-  }
-  const sandbox = {
-    module: { exports: {} },
-    exports: {},
-    global: {},
-    self: undefined,
-    performance: { now: () => Date.now() },
-    console,
-  };
-  sandbox.globalThis = sandbox;
-  try {
-    vm.createContext(sandbox);
-    vm.runInContext(src, sandbox, { timeout: 30000 });
-    const mod = sandbox.module.exports;
-    if (!mod || typeof mod.computeBest !== 'function') {
-      return { error: '引擎加载异常' };
-    }
-    cachedEngine = mod;
-    return mod;
-  } catch (e) {
-    return { error: '引擎编译失败: ' + e.message };
-  }
-}
 
 // v47: warm pool —— 4 个 search worker 跨请求复用。
 //   旧实现每次 deep 请求都 new 4 个 worker (加载 + 编译 VM + 启动 ~50-200ms/个),
@@ -111,11 +70,9 @@ function rebuildDeadWorkers() {
 
 parentPort.on('message', async (msg) => {
   const stones = msg.board ? msg.board.filter((c) => c !== 0).length : -1;
-  const deep = msg.deep === true;
-  console.log(`[hint] 开始: id=${msg.id} deep=${deep} 棋子=${stones}`);
+  console.log(`[hint] 深度开始: id=${msg.id} 棋子=${stones}`);
 
-  if (deep) {
-    // v47: warm pool 维护 —— 请求前重建缺失的 worker, 不重建当前 in-flight
+    // warm pool 维护 —— 请求前重建缺失的 worker, 不重建当前 in-flight
     //   中已死亡的 worker (避免与已发的 postMessage 冲突, 反正结果由 error
     //   占位即可)。
     rebuildDeadWorkers();
@@ -206,30 +163,4 @@ parentPort.on('message', async (msg) => {
       votes: winners,
       incomplete,
     });
-    return;
-  }
-
-  const engine = loadEngine();
-  if (engine.error) {
-    console.log(`[hint] 失败: id=${msg.id} ${engine.error}`);
-    parentPort.postMessage({ id: msg.id, error: engine.error });
-    return;
-  }
-  const t0 = Date.now();
-  let r;
-  try {
-    r = engine.computeBest(msg.board, msg.color, undefined);
-  } catch (e) {
-    console.log(`[hint] 失败: id=${msg.id} 计算失败: ${e.message}`);
-    parentPort.postMessage({ id: msg.id, error: '计算失败: ' + e.message });
-    return;
-  }
-  console.log(`[hint] 结束: id=${msg.id} ms=${Date.now() - t0} → (${r.x},${r.y})`);
-  parentPort.postMessage({
-    id: msg.id,
-    x: r.x,
-    y: r.y,
-    ms: Date.now() - t0,
-    deep,
-  });
 });
