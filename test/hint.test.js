@@ -44,6 +44,47 @@ test('对手活四必堵', () => {
   assert.ok(r.y === 4 || r.y === 9, `应堵活四端点, 实际 y=${r.y}`);
 });
 
+test('v49: 四个方向、所有缺口形态的四连都绝对优先封堵', () => {
+  const directions = [[1,0],[0,1],[1,1],[1,-1]];
+  for (const [dx, dy] of directions) {
+    for (let gap = 0; gap < 5; gap++) {
+      const b = empty();
+      const sx = 5, sy = dy < 0 ? 9 : 5;
+      for (let t = 0; t < 5; t++) {
+        if (t !== gap) b[idx(sx + dx * t, sy + dy * t)] = 2;
+      }
+      // 连续四位于五格窗口端部时，封死另一端，确保唯一必堵点就是 gap。
+      if (gap === 0) b[idx(sx + dx * 5, sy + dy * 5)] = 1;
+      if (gap === 4) b[idx(sx - dx, sy - dy)] = 1;
+      const before = b.slice();
+      for (const deep of [false, true]) {
+        const r = computeBest(b, 1, { deep, workerId: 0 });
+        assert.deepEqual([r.x, r.y], [sx + dx * gap, sy + dy * gap],
+          `方向(${dx},${dy}) gap=${gap} deep=${deep} 漏堵: (${r.x},${r.y})`);
+        assert.deepEqual(b, before, '战术扫描不得污染棋盘');
+      }
+    }
+  }
+});
+
+test('v49: 精确两手求解器既会反先，也会封住对手启动点', () => {
+  // 双方各有横向活三；轮到黑，黑先延伸成活四即可保证下一手成五，不能盲堵白。
+  const race = empty();
+  for (const x of [4,5,6]) race[idx(x, 5)] = 1;
+  for (const x of [8,9,10]) race[idx(x, 9)] = 2;
+  const attack = computeBest(race, 1, { deep: true, workerId: 0 });
+  assert.equal(attack.y, 5, `应在己方活三线上反先，实际 (${attack.x},${attack.y})`);
+  assert.ok(attack.x === 3 || attack.x === 7);
+
+  // 黑没有可证明反先时，必须占住白活三的一个启动点。
+  const defend = empty();
+  for (const x of [6,7,8]) defend[idx(x, 7)] = 2;
+  defend[idx(2, 2)] = 1; defend[idx(3, 3)] = 1;
+  const block = computeBest(defend, 1, { deep: true, workerId: 0 });
+  assert.equal(block.y, 7, `应封白方两手必胜启动点，实际 (${block.x},${block.y})`);
+  assert.ok(block.x === 5 || block.x === 9);
+});
+
 test('v2 识别跳三并优先冲四', () => {
   const b = empty();
   // 黑跳三: X_X 形状 (3,3)(5,3), 落在 (4,3) 即成活三

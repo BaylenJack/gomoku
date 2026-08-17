@@ -755,6 +755,8 @@ function createHintButton() {
     longPressFired = false;
     pressTimer = setTimeout(() => {
       longPressFired = true;
+      hintDeep = true;
+      hintOn = false;
       btn.classList.add('deep-press');
       btn.textContent = '🧠 深度计算中…';
       showHint(true);
@@ -766,12 +768,7 @@ function createHintButton() {
       // 单击 → 开关/普通提示
       if (hintDeep) {
         // 深度模式开着, 单击关闭
-        hintDeep = false;
-        hintOn = false;
-        btn.classList.remove('active');
-        setDeepUI(false);
-        hintMark = null;
-        hintHighlightUntil = 0;
+        resetHint();
         draw();
         return;
       }
@@ -780,11 +777,7 @@ function createHintButton() {
         btn.classList.add('active');
         btn.textContent = '💡 提示 开';
       } else {
-        hintOn = false;
-        btn.classList.remove('active');
-        btn.textContent = '💡 提示';
-        hintMark = null;
-        hintHighlightUntil = 0;
+        resetHint();
         draw();
         return;
       }
@@ -814,12 +807,14 @@ function createHintButton() {
 let hintWorker = null;
 let hintWorkerBusy = false;
 let hintWorkerQueue = null; // 排队中的请求 { board, color, resolve }
+let hintRequestSeq = 0;     // 只允许最新棋盘的提示结果落到 UI
+let hintAbort = null;       // 新棋局状态到达时取消旧 HTTP 响应
 function loadHintEngine() {
   return new Promise((resolve, reject) => {
     if (self.GomokuHint && hintWorker) return resolve();
     if (!hintWorker) {
       try {
-        hintWorker = new Worker('/worker.js');
+        hintWorker = new Worker('/worker.js?v=49');
         hintWorker.onmessage = (ev) => {
           hintWorkerBusy = false;
           const { x, y, error } = ev.data || {};
@@ -846,7 +841,7 @@ function loadHintEngine() {
     if (!hintWorker) {
       if (self.GomokuHint) return resolve();
       const s = document.createElement('script');
-      s.src = '/hint.js?v=12';
+      s.src = '/hint.js?v=49';
       s.onload = () => resolve();
       s.onerror = () => reject(new Error('引擎加载失败'));
       document.head.appendChild(s);
@@ -857,15 +852,22 @@ function loadHintEngine() {
 }
 
 // 计算最佳落点: 服务器端 AI 优先(3s 普通 / 15s 深度), 失败/超时回退本地 Worker
-function computeHintAsync(board, color, deep) {
-  // 超时: 普通 8s, 深度 30s → 回退本地
-  const timeoutMs = deep ? 30000 : 8000;
-  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('hint timeout')), timeoutMs));
+function computeHintAsync(board, color, deep, controller) {
+  // 深度请求绝不静默降级成弱本地档；16s 仍无服务端结果就终止本次显示。
+  const timeoutMs = deep ? 16000 : 8000;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error('hint timeout'));
+      controller.abort();
+    }, timeoutMs);
+  });
   return Promise.race([
     fetch('/hint', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ board, color, token: TOKEN, deep: deep === true }),
+      signal: controller.signal,
     })
       .then((resp) => {
         if (!resp.ok) throw new Error('hint ' + resp.status);
@@ -878,9 +880,12 @@ function computeHintAsync(board, color, deep) {
     timeout,
   ])
     .catch((e) => {
+      if (e && e.name === 'AbortError') throw e;
+      if (deep) throw e;
       // 回退本地 Worker (断网 / 服务器挂了 / 无权限 / 超时都走这里)
       return computeHintLocal(board, color).then((r) => ({ ...r, server: false }));
-    });
+    })
+    .finally(() => clearTimeout(timer));
 }
 
 // 原本地 Worker 计算逻辑 (兜底)
@@ -903,6 +908,9 @@ function computeHintLocal(board, color) {
 
 // 重置提示状态(落子/新对局/胜负/关闭时调用)
 function resetHint() {
+  hintRequestSeq++;
+  if (hintAbort) hintAbort.abort();
+  hintAbort = null;
   hintMark = null;
   hintHighlightUntil = 0;
   hintDeep = false;
@@ -920,9 +928,22 @@ async function showHint(deep) {
   if (!state || state.status !== 'playing') {
     toast('对局未开始'); return;
   }
+  const requestSeq = ++hintRequestSeq;
+  if (hintAbort) hintAbort.abort();
+  const controller = new AbortController();
+  hintAbort = controller;
+  const boardSnapshot = state.board.slice();
+  const colorSnapshot = state.turn;
   try {
     await loadHintEngine();
-    const { x, y, server, deep: isDeep } = await computeHintAsync(state.board, state.turn, deep);
+    const { x, y, server, deep: isDeep } = await computeHintAsync(
+      boardSnapshot, colorSnapshot, deep, controller,
+    );
+    // 搜索期间棋盘可能已经变化。旧结果即使落点现在仍为空，也绝不能覆盖
+    // 新棋盘提示；否则就会出现“对方四连了还显示上一回合进攻点”。
+    if (requestSeq !== hintRequestSeq || !state || state.turn !== colorSnapshot ||
+        state.board.length !== boardSnapshot.length ||
+        state.board.some((v, i) => v !== boardSnapshot[i])) return;
     if (state.board[y * SIZE + x] !== EMPTY) { toast('提示暂不可用'); return; }
     hintMark = { x, y };
     if (isDeep) {
@@ -942,8 +963,11 @@ async function showHint(deep) {
     toast(`${tag} 建议 (${x + 1}, ${y + 1})`, 2500);
     draw();
     loop();
-  } catch {
+  } catch (e) {
+    if (requestSeq !== hintRequestSeq || (e && e.name === 'AbortError')) return;
     toast('提示引擎不可用');
+  } finally {
+    if (requestSeq === hintRequestSeq) hintAbort = null;
   }
 }
 

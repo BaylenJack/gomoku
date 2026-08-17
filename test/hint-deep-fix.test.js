@@ -17,16 +17,8 @@ const E = 0, BLACK = 1, WHITE = 2;
 const idx = (x, y) => y * 15 + x;
 const empty = () => new Array(225).fill(E);
 
-// 快速深档: 预算 800ms/20万节点版 (逻辑完全一致, 只缩预算 —— runWithBudget
-// 深档默认 2^28 无上限, 防守 VCT 在无杀局面会跑很久, 测试必须限预算)
-const fastCode = code
-  .replace(/maxNodes: isDeep \? MAX_BUDGET : \(1 << 22\),/g, 'maxNodes: isDeep ? 200000 : (1 << 22),')
-  .replace(/maxMs: isDeep \? MAX_BUDGET : 5000,/g, 'maxMs: isDeep ? 800 : 5000,')
-  .replace('const DEEP_BUDGET_MS = 15000;', 'const DEEP_BUDGET_MS = 800;')
-  .replace(/\? 12/g, '? 8'); // fast 变体深度 12→8 (800ms 跑不动 12/10 层)
-const fsb = { self: {}, performance: { now: () => Date.now() } };
-vm.runInNewContext(fastCode, fsb);
-const fastTest = fsb.self.GomokuHint.__test__;
+const fastTest = __test__;
+const fastOpts = { deep: true, maxMs: 800, maxNodes: 200000, depth: 8 };
 
 test('FIX1: 防守局面阶段1跳过 (stage1.nodes===0), 预算转给阶段3', () => {
   // 局面: 黑有双活二结构 (无活三), 白无任何活三+/冲四+ → 白方无杀, 阶段1应跳过
@@ -36,7 +28,7 @@ test('FIX1: 防守局面阶段1跳过 (stage1.nodes===0), 预算转给阶段3', 
   b[idx(5, 5)] = 2; b[idx(6, 6)] = 2;
   // 白干扰子: 无任何三连结构
   b[idx(0, 0)] = 1; b[idx(1, 1)] = 1;
-  const r = fastTest.runWithBudget(b, 1, { deep: true });
+  const r = fastTest.runWithBudget(b, 1, fastOpts);
   assert.ok(r.stageNodes, 'runWithBudget 应返回 stageNodes');
   assert.equal(r.stageNodes.s1, 0, `防守局面阶段1应跳过, 实际 nodes=${r.stageNodes.s1}`);
   assert.ok(r.stageNodes.s3 > 0, `阶段3应获得预算, 实际 nodes=${r.stageNodes.s3}`);
@@ -47,7 +39,7 @@ test('FIX1: 进攻局面 (己方有活三) 阶段1仍执行', () => {
   // 白活三 (4,7)(5,7)(6,7) — 白有杀可找
   b[idx(4, 7)] = 2; b[idx(5, 7)] = 2; b[idx(6, 7)] = 2;
   b[idx(0, 0)] = 1;
-  const r = fastTest.runWithBudget(b, 2, { deep: true });
+  const r = fastTest.runWithBudget(b, 2, fastOpts);
   assert.ok(r.stageNodes.s1 > 0, `进攻局面阶段1应执行, 实际 nodes=${r.stageNodes.s1}`);
 });
 
@@ -57,7 +49,7 @@ test('v48.1: 预算截断返回最后完成的迭代深度, 不保留浅层最�
     [7,7,1],[8,7,1],[6,6,1],[9,9,1],[5,8,1],[9,6,1],
     [7,6,2],[8,8,2],[6,7,2],[5,5,2],[8,5,2],[10,8,2],
   ]) b[idx(x, y)] = c;
-  const r = fastTest.runWithBudget(b, 1, { deep: true });
+  const r = fastTest.runWithBudget(b, 1, fastOpts);
   assert.ok(r.best, '应至少完成一轮搜索');
   assert.equal(typeof r.best.completedDepth, 'number', 'best 应记录真实完成的迭代深度');
   assert.ok(r.best.completedDepth >= 2);

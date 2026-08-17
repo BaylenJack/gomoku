@@ -1,7 +1,7 @@
 // 五子棋 AI 搜索 Worker — 后台线程跑搜索, 主线程不卡
 // 接收: { board, color }  返回: { x, y, ms }
 // 通过 importScripts 加载引擎(浏览器 Worker 里无 module, UMD 正确绑定 self.GomokuHint)
-importScripts('/hint.js');
+importScripts('/hint.js?v=49');
 self.onmessage = (e) => {
   const { board, color } = e.data || {};
   if (!board || !color || typeof self.GomokuHint === 'undefined') {

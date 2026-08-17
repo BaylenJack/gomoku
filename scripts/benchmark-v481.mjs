@@ -10,7 +10,7 @@ const SIZE = 15;
 const idx = (x, y) => y * SIZE + x;
 
 function load(source) {
-  source = source.replace(/const DEEP_BUDGET_MS = 15000;/g, `const DEEP_BUDGET_MS = ${nodeBudget ? 60000 : budgetMs};`);
+  source = source.replace(/const DEEP_BUDGET_MS = \d+;/g, `const DEEP_BUDGET_MS = ${nodeBudget ? 60000 : budgetMs};`);
   if (nodeBudget) {
     source = source.replace(/maxNodes: isDeep \? MAX_BUDGET : \(1 << 22\),/g,
       `maxNodes: isDeep ? ${nodeBudget} : (1 << 22),`);
@@ -39,7 +39,7 @@ const current = load(fs.readFileSync(new URL('../public/hint.js', import.meta.ur
 for (const [name, color, stones] of positions) {
   const b = board(stones);
   const row = [];
-  for (const [label, engine] of [['HEAD', baseline], ['v48.1', current]]) {
+  for (const [label, engine] of [['HEAD', baseline], ['current', current]]) {
     const t0 = performance.now();
     const result = engine.computeBest(b.slice(), color, { deep: true, workerId: 0 });
     row.push(`${label} ${(performance.now() - t0).toFixed(0)}ms (${result.x},${result.y}) v=${result.value ?? '-'} pv=${result.path?.length ?? '-'}`);
@@ -88,8 +88,8 @@ if (process.argv.includes('--battle')) {
       const currentBlack = side === 0;
       const result = play(currentBlack ? current : baseline, currentBlack ? baseline : current, openings[openingIndex]);
       const winner = result.winner === 0 ? '和棋' :
-        ((result.winner === 1) === currentBlack ? 'v48.1' : 'HEAD');
-      console.log(`对局${game}/开局${openingIndex + 1}: v48.1${currentBlack ? '执黑' : '执白'}，${winner}胜，${result.plies}手`);
+        ((result.winner === 1) === currentBlack ? 'current' : 'HEAD');
+      console.log(`对局${game}/开局${openingIndex + 1}: current${currentBlack ? '执黑' : '执白'}，${winner}胜，${result.plies}手`);
     }
   }
 }

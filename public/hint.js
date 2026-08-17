@@ -1,4 +1,4 @@
-// 五子棋提示引擎 v6 — 借鉴 gobang (lihongxun945) 的 MiniMax + Alpha-Beta + VCT/VCF
+// 五子棋提示引擎 v49 — 精确战术层 + MiniMax/Alpha-Beta + VCT/VCF
 //
 // 架构来源: https://github.com/lihongxun945/gobang
 //   1. 增量点位评估: 每个空位缓存四方向棋形分数, 落子只更新周围 5 格,
@@ -613,7 +613,7 @@
       if (cDepth >= depth) {
         return [evaluator.evaluate(role), null, path];
       }
-      // Razoring: 深度浅 + 静态评估远低于 alpha → 直接截断
+      // Razoring 仅用于常规搜索最后两层；根节点的精确强制防守不经过这里。
       if (!onlyThree && !onlyFour && cDepth >= depth - 2 && depth - cDepth <= 2) {
         const staticScore = evaluator.evaluate(role);
         if (staticScore + 45 * (depth - cDepth) <= alpha) {
@@ -707,23 +707,8 @@
         //   原 v45.1 TODO 中提到的 "测试套件过 60/62 但基准对战强度下降" 问题,
         //   通过保守的 reduction 表 (max 3) + fail-low 重搜 + 跳过 VCT/VCF/PV/前 3
         //   等多重保护规避。
-        // v48 NMP (Null Move Pruning) —— 模拟 "跳过一手": 用减深度搜索
-        //   (d - 3) 看对手能否 beat beta, 不能则当前位置必胜/必不败, 直接截断。
-        //   安全性: gomoku 没有 zugzwang (永远能走子), NMP 比 chess 更安全;
-        //   - 跳过 PV/VCT/VCF 节点
-        //   - 必须 d >= 6 (减 3 后 >= 3, 避免递归 NMP)
-        //   - 必须 iterBest 已建立 (非第一个 move)
-        //   - 必须 iterBest < FIVE 且 > -FIVE (不剪必胜/必败路径)
-        if (!onlyThree && !onlyFour && cDepth > 0 && d >= 6 && iterBest > -MAX && iterBest < FIVE && iterBest > -FIVE) {
-          const NMP_REDUCTION = 3;
-          let [nullVal] = helper(evaluator, board, other(role), d - NMP_REDUCTION, cDepth + 1, path, -beta, -beta + 1, budget, cache, lastMove, bestSlot);
-          nullVal = -nullVal;
-          if (nullVal >= beta) {
-            // v48 NMP: fail-high (对手连一手都没法 beat beta) → 直接返回 beta
-            //   注意: 不更新 bestSlot (避免浅层 NMP cut 污染根层结果)
-            return [beta, null, path];
-          }
-        }
+        // 旧 NMP 位于任何着法搜索之前，却要求 iterBest 已建立，因此条件永远
+        // 不可能成立。删除这段死代码，避免以后误以为已有 null-move 保护。
         for (let i = 0; i < points.length; i++) {
           const [x, y] = points[i];
           evaluator.move(x, y, role);
@@ -942,9 +927,10 @@
     // 阶段 2 若在更深一轮中超时，局部 move/value 仍可能残留阶段 1 的着法，
     // 从而白算 55% 主搜索预算。阶段 2 从干净槽开始，只提交自己的完整迭代。
     budget.best = null;
+    const remainingBeforeS2 = Math.max(50, budget.maxMs - (performance.now() - budget.t0));
     const b2 = {
       nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.55),
-      t0: performance.now(), maxMs: budget.maxMs * 0.55,
+      t0: performance.now(), maxMs: Math.min(budget.maxMs * 0.55, remainingBeforeS2),
       incOuter,
     };
     try {
@@ -1007,9 +993,11 @@
     // v47.2: 无进攻点时阶段 3 预算 45% → 55% (阶段 1 跳过转来), 深杀链验证更充分
     // v47.13: 无进攻点时阶段 3 预算 55% → 45% (阶段 2 已从 40% 升到 55%,
     // 防守校验 45% + 阶段 2 的深度优势仍能覆盖长杀链; 三阶段总和回到 100%)
+    const remainingBeforeS3 = Math.max(50, budget.maxMs - (performance.now() - budget.t0));
     const b3 = {
       nodes: 0, maxNodes: Math.floor(budget.maxNodes * (hasAttack ? 0.25 : 0.45)),
-      t0: performance.now(), maxMs: budget.maxMs * (hasAttack ? 0.25 : 0.45),
+      t0: performance.now(),
+      maxMs: Math.min(budget.maxMs * (hasAttack ? 0.25 : 0.45), remainingBeforeS3),
       incOuter,
     };
     if (value < FIVE) {
@@ -1090,10 +1078,38 @@
 
   function winPoints(board, color) {
     const out = [];
+    // v49: 最高优先级战术不再依赖正则/启发式棋形。逐个合法空位真实落子，
+    // 用与游戏规则一致的 winsAfter 判定；225 格全扫也只有常数级开销。
+    // 这完整覆盖连续四、跳四、边界冲四和长连，任何搜索/评估都无权覆盖。
+    for (let c = 0; c < board.length; c++) {
+      if (board[c] !== EMPTY) continue;
+      const x = c % SIZE, y = Math.floor(c / SIZE);
+      board[c] = color;
+      const wins = winsAfter(board, x, y, color);
+      board[c] = EMPTY;
+      if (wins) out.push({ x, y });
+    }
+    return out;
+  }
+
+  // 精确两手战术：当前方落 candidate 后，若对手没有立即成五，而当前方留下
+  // 至少两个不同成五点，则对手一手最多封一个，当前方下一手必胜。
+  function forcedWinInTwoPoints(board, color) {
+    const out = [];
+    const opp = other(color);
     for (const [x, y] of nearCells(board)) {
-      for (const [dx, dy] of DIRS) {
-        if (dirThreat(board, x, y, dx, dy, color) >= 5) { out.push({ x, y }); break; }
+      const c = idx(x, y);
+      if (board[c] !== EMPTY) continue;
+      board[c] = color;
+      const winsNow = winsAfter(board, x, y, color);
+      if (!winsNow) {
+        const oppImmediate = winPoints(board, opp);
+        if (!oppImmediate.length) {
+          const nextWins = winPoints(board, color);
+          if (nextWins.length >= 2) out.push({ x, y, replies: nextWins.length });
+        }
       }
+      board[c] = EMPTY;
     }
     return out;
   }
@@ -1394,12 +1410,12 @@ function oppLineBlocks(board, opp, minN = 3) {
 
   // v47.3 融合 v11.5: 防守候选的 VCT 安全验证 —— 按评分取前 3, 逐个摆子跑
   // 对手 VCT (深度 18), 第一个"对手杀不掉"的当选; 全被杀/预算耗尽 → 回退
-  // 评分最高的候选。预算固定 2s/20 万节点 —— 杀链验证通常 <200ms。
+  // 评分最高的候选。预算固定 1.2s/20 万节点 —— 杀链验证通常 <200ms。
   // 背景: 直接按评分返回可能选到被杀点 (实测 P6 局面 (8,9) 堵后黑仍可杀),
   // v11.5 时代预算小对手弱, 该问题不显; 现在对手会用多线集结杀。
   function safeDefensePick(board, color, scored, fallback) {
     const opp = other(color);
-    const b = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 2000, incOuter: null };
+    const b = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 1200, incOuter: null };
     for (let i = 0; i < Math.min(3, scored.length); i++) {
       const p = scored[i].p;
       const x = p[0] !== undefined ? p[0] : p.x;
@@ -1437,6 +1453,7 @@ function oppLineBlocks(board, opp, minN = 3) {
   //   getValuableMoves 用 jitterSeed 对候选段做 Fisher-Yates, dispatcher
   //   谈合后选全局最优。workerId=0(单跑/无 dispatcher) 不抖动, 保持确定。
   function computeBest(board, color, opts) {
+    const computeStartedAt = performance.now();
     // v11.4: 跨请求重置杀手走法表 —— 引擎模块在 worker 里被缓存复用,
     // killers 不重置会让结果依赖请求历史(同一棋盘不同答案)。
     vct.resetKillers();
@@ -1492,6 +1509,35 @@ function oppLineBlocks(board, opp, minN = 3) {
       return { x: best.x, y: best.y };
     }
 
+    // 3. 可证明的两手必胜优先于所有启发式/VCT。与旧 killInOne 的棋形近似
+    // 不同，这里真实枚举双方成五点，不会把“看起来像双威胁”误报成必胜。
+    const myForcedTwo = forcedWinInTwoPoints(board, color);
+    if (myForcedTwo.length) {
+      let best = myForcedTwo[0], bestScore = -Infinity;
+      for (const p of myForcedTwo) {
+        const b2 = board.slice();
+        b2[idx(p.x, p.y)] = color;
+        const score = p.replies * FIVE + evalBoardConn(b2, color);
+        if (score > bestScore) { bestScore = score; best = p; }
+      }
+      return { x: best.x, y: best.y, value: FIVE, tactical: 'win-in-two' };
+    }
+
+    // 4. 对手若下一手能制造两个成五点，当前必须抢占该启动点。只有上面的
+    // 己方立即/两手必胜可以合法反先；普通“做机会”不允许覆盖这个防守。
+    const oppForcedTwo = forcedWinInTwoPoints(board, opp);
+    if (oppForcedTwo.length) {
+      let best = oppForcedTwo[0], bestScore = -Infinity;
+      for (const p of oppForcedTwo) {
+        const b2 = board.slice();
+        b2[idx(p.x, p.y)] = color;
+        const remaining = forcedWinInTwoPoints(b2, opp).length;
+        const score = -remaining * MAX + evalBoardConn(b2, color);
+        if (score > bestScore) { bestScore = score; best = p; }
+      }
+      return { x: best.x, y: best.y, tactical: 'block-win-in-two' };
+    }
+
     // 2b-MUST. 必堵 (1 步就输): 对手活四 + 冲四
     //   v11.7: 与慢威胁(活三/双威胁)分开 —— 冲四不堵必输, 活三可被 killInOne 抢占
     //   v45.1: 同上, 硬性 1 步输仍立即返回, 两档都执行
@@ -1524,7 +1570,7 @@ function oppLineBlocks(board, opp, minN = 3) {
       if (isDeep) {
         setPick(best);
       } else {
-        return { x: best.x, y: best.y };
+        return { x: best.x, y: best.y, tactical: 'forced-defense' };
       }
     }
 
@@ -1591,7 +1637,7 @@ function oppLineBlocks(board, opp, minN = 3) {
       if (isDeep) {
         setPick(pick);
       } else {
-        return pick;
+        return { ...pick, tactical: 'forced-defense' };
       }
     }
 
@@ -1670,31 +1716,18 @@ function oppLineBlocks(board, opp, minN = 3) {
     // lastMove 形参保留, 但当前 getValuableMoves.orderNear 实际用 distToNearestStone 排序
     // (历史遗留接口, 暂保留以兼容 v11.4 阶段 3 的 move 传参, 不再盲扫右下角)
     const lastMove = null;
-    // v9: Web Worker 后台跑 — 3 秒 / 80 万节点(主线程同步调用时仍会回退)
-    // v11: budget.best 记录最优-so-far —— 超时也能返回部分搜索的最佳结果
-    // v45: deep 档用 MAX_BUDGET(2^28)作"无上限"占位 —— ONLY_THREE_THRESHOLD
-    //   把深层搜索的分支砍到极小, 实际节点数远低; 即使触顶, BUDGET 抛出会
-    //   被各阶段 try/catch 兜住, 不会把整个搜索崩溃。
-    // v45.1: 放宽预算 —— 普通 5s/4M, deep 无上限; 让搜索真正能跑(上轮 v45
-    //   1.5s 太少, 中盘复杂局面 80% 节点预算耗尽, 启发式 dominate, deep 档
-    //   与普通档几乎无差)。4M = 1<<22, 5s 在手机端也可接受。
+    // 节点上限只作异常保护，实际由墙钟截止；budget.best 保留最后完整迭代。
     const MAX_BUDGET = 1 << 28;
-    // v47: deep 档 maxMs 从 MAX_BUDGET(2^28 ms, 等于无上限)改为 3500ms ——
-    //   v46 用 MAX_BUDGET 是为了让搜索不被 wall-clock 截断, 但 dispatcher
-    //   WORKER_TIMEOUT_MS=4000 仍会 terminate 还没搜完的 worker, 谈合依据
-    //   (budget.best.value/path)虽存在, engine 却不返回, 见 P0 #1。
-    //   现在 3500ms 让 helper 在 ~3.5s 抛 BUDGET, computeBest 返回 budget.best
-    //   (含 value/path) → dispatcher pickBest 拿到真实依据。4s dispatcher 超时
-    //   仍兜底(防 worker 真的卡死)。
-    // v47.3: 深档 wall-clock 10s → 60s (用户要求预算可无限大) ——
-    // 深档强制深算 (除 1 步输赢硬门外), 60s 让深度 14 的迭代加深完成;
-    // dispatcher WORKER_TIMEOUT_MS (60.5s) 兜底。
-    const DEEP_BUDGET_MS = 15000;
+    // v49: 14.5s 引擎硬预算 + 0.5s IPC/序列化余量，保证公网响应在 15s 内。
+    // 预算从 computeBest 入口计时，前置棋形分析也计入总延迟。
+    const DEEP_BUDGET_MS = 14500;
+    const totalBudgetMs = isDeep ? DEEP_BUDGET_MS : 5000;
+    const remainingBudgetMs = Math.max(50, totalBudgetMs - (performance.now() - computeStartedAt));
     const budget = {
       nodes: 0,
       maxNodes: isDeep ? MAX_BUDGET : (1 << 22),  // v45.1: 普通档 1.5s/400k → 5s/4M
       t0: performance.now(),
-      maxMs: isDeep ? DEEP_BUDGET_MS : 5000,       // v47: deep 3.5s, 普通 5s (v45.1: 1500→5000)
+      maxMs: remainingBudgetMs,
       visited: null,
       best: null,
       // v46 Lazy SMP: jitterSeed 透传到 helper → getValuableMoves 尾段 Fisher-Yates
@@ -1742,38 +1775,29 @@ function oppLineBlocks(board, opp, minN = 3) {
     evalBoard,            // 阶段化评估
     stageDefRatio,        // 阶段化 DEF_RATIO
     countForcing,         // 双活三威胁统计
+    immediateWinningMoves: winPoints,
+    forcedWinInTwoPoints,
     // runWithBudget —— 直接跑搜索并返回 budget 节点数, 不走启发式门。
     //   测试用它验证"深档真的跑了搜索"(节点数 > 0)。
     runWithBudget(board, color, opts) {
       const MAX_BUDGET = 1 << 28;
-    // v47: deep 档 maxMs 从 MAX_BUDGET(2^28 ms, 等于无上限)改为 3500ms ——
-    //   v46 用 MAX_BUDGET 是为了让搜索不被 wall-clock 截断, 但 dispatcher
-    //   WORKER_TIMEOUT_MS=4000 仍会 terminate 还没搜完的 worker, 谈合依据
-    //   (budget.best.value/path)虽存在, engine 却不返回, 见 P0 #1。
-    //   现在 3500ms 让 helper 在 ~3.5s 抛 BUDGET, computeBest 返回 budget.best
-    //   (含 value/path) → dispatcher pickBest 拿到真实依据。4s dispatcher 超时
-    //   仍兜底(防 worker 真的卡死)。
-    // v47.3: 深档 wall-clock 10s → 60s (用户要求预算可无限大) ——
-    // 深档强制深算 (除 1 步输赢硬门外), 60s 让深度 14 的迭代加深完成;
-    // dispatcher WORKER_TIMEOUT_MS (60.5s) 兜底。
-    const DEEP_BUDGET_MS = 15000;
       const isDeep = !!(opts && opts.deep === true);
       const searchBoard = board.slice();
       const evaluator = createEvaluator(searchBoard);
       evaluator.init();
       const budget = {
         nodes: 0,
-        maxNodes: isDeep ? MAX_BUDGET : (1 << 22),
+        maxNodes: (opts && opts.maxNodes) || (isDeep ? MAX_BUDGET : (1 << 22)),
         t0: performance.now(),
-        maxMs: isDeep ? MAX_BUDGET : 5000,
+        maxMs: (opts && opts.maxMs) || (isDeep ? 14500 : 5000),
         visited: null,
         best: null,
       };
       let stoneCount = 0;
       for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
-      const depth = isDeep
+      const depth = (opts && opts.depth) || (isDeep
         ? 12
-        : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6));
+        : (stoneCount < 8 ? 2 : (stoneCount > 190 ? 4 : 6)));
       try {
         minmaxSearch(evaluator, searchBoard, color, depth, budget, null);
       } catch (e) {
