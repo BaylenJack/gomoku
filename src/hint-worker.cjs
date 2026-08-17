@@ -152,7 +152,9 @@ parentPort.on('message', async (msg) => {
       return;
     }
     // v47: 日志打印全部 worker 的 value, 便于确认谈合依据真实到位
-    const _values = results.filter((r) => !r.error).map((r) => "w" + r.workerId + "=" + r.value).join(" ");
+    const _values = results.filter((r) => !r.error).map((r) =>
+      "w" + r.workerId + "=(" + r.x + "," + r.y + ")/v" + r.value + "/d" + r.depth + "/n" + r.nodes
+    ).join(" ");
     console.log("[hint] Lazy SMP 结束: id=" + msg.id + " ms=" + (Date.now() - t0) + " winners=" + winners + "/" + 4 + " → (" + best.x + "," + best.y + ") best.value=" + best.value + " [" + _values + "]" + (incomplete ? " [超时]" : ""));
     parentPort.postMessage({
       id: msg.id,
@@ -162,5 +164,7 @@ parentPort.on('message', async (msg) => {
       deep: true,
       votes: winners,
       incomplete,
+      depth: best.depth || 0,
+      nodes: best.nodes || 0,
     });
 });

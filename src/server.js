@@ -221,6 +221,8 @@ function handleHint(req, res) {
           const payload = { ok: true, x: r.x, y: r.y, ms, deep: true };
           if (r.votes !== undefined) payload.votes = r.votes;
           if (r.incomplete !== undefined) payload.incomplete = r.incomplete;
+          if (r.depth !== undefined) payload.depth = r.depth;
+          if (r.nodes !== undefined) payload.nodes = r.nodes;
           res.end(JSON.stringify(payload));
         })
         .catch((e) => {

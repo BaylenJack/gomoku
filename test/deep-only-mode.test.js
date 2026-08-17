@@ -28,10 +28,10 @@ test('dispatcher 只保留 Lazy SMP 深度路径', () => {
 });
 
 test('深度模式固定为 10 层、3000 万节点并受 10 秒端到端窗口约束', () => {
-  assert.match(engine, /v11\.5-tuned/);
+  assert.match(engine, /v11\.6/);
   assert.match(engine, /const depth = 10;/);
   assert.match(engine, /maxNodes: 30000000/);
-  assert.match(engine, /maxMs: 9000/);
+  assert.match(engine, /maxMs: Math\.max\(50, 9000/);
   assert.match(dispatcher, /const WORKER_TIMEOUT_MS = 9500;/);
   assert.match(app, /const timeoutMs = 10000;/);
 });
