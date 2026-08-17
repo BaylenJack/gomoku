@@ -223,6 +223,9 @@ function handleHint(req, res) {
           if (r.incomplete !== undefined) payload.incomplete = r.incomplete;
           if (r.depth !== undefined) payload.depth = r.depth;
           if (r.nodes !== undefined) payload.nodes = r.nodes;
+          if (r.predictedStop !== undefined) payload.predictedStop = r.predictedStop;
+          if (r.value !== undefined) payload.value = r.value;
+          if (r.verified !== undefined) payload.verified = r.verified;
           res.end(JSON.stringify(payload));
         })
         .catch((e) => {

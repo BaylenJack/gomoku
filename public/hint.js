@@ -1,4 +1,4 @@
-// 五子棋提示引擎 v11.6 — 增量搜索核 / 四路分流 / 3000 万节点 / 深度 10 / 10 秒
+// 五子棋提示引擎 v11.7 — 三连深析 / 完整迭代预测 / 3000 万节点 / 深度 10 / 10 秒
 //
 // 架构来源: https://github.com/lihongxun945/gobang
 //   1. 增量点位评估: 每个空位缓存四方向棋形分数, 落子只更新周围 5 格,
@@ -168,16 +168,23 @@
     const totals = [0, 0];
     let hash1 = 0, hash2 = 0;
 
-    function updatePoint(x, y, role) {
+    function updatePoint(x, y, role, changedDir = -1) {
       const rIdx = role - 1;
       const c = idx(x, y);
       const old = scores[rIdx][c];
       let total = 0;
       let fourCnt = 0, blockFourCnt = 0, threeCnt = 0, twoCnt = 0;
+      if (changedDir >= 0) {
+        const [dx, dy] = DIRS[changedDir];
+        shapeCache[rIdx][c * 4 + changedDir] = getShape(board, x, y, dx, dy, role);
+      } else {
+        for (let d = 0; d < 4; d++) {
+          const [dx, dy] = DIRS[d];
+          shapeCache[rIdx][c * 4 + d] = getShape(board, x, y, dx, dy, role);
+        }
+      }
       for (let d = 0; d < 4; d++) {
-        const [dx, dy] = DIRS[d];
-        const sh = getShape(board, x, y, dx, dy, role);
-        shapeCache[rIdx][c * 4 + d] = sh;
+        const sh = shapeCache[rIdx][c * 4 + d];
         if (sh === SH.FOUR) fourCnt++;
         else if (sh === SH.BLOCK_FOUR) blockFourCnt++;
         else if (sh === SH.THREE) threeCnt++;
@@ -204,14 +211,15 @@
 
     function refresh(x, y) {
       // 落子点影响周围 6 格内的所有空位 (v11: 窗口扩到 6 配合双跳识别)
-      for (const [dx, dy] of DIRS) {
+      for (let d = 0; d < DIRS.length; d++) {
+        const [dx, dy] = DIRS[d];
         for (const sign of [1, -1]) {
           for (let step = 1; step <= 6; step++) {
             const nx = x + sign * step * dx, ny = y + sign * step * dy;
             if (!inB(nx, ny)) break;
             if (board[idx(nx, ny)] !== EMPTY) continue;
-            updatePoint(nx, ny, 1);
-            updatePoint(nx, ny, 2);
+            updatePoint(nx, ny, 1, d);
+            updatePoint(nx, ny, 2, d);
           }
         }
       }
@@ -446,6 +454,16 @@
 
       // gobang_AI order: 离最后落子近的点优先搜索(Alpha-Beta 剪枝效率关键)
       let points = getValuableMoves(evaluator, board, role, cDepth, onlyThree, onlyFour, lastMove);
+      if (cDepth === 0 && budget.rootPriority && budget.rootPriority.length) {
+        const seen = new Set();
+        const merged = [];
+        for (const p of [...budget.rootPriority, ...points]) {
+          if (!p || p.length !== 2 || board[idx(p[0], p[1])] !== EMPTY) continue;
+          const k = p[1] * SIZE + p[0];
+          if (!seen.has(k)) { seen.add(k); merged.push(p); }
+        }
+        points = merged;
+      }
       if (!points.length) return [evaluator.evaluate(role), null, path];
 
       // v10 杀手走法: 把剪枝成功的走法排到最前面(同深度优先试)。
@@ -475,11 +493,33 @@
       let completedDepth = cDepth;
       let finalExact = false;
       const alphaStart = alpha;
+      let previousIterationMs = 0;
+      let beforePreviousIterationMs = 0;
 
       // v11.2: 迭代加深 —— 每轮迭代记录"该深度最优", 迭代结束时提交, 更深迭代优先。
       // (v11 回归: 每层每步直接覆盖, 浅层 d=2 的乐观值永远压住深层准确值, 有效深度≈2)
-      for (let d = cDepth + 1; d <= depth; d += 1) {
+      // 标准迭代加深只在根节点执行。旧实现每个递归节点都从浅层重新迭代，
+      // 同一子树被指数级重复搜索；内部节点直接搜索根轮次指定的目标深度。
+      const firstIterationDepth = cDepth === 0 ? cDepth + 1 : depth;
+      for (let d = firstIterationDepth; d <= depth; d += 1) {
         if (d % 2 !== 0) continue; // 迭代加深只搜偶数层(己方能赢的解)
+        // 常规根搜索只启动预计能完成的下一轮。未完成迭代不会产生可用结果，
+        // 盲目跑满墙钟只会增加等待；VCT/VCF 不使用预测，避免漏深层杀棋。
+        if (cDepth === 0 && !onlyThree && !onlyFour && completedDepth >= 6 && previousIterationMs > 0) {
+          const elapsed = performance.now() - budget.t0;
+          const remaining = budget.maxMs - elapsed;
+          const observedGrowth = beforePreviousIterationMs > 0
+            ? previousIterationMs / beforePreviousIterationMs
+            : 3;
+          const growth = Math.max(2, Math.min(8, observedGrowth));
+          const estimatedNextMs = previousIterationMs * growth;
+          if (remaining < estimatedNextMs * 1.15) {
+            budget.predictedStop = true;
+            break;
+          }
+        }
+        const iterationStartedAt = performance.now();
+        const iterationStartedNodes = budget.nodes;
         let iterBest = -MAX, iterMove = null, iterPath = path, iterDepth = 0;
         let breakAll = false;
         let iterCutoff = false;
@@ -543,6 +583,16 @@
         if (iterMove && d < depth) {
           points = [iterMove, ...points.filter((p) => p[0] !== iterMove[0] || p[1] !== iterMove[1])];
         }
+        if (cDepth === 0) {
+          beforePreviousIterationMs = previousIterationMs;
+          previousIterationMs = Math.max(0.01, performance.now() - iterationStartedAt);
+          if (!budget.iterations) budget.iterations = [];
+          budget.iterations.push({
+            depth: d,
+            ms: Math.round(previousIterationMs * 100) / 100,
+            nodes: budget.nodes - iterationStartedNodes,
+          });
+        }
         if (breakAll) break;
       }
 
@@ -584,6 +634,7 @@
     const deadline = startedAt + budget.maxMs;
     const totalNodes = budget.maxNodes;
     const rootOffset = budget.rootOffset || 0;
+    const rootPriority = budget.rootPriority || [];
 
     // 阶段 1: VCT 找杀(预算 35%)
     // v11.4: 各阶段用独立 evaluator 副本 —— BUDGET 超时是异常抛出, 搜索树上
@@ -592,7 +643,7 @@
     const b1 = {
       nodes: 0, maxNodes: Math.floor(totalNodes * 0.35),
       t0: performance.now(), maxMs: budget.maxMs * 0.35,
-      best: null, rootOffset,
+      best: null, rootOffset, rootPriority,
     };
     let value, move, bestPath;
     try {
@@ -619,7 +670,7 @@
       maxNodes: Math.max(1, remainingNodesAfterB1 - stage3NodeReserve),
       t0: performance.now(),
       maxMs: Math.max(1, deadline - performance.now() - stage3TimeReserve),
-      best: null, rootOffset,
+      best: null, rootOffset, rootPriority,
     };
     value = undefined;
     move = null;
@@ -639,6 +690,8 @@
     }
     budget.best = b2.best;
     budget.nodes = b1.nodes + b2.nodes;
+    budget.predictedStop = !!b2.predictedStop;
+    budget.iterations = b2.iterations || [];
     if (!move) return null;
     if (value >= FIVE) {
       return {
@@ -660,7 +713,7 @@
       maxNodes: Math.max(1, totalNodes - b1.nodes - b2.nodes),
       t0: performance.now(),
       maxMs: Math.max(1, deadline - performance.now()),
-      best: null, rootOffset,
+      best: null, rootOffset, rootPriority: [],
     };
     let verified = true;
     try {
@@ -1035,6 +1088,19 @@
     const wins = winPoints(board, color);
     if (wins.length) return wins[0];
 
+    // 战术规则只负责把关键点放到根节点最前面，不再替深搜直接作决定。
+    // 这样对手三连/跳三/双威胁出现时，所有候选仍会经过完整攻防比较。
+    const tacticalPriority = [];
+    const prioritySeen = new Set();
+    const addPriority = (p) => {
+      if (!p || !inB(p.x, p.y) || board[idx(p.x, p.y)] !== EMPTY) return;
+      const k = p.y * SIZE + p.x;
+      if (!prioritySeen.has(k)) {
+        prioritySeen.add(k);
+        tacticalPriority.push([p.x, p.y]);
+      }
+    };
+
     // 1.5 己方一步杀优先于堵棋 —— 杀是必胜: 对手冲四只需一步堵, 堵完己方威胁
     // 还在, 继续杀; 先堵反而把先手让出去(对手双活三也同理)。
     // 对手活四在盘(两个成五点同一四连两端)下一手必胜, 己方杀来不及, 不在此列;
@@ -1044,21 +1110,12 @@
       const liveFour = oppWins.length === 2 && sameLiveFour(board, opp, oppWins[0], oppWins[1]);
       if (!liveFour) {
         const kill = killInOne(board, color);
-        if (kill) return { x: kill.x, y: kill.y };
+        if (kill) addPriority(kill);
       }
     }
 
-    // 2. 对手下一手成五 → 必堵(选堵点中对自己最好的)
-    if (oppWins.length) {
-      let best = oppWins[0], bestScore = -Infinity;
-      for (const b of oppWins) {
-        const b2 = board.slice();
-        b2[idx(b.x, b.y)] = color;
-        const s = evalBoardConn(b2, color);
-        if (s > bestScore) { bestScore = s; best = b; }
-      }
-      return { x: best.x, y: best.y };
-    }
+    // 2. 对手下一手成五点优先进入根搜索，搜索负责比较两个堵点及反击手段。
+    for (const p of oppWins) addPriority(p);
 
     // 2b. 硬性防守: 对手落子即成活四/双威胁的点 → 必堵或抢占
     // (搜索会算到这些威胁, 但硬性规则更快更稳, 且搜索预算有限)
@@ -1070,8 +1127,6 @@
     const double = oppDoubleThreatPoints(board, opp);
     const line = oppLineBlocks(board, opp);
     if (urgent.length || double.length || line.length) {
-      // v11.5: 一步杀已在 1.5 优先处理(对手无活四时无条件查) ——
-      // 到这里仍是"该堵"(说明己方无一步杀或对手活四在盘)。
       const cands = [...urgent, ...double, ...line];
       // 紧迫度: 对手活三/四(必堵) > 对手双威胁 > 己方活四机会 > 聚子
       // v8 修正: 堵对手活三的端点必须优先于己方活四机会 ——
@@ -1087,7 +1142,7 @@
         const k = p.y * SIZE + p.x;
         if (!urgency.has(k) || urgency.get(k) < 2) urgency.set(k, 2);
       }
-      let best = cands[0], bestScore = -Infinity;
+      const ranked = [];
       for (const b of cands) {
         const b2 = board.slice();
         b2[idx(b.x, b.y)] = color;
@@ -1105,9 +1160,10 @@
           }
           if (conn >= 2) s += 8e5;
         }
-        if (s > bestScore) { bestScore = s; best = b; }
+        ranked.push({ p: b, score: s });
       }
-      return { x: best.x, y: best.y };
+      ranked.sort((a, b) => b.score - a.score);
+      for (const item of ranked) addPriority(item.p);
     }
 
     // 2c. 一步反推防守 (mumuy gobang 法):
@@ -1133,11 +1189,17 @@
     // v11.5-tuned: 全局固定 10 层深度。开局、中盘、残局使用同一搜索深度，
     // 节点与墙钟预算负责在复杂局面中安全截断。
     const depth = 10;
+    const nodeBudget = 30000000;
+    const timeBudgetMs = 9000;
+    const testConfig = opts && opts.__testConfig;
+    const effectiveDepth = testConfig && Number.isInteger(testConfig.depth)
+      ? Math.max(2, Math.min(depth, testConfig.depth))
+      : depth;
 
     // 开局定式: 仅黑第 3 手(天元 + 白 1 子)用严格定式 ——
     // 黑天元开局理论必胜, 白 1 子在斜对角时, 黑应下与天元相邻的活 2 点
     // (普通开局库易给劣手, 这里只保留一个经过验证的必胜雏形)
-    if (stoneCount === 2 && color === BLACK) {
+    if (!skipHard && stoneCount === 2 && color === BLACK) {
       const stones = [];
       for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
         if (board[idx(x, y)] !== EMPTY) stones.push([x, y, board[idx(x, y)]]);
@@ -1171,20 +1233,27 @@
     // 仍返回最后一次完成迭代的结果。
     const budget = {
       nodes: 0,
-      maxNodes: 30000000,
+      maxNodes: testConfig && Number.isFinite(testConfig.maxNodes)
+        ? Math.max(100, Math.min(nodeBudget, testConfig.maxNodes))
+        : nodeBudget,
       t0: performance.now(),
-      maxMs: Math.max(50, 9000 - (performance.now() - computeStartedAt)),
+      maxMs: Math.max(50,
+        (testConfig && Number.isFinite(testConfig.maxMs) ? Math.min(timeBudgetMs, testConfig.maxMs) : timeBudgetMs) -
+        (performance.now() - computeStartedAt)),
       visited: null,
       best: null,
       rootOffset,
+      rootPriority: tacticalPriority,
     };
     try {
-      const res = minmaxSearch(evaluator, searchBoard, color, depth, budget, lastMove);
+      const res = minmaxSearch(evaluator, searchBoard, color, effectiveDepth, budget, lastMove);
       if (res && res.move) {
         return {
           x: res.move[0], y: res.move[1],
           value: res.value, path: res.path || [], depth: res.depth || 0,
           verified: res.verified !== false, nodes: budget.nodes,
+          predictedStop: !!budget.predictedStop,
+          iterations: budget.iterations || [],
         };
       }
     } catch (e) {
@@ -1196,6 +1265,8 @@
         x: budget.best.move[0], y: budget.best.move[1],
         value: budget.best.value, path: budget.best.path || [],
         depth: budget.best.searchDepth || 0, verified: false, nodes: budget.nodes,
+        predictedStop: !!budget.predictedStop,
+        iterations: budget.iterations || [],
       };
     }
 

@@ -11,6 +11,7 @@ const { computeBest, __test__ } = sandbox.self.GomokuHint;
 const SIZE = 15;
 const idx = (x, y) => y * SIZE + x;
 const empty = () => new Array(SIZE * SIZE).fill(0);
+const fastDeep = { deep: true, workerId: 0, __testConfig: { depth: 6, maxNodes: 200_000, maxMs: 300 } };
 
 test('增量哈希和评估在 move/undo 后与全盘重算一致', () => {
   const board = empty();
@@ -73,8 +74,9 @@ test('关键防守规则仍优先命中活四、活三和跳三', () => {
     board[idx(2, 2)] = 1;
     board[idx(3, 3)] = 1;
     const before = board.slice();
-    const result = computeBest(board, 1, { deep: true, workerId: 0 });
+    const result = computeBest(board, 1, fastDeep);
     assert.ok(valid(result), `错误防守点: ${JSON.stringify(result)}`);
+    assert.ok(result.nodes > 0 && result.depth >= 2, `战术局面必须进入深搜: ${JSON.stringify(result)}`);
     assert.deepEqual(board, before, '计算不得污染输入棋盘');
   }
 });
@@ -95,12 +97,27 @@ test('四个方向的对手四连都能堵住，含单端被封局面', () => {
       if (blockedSide < 0) board[idx(left[0], left[1])] = 1;
       if (blockedSide > 0) board[idx(right[0], right[1])] = 1;
       board[idx(1, 1)] = 1;
-      const result = computeBest(board, 1, { deep: true, workerId: 0 });
+      const result = computeBest(board, 1, fastDeep);
       const valid = [];
       if (blockedSide >= 0) valid.push(left);
       if (blockedSide <= 0) valid.push(right);
       assert.ok(valid.some(([x, y]) => result.x === x && result.y === y),
         `方向 (${dx},${dy}) blocked=${blockedSide} 返回 ${JSON.stringify(result)}`);
+      assert.ok(result.nodes > 0, '四连防守也必须经过搜索比较，不能启发式秒回');
     }
   }
+});
+
+test('对手三连与己方反击并存时必须搜索后再决定', () => {
+  const board = empty();
+  for (const [x, y, c] of [
+    [3,7,1],[4,7,2],[5,7,2],[6,7,2],
+    [9,5,1],[11,5,1],[10,4,1],[10,6,1],
+  ]) board[idx(x, y)] = c;
+  const result = computeBest(board, 1, fastDeep);
+  assert.ok(result.nodes > 0 && result.depth >= 2, `必须进入搜索: ${JSON.stringify(result)}`);
+  const blockedThree = result.x === 7 && result.y === 7;
+  const provenCounterattack = result.value >= 10_000_000;
+  assert.ok(blockedThree || provenCounterattack,
+    `不堵三连时必须已经证明反击必胜: ${JSON.stringify(result)}`);
 });

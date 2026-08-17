@@ -52,6 +52,7 @@ parentPort.on('message', (msg) => {
       verified: r.verified !== false,
       depth: r.depth || 0,
       nodes: r.nodes || 0,
+      predictedStop: !!r.predictedStop,
       workerId: workerData.workerId,
       ms: Date.now() - t0,
     });

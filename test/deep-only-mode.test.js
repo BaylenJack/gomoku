@@ -28,10 +28,10 @@ test('dispatcher 只保留 Lazy SMP 深度路径', () => {
 });
 
 test('深度模式固定为 10 层、3000 万节点并受 10 秒端到端窗口约束', () => {
-  assert.match(engine, /v11\.6/);
+  assert.match(engine, /v11\.7/);
   assert.match(engine, /const depth = 10;/);
-  assert.match(engine, /maxNodes: 30000000/);
-  assert.match(engine, /maxMs: Math\.max\(50, 9000/);
+  assert.match(engine, /const nodeBudget = 30000000;/);
+  assert.match(engine, /const timeBudgetMs = 9000;/);
   assert.match(dispatcher, /const WORKER_TIMEOUT_MS = 9500;/);
   assert.match(app, /const timeoutMs = 10000;/);
 });
@@ -59,7 +59,7 @@ test('dispatcher 收到不带 deep 的请求仍执行深度搜索', async () => 
   }
 });
 
-test('四路深度 dispatcher 不会被己方做棋诱惑带离对手三连', async () => {
+test('四路深度 dispatcher 对三连必须深搜，反击时必须证明必胜', async () => {
   const worker = new Worker(new URL('../src/hint-worker.cjs', import.meta.url), {
     workerData: { publicDir: path.resolve('public') },
   });
@@ -78,7 +78,10 @@ test('四路深度 dispatcher 不会被己方做棋诱惑带离对手三连', as
       });
       worker.postMessage({ id: 'three-defense-test', board, color: 1 });
     });
-    assert.deepEqual([result.x, result.y], [7, 7]);
+    const blocked = result.x === 7 && result.y === 7;
+    const provenCounterattack = result.x === 10 && result.y === 5 && result.value >= 10_000_000;
+    assert.ok(blocked || provenCounterattack, `三连局面返回未经证明的走法: ${JSON.stringify(result)}`);
+    assert.ok(result.nodes > 0 && result.depth >= 2, `三连局面没有进入深搜: ${JSON.stringify(result)}`);
     assert.equal(result.deep, true);
   } finally {
     await worker.terminate();
