@@ -31,7 +31,7 @@ function winsAt(b, x, y, c) {
       if (b[idx(nx, ny)] === c) n++; else break;
     }
     for (let i = 1; i < 5; i++) {
-      const nx = x - dx*i, ny = y + dy*i;
+      const nx = x - dx*i, ny = y - dy*i;
       if (nx<0||nx>=15||ny<0||ny>=15) break;
       if (b[idx(nx, ny)] === c) n++; else break;
     }

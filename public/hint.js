@@ -499,11 +499,25 @@
     // 恢复 gobang 的局部性剪枝 (五子棋着法强局部性, 近点先搜剪枝效率高)。
     // 只在同一类别段内排序, 不跨类别 (类别优先级由拼接顺序保证)。
     const segSort = (arr) => {
-      if (!lastMove || arr.length < 2) return arr;
-      const lx = lastMove[0], ly = lastMove[1];
-      return arr.slice().sort((a, b) =>
-        Math.max(Math.abs(a[0] - lx), Math.abs(a[1] - ly)) -
-        Math.max(Math.abs(b[0] - lx), Math.abs(b[1] - ly)));
+      if (arr.length < 2) return arr;
+      const opp = other(role);
+      return arr.slice().sort((a, b) => {
+        // v48.1: 同棋形等级先按双方点位战术分排序，再做候选截断。
+        // 旧根节点 lastMove=null 时完全保留 y/x 扫描顺序，slice(0,N) 会系统性
+        // 丢掉棋盘右下方的同级强点。点分排序消除方位偏置，也让强着先搜。
+        const as = evaluator.pointScore(a[0], a[1], role) + evaluator.pointScore(a[0], a[1], opp);
+        const bs = evaluator.pointScore(b[0], b[1], role) + evaluator.pointScore(b[0], b[1], opp);
+        if (as !== bs) return bs - as;
+        if (lastMove) {
+          const ad = Math.max(Math.abs(a[0] - lastMove[0]), Math.abs(a[1] - lastMove[1]));
+          const bd = Math.max(Math.abs(b[0] - lastMove[0]), Math.abs(b[1] - lastMove[1]));
+          if (ad !== bd) return ad - bd;
+        }
+        // 稳定、旋转更中性的兜底：靠近天元优先，最后才按坐标。
+        const ac = Math.max(Math.abs(a[0] - 7), Math.abs(a[1] - 7));
+        const bc = Math.max(Math.abs(b[0] - 7), Math.abs(b[1] - 7));
+        return (ac - bc) || (a[1] - b[1]) || (a[0] - b[0]);
+      });
     };
 
     if (sets.five.length || sets.blockFive.length) return applyJitter(orderNear([...segSort(sets.five), ...segSort(sets.blockFive)], 8));
@@ -591,6 +605,8 @@
       // v45.1: 同时累加到外层 budget(若有 incOuter) —— 测试可观察总节点数
       if (budget.incOuter) budget.incOuter();
       if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
+      const originalAlpha = alpha;
+      const originalBeta = beta;
 
       // 静态搜索: 到达叶子(或接近叶子)时, 不立即评估 —— 继续搜强制走法
       // (冲四/活三), 避免"被一子反转"的假评估 (PentaZen quiescence)
@@ -611,7 +627,12 @@
       // v11.5: 53 位 key —— 高 32 位 h2 纯位段(<<21) + 低 21 位 mix
       // (mix 把 role/深度/变体混合进 h1), 位段无重叠 → 无进位歧义。
       // 原 32 位 key 在几万节点的树里碰撞 ~1-5%, 误命中产生偶发错棋。
-      const mix = (h1 ^ Math.imul(role + (depth - cDepth) * 4 + (onlyThree ? 2 : 0) + (onlyFour ? 1 : 0), 0x9E3779B1)) >>> 0;
+      // v48.1: TT key 只描述局面、行棋方和搜索变体，深度放在 entry.depth。
+      // 旧 key 把剩余深度也混进去，导致迭代加深 d=2/4/6/... 之间完全无法
+      // 复用上一层 TT，prev.depth 的深度判定形同虚设。移除深度后，浅层条目
+      // 可继续提供 best-move 排序，足够深的条目才会用于剪枝/直接返回。
+      const variant = (onlyThree ? 2 : 0) + (onlyFour ? 1 : 0);
+      const mix = (h1 ^ Math.imul(role * 4 + variant, 0x9E3779B1)) >>> 0;
       const key = h2 * 2097152 + (mix >>> 11);
       const prev = cache.get(key);
       // v47.14 TT 边界标记修复: 缓存条目标记 flag(0=精确, 1=剪枝下界)。
@@ -622,10 +643,11 @@
       // 幻觉 PV 里黑方已五连仍标白胜)。
       if (prev && prev.onlyThree === onlyThree && prev.onlyFour === onlyFour) {
         const enough = prev.depth >= depth - cDepth;
-        // 精确值: FIVE 任意深度可信, 其余需深度足够; 下界: 仅当 >= beta 时
-        // 可直接 fail-high (标准 alpha-beta TT 语义), 否则不采信其值
-        if ((prev.flag !== 1 && (Math.abs(prev.value) >= FIVE || enough)) ||
-            (prev.flag === 1 && prev.value >= beta)) {
+        // flag: 0=精确, 1=下界(fail-high), -1=上界(fail-low)。边界值只有在
+        // 能关闭当前窗口时才可直接使用；否则仍保留其 best move 用于排序。
+        if ((prev.flag === 0 && (Math.abs(prev.value) >= FIVE || enough)) ||
+            (enough && prev.flag === 1 && prev.value >= beta) ||
+            (enough && prev.flag === -1 && prev.value <= alpha)) {
           return [prev.value, prev.move, [...path, ...prev.path]];
         }
       }
@@ -643,44 +665,26 @@
       // v10 杀手走法: 把剪枝成功的走法排到最前面(同深度优先试)。
       // 注意: killers 按 cDepth 索引(同深度节点), 只在剪枝时写入;
       // 排序是稳定的(只把杀手提到前面, 不重排其余)。
-      const k1 = killers[cDepth] ? killers[cDepth][0] : null;
-      const k2 = killers[cDepth] ? killers[cDepth][1] : null;
-      if (k1 !== null || k2 !== null) {
-        const killerSet = new Set([k1, k2].filter((k) => k !== null));
-        if (killerSet.size) {
-          points = [...points.filter((p) => !killerSet.has(p[0] * SIZE + p[1])),
-                   ...points.filter((p) => killerSet.has(p[0] * SIZE + p[1]))];
-        }
-      }
-      // v45: TT best-move 提到次位(杀手之后) —— 同层有 caching 复用价值
-      if (ttMove) {
-        const i = points.findIndex(p => p[0] === ttMove[0] && p[1] === ttMove[1]);
-        if (i > 0) {
-          points = [points[i], ...points.slice(0, i), ...points.slice(i + 1)];
-        } else if (i === -1) {
-          // getValuableMoves 浅层筛选把 ttMove 砍了: 它是"理论上好但本
-          // 层不重要"的格子 —— 不强插, history 排序会自然处理
-          points = points.slice();
-        }
-      }
-      // v48: countermove history 提到第三位(在 killer/ttMove 之后)
-      //   只在 lastMove 存在(非根节点)时使用, 避免根层 churn
-      if (lastMove) {
-        const cmIdx = COUNTER_MOVE[lastMove[0] * SIZE + lastMove[1]];
-        if (cmIdx !== NO_COUNTER) {
-          const j = points.findIndex((p) => p[0] * SIZE + p[1] === cmIdx);
-          if (j > 2) {
-            // 提到 index 3, 不挤掉前 2 个 (killer/ttMove)
-            points = [points[0], points[1], points[2], points[j],
-                     ...points.slice(3, j), ...points.slice(j + 1)];
-          } else if (j === -1) {
-            // countermove 被 getValuableMoves 砍了, 跳过 (不强插)
-          }
-        }
-      }
-      // v45: history 启发 —— 按历史剪枝分降序
-      // v47.4: 同分时按距 lastMove 距离升序 (局部性 tiebreak, 剪枝更高效)
+      const k1 = killers[cDepth] ? killers[cDepth][0] : NO_COUNTER;
+      const k2 = killers[cDepth] ? killers[cDepth][1] : NO_COUNTER;
+      const ttIdx = ttMove ? ttMove[0] * SIZE + ttMove[1] : NO_COUNTER;
+      const cmIdx = lastMove
+        ? COUNTER_MOVE[lastMove[0] * SIZE + lastMove[1]]
+        : NO_COUNTER;
+      // v48.1: 用一次复合排序兑现启发式优先级。
+      // 旧实现先把 killer 拼到数组末尾（方向写反），随后 history sort 又会
+      // 抹掉 TT/killer/countermove 的位置，三套启发式实际几乎不生效。
+      // 顺序固定为 TT > killer > countermove > history > 局部距离。
+      const priority = (p) => {
+        const m = p[0] * SIZE + p[1];
+        if (m === ttIdx) return 3;
+        if (m === k1 || m === k2) return 2;
+        if (m === cmIdx) return 1;
+        return 0;
+      };
       points.sort((a, b) => {
+        const pa = priority(a), pb = priority(b);
+        if (pa !== pb) return pb - pa;
         const ha = HISTORY[b[0] * SIZE + b[1]] - HISTORY[a[0] * SIZE + a[1]];
         if (ha !== 0 || !lastMove) return ha;
         const la = Math.max(Math.abs(a[0] - lastMove[0]), Math.abs(a[1] - lastMove[1]));
@@ -692,12 +696,11 @@
       let move = null;
       let bestPath = path;
       let bestDepth = 0;
-      let didCut = false; // v47.14: 剪枝退出 → 缓存标记下界
+      let didCut = false; // 剪枝退出 → 缓存标记下界
 
-      // v11.2: 迭代加深 —— 每轮迭代记录"该深度最优", 迭代结束时提交, 更深迭代优先。
-      // (v11 回归: 每层每步直接覆盖, 浅层 d=2 的乐观值永远压住深层准确值, 有效深度≈2)
+      // 迭代加深: 每轮记录该深度最优，更深的完整迭代覆盖浅层。
       for (let d = cDepth + 1; d <= depth; d += 1) {
-        if (d % 2 !== 0) continue; // 迭代加深只搜偶数层(己方能赢的解)
+        if (d % 2 !== 0) continue;
         let iterBest = -MAX, iterMove = null, iterPath = path, iterDepth = 0;
         let breakAll = false;
         // v48 LMR (Late Move Reduction) —— 已在下方 for(i) 内实施。
@@ -777,7 +780,7 @@
           alpha = Math.max(alpha, iterBest);
           // v10: Alpha-Beta 剪枝命中 → 记录杀手走法(PentaZen update_killers)
           if (alpha >= beta) {
-            didCut = true; // v47.14: 剪枝退出, 当前 value 是下界非精确值
+            didCut = true; // 剪枝退出, 当前 value 是下界非精确值
             if (!killers[cDepth]) killers[cDepth] = [null, null];
             if (killers[cDepth][0] !== x * SIZE + y) {
               killers[cDepth][1] = killers[cDepth][0];
@@ -808,10 +811,17 @@
           // 浅层"没杀"证明不了任何事; v11.4: 常规变体逐迭代写入 —— 浅层完整
           // 迭代(d=2/4)结果远好于纯启发式, 最终迭代超时也有真结果可用,
           // 不再整个搜索白跑后退化回启发式。
-          if (bestSlot && cDepth === 0 && (!onlyThree || d === depth || iterBest >= FIVE) &&
-              (!bestSlot.best || iterBest > bestSlot.best.value ||
-               (iterBest <= -FIVE && bestSlot.best.value <= -FIVE && iterPath.length > bestSlot.best.depth))) {
-            bestSlot.best = { value: iterBest, move: iterMove, path: iterPath, depth: iterPath.length };
+          if (bestSlot && cDepth === 0 && (!onlyThree || d === depth || iterBest >= FIVE)) {
+            // v48.1: budget.best 表示“最后一个完整迭代”，而不是“历史最高分”。
+            // 浅层估值天然更乐观；旧比较只在分数更高时覆盖，会让 d=2 的高分
+            // 压住已经完成的 d=8/10 更准确结果，超时时等价于退回浅搜。
+            bestSlot.best = {
+              value: iterBest,
+              move: iterMove,
+              path: iterPath,
+              depth: iterPath.length,
+              completedDepth: d,
+            };
           }
         }
         if (breakAll) break;
@@ -819,16 +829,20 @@
 
       // v47.4 (回退): PVS 放弃后恢复无条件写缓存 (全窗口搜索的值精确)
       // v47.14: 剪枝退出(didCut)的值是下界, 标记 flag=1 防被当精确值复用
-      if (cache.size < CACHE_MAX && (!prev || prev.depth < depth - cDepth)) {
+      const remainingDepth = depth - cDepth;
+      const ttFlag = value <= originalAlpha ? -1 : (didCut || value >= originalBeta ? 1 : 0);
+      if (cache.size < CACHE_MAX &&
+          (!prev || prev.depth < remainingDepth ||
+           (prev.depth === remainingDepth && prev.flag !== 0 && ttFlag === 0))) {
         cache.set(key, {
-          depth: depth - cDepth,
+          depth: remainingDepth,
           value,
           move,
           path: bestPath.slice(cDepth),
           // v8: 缓存区分变体 —— VCT/VCF 与常规搜索的缓存不通用(gobang)
           onlyThree,
           onlyFour,
-          flag: didCut ? 1 : 0,
+          flag: ttFlag,
         });
       }
       return [value, move, bestPath];
@@ -924,6 +938,10 @@
     // 阶段 2: 常规 minmax(预算 55% —— v47.13 从 40% 上调: 阶段 1 VCT 35% → 20%,
     // 找不到杀时省下的时间转给深度 12 主战场。实测复杂中盘 40% 下深度 12 常
     // 跑不完只提交 d=10, 55% 下完成度显著提升, 且找杀/验证不受影响)
+    // 阶段 1 的非必胜结果不能占用阶段 2 的 best slot。旧实现共用 budget.best，
+    // 阶段 2 若在更深一轮中超时，局部 move/value 仍可能残留阶段 1 的着法，
+    // 从而白算 55% 主搜索预算。阶段 2 从干净槽开始，只提交自己的完整迭代。
+    budget.best = null;
     const b2 = {
       nodes: 0, maxNodes: Math.floor(budget.maxNodes * 0.55),
       t0: performance.now(), maxMs: budget.maxMs * 0.55,
@@ -938,6 +956,11 @@
     } catch (e) {
       if (e !== BUDGET) throw e;
       budget.stageNodes.s2 = b2.nodes;
+      if (budget.best && budget.best.move) {
+        value = budget.best.value;
+        move = budget.best.move;
+        bestPath = budget.best.path;
+      }
     }
     // v47.14: 阶段 2 的 FIVE 声称也必须假杀验证 —— 阶段 1 有验证, 阶段 2
     // (常规 minmax) 的必胜声称此前直接信任。TT 边界污染 (已修复) 与 LMR

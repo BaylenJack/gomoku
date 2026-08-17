@@ -51,6 +51,18 @@ test('FIX1: 进攻局面 (己方有活三) 阶段1仍执行', () => {
   assert.ok(r.stageNodes.s1 > 0, `进攻局面阶段1应执行, 实际 nodes=${r.stageNodes.s1}`);
 });
 
+test('v48.1: 预算截断返回最后完成的迭代深度, 不保留浅层最高分', () => {
+  const b = empty();
+  for (const [x, y, c] of [
+    [7,7,1],[8,7,1],[6,6,1],[9,9,1],[5,8,1],[9,6,1],
+    [7,6,2],[8,8,2],[6,7,2],[5,5,2],[8,5,2],[10,8,2],
+  ]) b[idx(x, y)] = c;
+  const r = fastTest.runWithBudget(b, 1, { deep: true });
+  assert.ok(r.best, '应至少完成一轮搜索');
+  assert.equal(typeof r.best.completedDepth, 'number', 'best 应记录真实完成的迭代深度');
+  assert.ok(r.best.completedDepth >= 2);
+});
+
 test('FIX2: 阶段2选点会被杀时, 改选安全防守点 (真实对局局面)', () => {
   // 真实对局复现: 黑(后手棋, 实际是先手方)第 9 手 (7,10) 后, 白第 9 手。
   // 黑已有斜活二 (5,6)(6,5) + 竖活二 (5,5)(5,6) —— 白若走 (7,9) 类闲棋,

@@ -104,11 +104,10 @@ function getSearchWorkers() {
 function rebuildDeadWorkers() {
   if (!searchPool) return;
   if (searchPool.every((w) => !w._dead)) return;
-  // 残余存活 worker 留着 (理论上没有, 但兜底)
-  searchPool = searchPool.filter((w) => !w._dead);
-  while (searchPool.length < NUM_WORKERS) {
-    searchPool.push(spawnSearchWorker(searchPool.length));
-  }
+  // v48.1: 按 workerId 补洞。旧实现 filter 后用数组 length 作为新 id；若中间
+  // 的 #1 死亡而 #2/#3 存活，会再创建一个 #3，造成重复 seed、缺失 #1。
+  const alive = new Map(searchPool.filter((w) => !w._dead).map((w) => [w._workerId, w]));
+  searchPool = Array.from({ length: NUM_WORKERS }, (_, i) => alive.get(i) || spawnSearchWorker(i));
 }
 
 parentPort.on('message', async (msg) => {
@@ -129,24 +128,32 @@ parentPort.on('message', async (msg) => {
     console.log(`[hint] Lazy SMP 开始: id=${msg.id} 棋子=${stones} workers=${NUM_WORKERS}`);
     const results = [];
     const listeners = [];
+    const settledWorkers = new Set();
+    // error 后通常还会紧接一个 exit；同一 worker 只能结算一次，否则重复占位
+    // 会让 results.length 提前达到 4，dispatcher 在其他存活 worker 返回前结束。
+    const pushResult = (workerId, result) => {
+      if (settledWorkers.has(workerId)) return;
+      settledWorkers.add(workerId);
+      results.push(result);
+    };
 
     for (let i = 0; i < workers.length; i++) {
       const w = workers[i];
       if (w._dead) {
         // 已死 worker 直接占位 —— pickBest 仍能从幸存 worker 选最优
-        results.push({ id: msg.id, workerId: i, error: 'worker 已死亡' });
+        pushResult(i, { id: msg.id, workerId: i, error: 'worker 已死亡' });
         continue;
       }
       // v47: 错误快速标记 —— error/exit 立即 push error 占位, 不再傻等满超时
       const onMsg = (r) => {
-        if (r && r.id === msg.id) results.push(r);
+        if (r && r.id === msg.id) pushResult(i, r);
       };
       const onErr = (e) => {
-        results.push({ id: msg.id, workerId: i, error: '错误: ' + ((e && e.message) || '未知') });
+        pushResult(i, { id: msg.id, workerId: i, error: '错误: ' + ((e && e.message) || '未知') });
       };
       const onExit = (code) => {
         if (code !== 0) {
-          results.push({ id: msg.id, workerId: i, error: '异常退出 code=' + code });
+          pushResult(i, { id: msg.id, workerId: i, error: '异常退出 code=' + code });
         }
       };
       listeners.push({ w, onMsg, onErr, onExit });
@@ -156,7 +163,7 @@ parentPort.on('message', async (msg) => {
       try {
         w.postMessage({ id: msg.id, board: msg.board, color: msg.color, deep: true });
       } catch (e) {
-        results.push({ id: msg.id, workerId: i, error: 'postMessage 失败: ' + e.message });
+        pushResult(i, { id: msg.id, workerId: i, error: 'postMessage 失败: ' + e.message });
       }
     }
 
@@ -177,7 +184,7 @@ parentPort.on('message', async (msg) => {
     // 兜底: 超时后还没回来的 worker —— 把它们的结果标成 error
     const seenIds = new Set(results.map((r) => r.workerId));
     for (let i = 0; i < workers.length; i++) {
-      if (!seenIds.has(i)) results.push({ id: msg.id, workerId: i, error: '超时未返回' });
+      if (!seenIds.has(i)) pushResult(i, { id: msg.id, workerId: i, error: '超时未返回' });
     }
 
     const best = pickBest(results);
