@@ -1,4 +1,4 @@
-// 五子棋提示引擎 v51 — 三连安全层 + MiniMax/Alpha-Beta + VCT/VCF
+// 五子棋提示引擎 v52 — 正确性优先搜索核 + 根节点战术安全层 + VCT/VCF
 //
 // 架构来源: https://github.com/lihongxun945/gobang
 //   1. 增量点位评估: 每个空位缓存四方向棋形分数, 落子只更新周围 5 格,
@@ -332,6 +332,9 @@
             const c = idx(x, y);
             hash1 = (hash1 ^ ZB[c * 2 + (v - 1)]) >>> 0;
             hash2 = (hash2 ^ ZB2[c * 2 + (v - 1)]) >>> 0;
+            // 初始化也必须识别已有终局。正常对局不会对已结束棋盘请求提示，
+            // 但搜索副本、测试和恢复局面都可能从含五连的盘面初始化。
+            if (winsAfter(board, x, y, v)) fiveCnt[v - 1]++;
           } else {
             updatePoint(x, y, 1);
             updatePoint(x, y, 2);
@@ -394,6 +397,7 @@
     const sets = {
       five: [], blockFive: [], four: [], fourFour: [], fourThree: [],
       threeThree: [], blockFour: [], three: [], twoTwo: [], blockThree: [], two: [],
+      quietDefense: [],
     };
     for (let y = 0; y < N; y++) {
       for (let x = 0; x < N; x++) {
@@ -411,7 +415,7 @@
             else if (sh === SH.THREE) threeCnt++;
             else if (sh === SH.TWO) twoCnt++;
           }
-          let cat;
+          let cat = null;
           if (best === SH.FIVE || best === SH.BLOCK_FIVE) cat = best === SH.FIVE ? 'five' : 'blockFive';
           else if (fourCnt >= 2 || (fourCnt && blockFourCnt)) cat = 'fourFour';
           else if (blockFourCnt >= 2) cat = 'fourFour';
@@ -423,7 +427,6 @@
           else if (twoCnt >= 2) cat = 'twoTwo';
           else if (best === SH.BLOCK_THREE) cat = 'blockThree';
           else if (best === SH.TWO) cat = 'two';
-          else continue;
           // 深度降级: 深层只保留活三/冲四/成五
           if (deep && cat !== 'five' && cat !== 'blockFive' && cat !== 'four' &&
               cat !== 'blockFour' && cat !== 'fourFour' && cat !== 'fourThree' &&
@@ -455,10 +458,15 @@
                   if (inB(nx, ny) && board[idx(nx, ny)] === other(role)) oppN++;
                 }
               }
-              if (oppN >= 2) keep = true;
+              if (oppN >= 2) {
+                // 纯防守点可能没有任何己方棋形，不能依赖 cat 才进入候选。
+                sets.quietDefense.push([x, y]);
+                keep = true;
+              }
             }
             if (!keep) continue;
           }
+          if (!cat) continue;
           sets[cat].push([x, y]);
         }
       }
@@ -521,11 +529,21 @@
     };
 
     if (sets.five.length || sets.blockFive.length) return applyJitter(orderNear([...segSort(sets.five), ...segSort(sets.blockFive)], 8));
-    if (onlyFour || sets.four.length) return applyJitter(orderNear([...segSort(sets.four), ...segSort(sets.blockFour)], 12));
-    if (sets.fourFour.length) return applyJitter(orderNear([...segSort(sets.fourFour), ...segSort(sets.blockFour)], 12));
+    // 强制棋形必须合并后再截断。旧逻辑只要存在一个普通 four 就提前返回，
+    // 会把同一节点的 fourFour/fourThree/threeThree（包括精确两手杀）整个漏掉。
+    if (onlyFour) return applyJitter(orderNear([
+      ...segSort(sets.fourFour), ...segSort(sets.fourThree),
+      ...segSort(sets.four), ...segSort(sets.blockFour),
+    ], 12));
+    if (sets.four.length || sets.fourFour.length) return applyJitter(orderNear([
+      ...segSort(sets.fourFour), ...segSort(sets.fourThree), ...segSort(sets.threeThree),
+      ...segSort(sets.four), ...segSort(sets.blockFour),
+    ], 14));
     if (sets.fourThree.length) return applyJitter(orderNear([...segSort(sets.fourThree), ...segSort(sets.blockFour), ...segSort(sets.three)], 14));
     if (sets.threeThree.length) return applyJitter(orderNear([...segSort(sets.threeThree), ...segSort(sets.blockFour), ...segSort(sets.three)], 14));
-    if (onlyThree) return applyJitter(orderNear([...segSort(sets.blockFour), ...segSort(sets.three)], 14));
+    if (onlyThree) return applyJitter(orderNear([
+      ...segSort(sets.blockFour), ...segSort(sets.three), ...segSort(sets.quietDefense),
+    ], 14));
     return applyJitter(orderNear([...segSort(sets.blockFour), ...segSort(sets.three), ...segSort(sets.blockThree), ...segSort(sets.twoTwo), ...segSort(sets.two)], 16));
   }
 
@@ -600,6 +618,32 @@
     // v11.4: 跨请求重置 —— worker 缓存引擎模块, killers 不重置会把上一请求的
     // 剪枝记录泄漏进下一请求的走法排序, 预算截断时结果随请求历史漂移。
     function resetKillers() { killers.length = 0; }
+    function forcingQuiescence(evaluator, board, role, cDepth, path, alpha, beta, budget, lastMove, qLeft) {
+      const score = evaluator.evaluate(role);
+      if (Math.abs(score) >= FIVE || qLeft <= 0) return [score, null, path];
+      const points = getValuableMoves(
+        evaluator, board, role, cDepth, false, true, lastMove, budget.jitterSeed,
+      );
+      if (!points.length) return [score, null, path];
+      let best = -MAX, bestMove = null, bestPath = path;
+      for (const [x, y] of points) {
+        if (++budget.nodes > budget.maxNodes) throw BUDGET;
+        if (budget.incOuter) budget.incOuter();
+        if (budget.t0 && performance.now() - budget.t0 > budget.maxMs) throw BUDGET;
+        evaluator.move(x, y, role);
+        const nextPath = [...path, [x, y]];
+        let [value, , pv] = forcingQuiescence(
+          evaluator, board, other(role), cDepth + 1, nextPath,
+          -beta, -alpha, budget, [x, y], qLeft - 1,
+        );
+        value = -value;
+        evaluator.undo(x, y);
+        if (value > best) { best = value; bestMove = [x, y]; bestPath = pv; }
+        alpha = Math.max(alpha, best);
+        if (alpha >= beta) break;
+      }
+      return bestMove ? [best, bestMove, bestPath] : [score, null, path];
+    }
     function helper(evaluator, board, role, depth, cDepth, path, alpha, beta, budget, cache, lastMove, bestSlot) {
       if (++budget.nodes > budget.maxNodes) throw BUDGET;
       // v45.1: 同时累加到外层 budget(若有 incOuter) —— 测试可观察总节点数
@@ -608,18 +652,22 @@
       const originalAlpha = alpha;
       const originalBeta = beta;
 
-      // 静态搜索: 到达叶子(或接近叶子)时, 不立即评估 —— 继续搜强制走法
-      // (冲四/活三), 避免"被一子反转"的假评估 (PentaZen quiescence)
+      // 每个节点先判终局。旧实现只在叶子调用 evaluate，成五后仍允许对手继续
+      // 落子，PV、杀棋长度和 TT 都会被非法后续着污染。
+      const nodeScore = evaluator.evaluate(role);
+      if (Math.abs(nodeScore) >= FIVE) return [nodeScore, null, path];
       if (cDepth >= depth) {
-        return [evaluator.evaluate(role), null, path];
-      }
-      // Razoring 仅用于常规搜索最后两层；根节点的精确强制防守不经过这里。
-      if (!onlyThree && !onlyFour && cDepth >= depth - 2 && depth - cDepth <= 2) {
-        const staticScore = evaluator.evaluate(role);
-        if (staticScore + 45 * (depth - cDepth) <= alpha) {
-          return [staticScore, null, path];
+        // 常规搜索叶子再延伸两层冲四/成五应对，消除“刚好切在强制着之前”的
+        // 地平线效应；VCT/VCF 自身已经是强制搜索，不重复延伸。
+        if (!onlyThree && !onlyFour) {
+          return forcingQuiescence(
+            evaluator, board, role, cDepth, path, alpha, beta, budget, lastMove, 2,
+          );
         }
+        return [nodeScore, null, path];
       }
+      // 删除旧的 45/90 分 razoring。该阈值与活三/冲四的千至十万分尺度
+      // 完全不匹配，而且没有战术静态延伸保护，会在叶子前直接剪掉反转着。
 
       // v47.4: 增量 Zobrist (O(1)) —— 原 boardHash 每节点全盘扫描 O(225)
       const [h1, h2] = evaluator.hash ? evaluator.hash() : boardHash(board);
@@ -696,19 +744,29 @@
       let move = null;
       let bestPath = path;
       let bestDepth = 0;
-      let didCut = false; // 剪枝退出 → 缓存标记下界
+      let finalDidCut = false; // 最后完成迭代是否剪枝 → TT 边界类型
+      let completedSearchDepth = cDepth;
 
-      // 迭代加深: 每轮记录该深度最优，更深的完整迭代覆盖浅层。
-      for (let d = cDepth + 1; d <= depth; d += 1) {
-        if (d % 2 !== 0) continue;
+      // 迭代加深只允许在根节点运行。旧结构在每个递归节点重复迭代，既重复
+      // 计算，又把浅层 alpha 当成深层合法下界；LMR 传入奇数深度时甚至会因
+      // “只跑偶数轮”而一次走法都不搜，直接返回 -MAX。
+      const iterationDepths = [];
+      if (cDepth === 0) {
+        if (depth < 2) iterationDepths.push(depth);
+        else {
+          for (let d = 2; d <= depth; d += 2) iterationDepths.push(d);
+          if (depth % 2 !== 0) iterationDepths.push(depth);
+        }
+      } else {
+        iterationDepths.push(depth);
+      }
+      for (const d of iterationDepths) {
+        // 不同深度的估值不能互为 alpha 下界；每轮从调用者窗口重新开始。
+        alpha = originalAlpha;
+        beta = originalBeta;
         let iterBest = -MAX, iterMove = null, iterPath = path, iterDepth = 0;
         let breakAll = false;
-        // v48 LMR (Late Move Reduction) —— 已在下方 for(i) 内实施。
-        //   原 v45.1 TODO 中提到的 "测试套件过 60/62 但基准对战强度下降" 问题,
-        //   通过保守的 reduction 表 (max 3) + fail-low 重搜 + 跳过 VCT/VCF/PV/前 3
-        //   等多重保护规避。
-        // 旧 NMP 位于任何着法搜索之前，却要求 iterBest 已建立，因此条件永远
-        // 不可能成立。删除这段死代码，避免以后误以为已有 null-move 保护。
+        let iterDidCut = false;
         for (let i = 0; i < points.length; i++) {
           const [x, y] = points[i];
           evaluator.move(x, y, role);
@@ -716,16 +774,18 @@
           // v48 LMR (Late Move Reduction): 排序靠后的着法减少搜索深度
           //   - 只在常规搜索启用 (跳过 VCT/VCF 变体, 它们只看 forcing 走法, 减深度风险大)
           //   - 跳过 PV 节点 (cDepth === 0 视为根 PV)
-          //   - 跳过 i < 3 (前 3 个是 killer/ttMove/countermove, 优先级最高)
+          //   - 跳过前 4 个高优先候选
           //   - 跳过第一个 move (iterBest === -MAX 时尚无 PV)
-          //   reduction 表: depth 大、index 大减得深 (Stockfish 风格)
-          //   v47.13 重搜条件: reduced search 返回 cv > alpha (含 fail-high) 且
-          //   r >= 2 时重搜完整窗口 (见下方修复注释)
+          //   - reduction 由“剩余深度”决定，且越靠后的着法减得越多
           let lmrDepth = d;
           let lmrReduced = false;
           let lmrR = 0;
-          if (!onlyThree && !onlyFour && cDepth > 0 && i >= 3 && d >= 4 && iterBest > -MAX) {
-            lmrR = Math.min(3, Math.max(0, Math.floor((d - 3) * 0.5) - Math.floor((i - 3) * 0.15)));
+          const remainingPlies = d - cDepth;
+          if (!onlyThree && !onlyFour && cDepth > 0 && i >= 4 &&
+              remainingPlies >= 4 && iterBest > -MAX) {
+            lmrR = 1;
+            if (remainingPlies >= 7 && i >= 8) lmrR = 2;
+            if (remainingPlies >= 9 && i >= 12) lmrR = 3;
             if (lmrR > 0) {
               lmrDepth = Math.max(cDepth + 1, d - lmrR);
               lmrReduced = true;
@@ -737,12 +797,8 @@
           let [cv, , cp] = helper(evaluator, board, other(role), lmrDepth, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
           cv = -cv;
           evaluator.undo(x, y);
-          // v47.13 LMR 修复: 原条件 (cv < beta) 把 fail-high 排除在重搜外 ——
-          // 减深度搜索的 fail-high 是乐观上界, 3 层减深度可能高估着法 (对手
-          // 深层的防守没被看到), 直接截断会让根层候选错误地 cut, 引擎下出
-          // 深度 9 的"假杀" (根层排序靠后的着法只搜到 d-3)。改为 cv > alpha
-          // 即重搜 (含 fail-high), r >= 2 才重搜 (r=1 误差极小, 省节点)。
-          if (lmrReduced && cv > alpha && lmrR >= 2) {
+          // 任何改善 alpha 的减深结果都必须完整深度重搜；r=1 同样不是证明。
+          if (lmrReduced && cv > alpha) {
             evaluator.move(x, y, role);
             let [cv2, , cp2] = helper(evaluator, board, other(role), d, cDepth + 1, newPath, -beta, -alpha, budget, cache, [x, y], bestSlot);
             cv2 = -cv2;
@@ -756,7 +812,9 @@
           // 常规变体保持逐层提交(深度 10 下干净窗口会超预算, 实测 18% 回退启发式),
           // 预算截断时由 budget.best 的最终迭代门控兜底。
           if ((!onlyThree || cv >= FIVE || d === depth) &&
-              (cv > iterBest || (cv <= -FIVE && iterBest <= -FIVE && cp.length > iterDepth))) {
+              (cv > iterBest ||
+               (cv >= FIVE && iterBest >= FIVE && (iterMove === null || cp.length < iterDepth)) ||
+               (cv <= -FIVE && iterBest <= -FIVE && cp.length > iterDepth))) {
             iterBest = cv;
             iterMove = [x, y];
             iterPath = cp;
@@ -765,7 +823,7 @@
           alpha = Math.max(alpha, iterBest);
           // v10: Alpha-Beta 剪枝命中 → 记录杀手走法(PentaZen update_killers)
           if (alpha >= beta) {
-            didCut = true; // 剪枝退出, 当前 value 是下界非精确值
+            iterDidCut = true; // 剪枝退出, 当前 value 是下界非精确值
             if (!killers[cDepth]) killers[cDepth] = [null, null];
             if (killers[cDepth][0] !== x * SIZE + y) {
               killers[cDepth][1] = killers[cDepth][0];
@@ -780,7 +838,7 @@
             }
             // v45: history 表累加 —— 剩余深度的平方(深层剪枝更值钱,
             //   加平方放大). 简单剪枝给 1, 深层导致整子树剪掉给 9-25.
-            HISTORY[x * SIZE + y] += (depth - cDepth) * (depth - cDepth);
+            HISTORY[x * SIZE + y] += remainingPlies * remainingPlies;
             break;
           }
           if (alpha >= FIVE) { breakAll = true; break; } // 自己赢了就结束
@@ -791,6 +849,8 @@
           move = iterMove;
           bestPath = iterPath;
           bestDepth = iterDepth;
+          finalDidCut = iterDidCut;
+          completedSearchDepth = d;
           // v11.2: budget.best 只从根层写入 —— 预算超时时返回部分搜索结果
           // v11.3 (gobang V3): VCT 变体(onlyThree)非胜值只在最终迭代提交 ——
           // 浅层"没杀"证明不了任何事; v11.4: 常规变体逐迭代写入 —— 浅层完整
@@ -812,10 +872,11 @@
         if (breakAll) break;
       }
 
-      // v47.4 (回退): PVS 放弃后恢复无条件写缓存 (全窗口搜索的值精确)
-      // v47.14: 剪枝退出(didCut)的值是下界, 标记 flag=1 防被当精确值复用
-      const remainingDepth = depth - cDepth;
-      const ttFlag = value <= originalAlpha ? -1 : (didCut || value >= originalBeta ? 1 : 0);
+      // 防御性兜底：任何节点都不能把内部哨兵 -MAX 当成真实局面值返回。
+      if (move === null || value === -MAX) return [nodeScore, null, path];
+
+      const remainingDepth = completedSearchDepth - cDepth;
+      const ttFlag = value <= originalAlpha ? -1 : (finalDidCut || value >= originalBeta ? 1 : 0);
       if (cache.size < CACHE_MAX &&
           (!prev || prev.depth < remainingDepth ||
            (prev.depth === remainingDepth && prev.flag !== 0 && ttFlag === 0))) {
@@ -890,7 +951,7 @@
         // 验证对手能否 VCT 杀; 对手杀链不短于己方 → 假杀, 落到阶段 2/3
         // 由防守校验改堵 (用户实战两局赢 AI 的破绽根因)。
         if (value >= FIVE && move) {
-          let oppVal = 0, oppPathLen = 0, isFake = false;
+          let oppVal = 0, oppPathLen = 0, isFake = false, verificationComplete = false;
           const vb = board.slice();
           vb[idx(move[0], move[1])] = role;
           const ve = createEvaluator(vb);
@@ -903,12 +964,12 @@
           const vbudget = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: verifyMs, incOuter: null };
           try {
             const [ov, , op] = vct(ve, vb, other(role), 18, 0, [], -MAX, MAX, vbudget, new Map(), move);
-            oppVal = ov; oppPathLen = op.length;
+            oppVal = ov; oppPathLen = op.length; verificationComplete = true;
           } catch (e) {
             if (e !== BUDGET) throw e;
           }
-          if (oppVal >= FIVE && bestPath.length >= oppPathLen) isFake = true;
-          if (!isFake) return { move, value, path: bestPath };
+          if (!verificationComplete || (oppVal >= FIVE && bestPath.length >= oppPathLen)) isFake = true;
+          if (!isFake) return { move, value, path: bestPath, verified: true };
           if (budget.best && budget.best.move &&
               budget.best.move[0] === move[0] && budget.best.move[1] === move[1]) {
             budget.best = null; // 清掉假杀, 防止搜索无果时回退
@@ -954,7 +1015,7 @@
     // 3 手反杀更快)。验证逻辑与阶段 1 一致: 落子后查对手 VCT 杀, 对手杀
     // 链不短于己方 → 假杀, 清掉 best 提交, 落到阶段 3 改堵对手杀棋起点。
     if (move && value >= FIVE) {
-      let oppVal = 0, oppPathLen = 0, isFake = false;
+      let oppVal = 0, oppPathLen = 0, isFake = false, verificationComplete = false;
       const vb = board.slice();
       vb[idx(move[0], move[1])] = role;
       const ve = createEvaluator(vb);
@@ -966,11 +1027,11 @@
       const vbudget = { nodes: 0, maxNodes: 150000, t0: performance.now(), maxMs: verifyMs, incOuter: null };
       try {
         const [ov, , op] = vct(ve, vb, other(role), 18, 0, [], -MAX, MAX, vbudget, new Map(), move);
-        oppVal = ov; oppPathLen = op.length;
+        oppVal = ov; oppPathLen = op.length; verificationComplete = true;
       } catch (e) {
         if (e !== BUDGET) throw e;
       }
-      if (oppVal >= FIVE && bestPath.length >= oppPathLen) isFake = true;
+      if (!verificationComplete || (oppVal >= FIVE && bestPath.length >= oppPathLen)) isFake = true;
       if (isFake) {
         if (budget.best && budget.best.move &&
             budget.best.move[0] === move[0] && budget.best.move[1] === move[1]) {
@@ -994,10 +1055,16 @@
     // v47.13: 无进攻点时阶段 3 预算 55% → 45% (阶段 2 已从 40% 升到 55%,
     // 防守校验 45% + 阶段 2 的深度优势仍能覆盖长杀链; 三阶段总和回到 100%)
     const remainingBeforeS3 = Math.max(50, budget.maxMs - (performance.now() - budget.t0));
+    const stage3TotalMs = Math.min(
+      budget.maxMs * (hasAttack ? 0.25 : 0.45),
+      remainingBeforeS3,
+    );
+    const stage3Started = performance.now();
     const b3 = {
       nodes: 0, maxNodes: Math.floor(budget.maxNodes * (hasAttack ? 0.25 : 0.45)),
-      t0: performance.now(),
-      maxMs: Math.min(budget.maxMs * (hasAttack ? 0.25 : 0.45), remainingBeforeS3),
+      t0: stage3Started,
+      // 先用约 65% 判断原着是否被杀，保留其余时间验证替代防守。
+      maxMs: Math.max(30, stage3TotalMs * 0.65),
       incOuter,
     };
     if (value < FIVE) {
@@ -1009,14 +1076,63 @@
         const [value2, move2, path2] = vct(sEval, sBoard, other(role), vctDefDepth, 0, [], -MAX, MAX, b3, cache, move);
         sEval.undo(move[0], move[1]);
         budget.stageNodes.s3 = b3.nodes;
-        // 己方未确认必胜 + 对手确认必胜 → 改堵对手杀棋起点
-        if (value2 >= FIVE && move2) return { move: move2, value, path: path2 };
+        if (value2 < FIVE || !move2) {
+          return { move, value, path: bestPath, verified: true };
+        }
+
+        // 对手确认有杀时，不能只占它 PV 的第一手就直接宣告安全。收集杀棋链
+        // 中的进攻着，逐个落到原棋盘后重新验证，防止另一条 VCT 路线接管。
+        const defenseCandidates = [];
+        const seenDefense = new Set();
+        const addDefense = (p) => {
+          if (!p || !Number.isInteger(p[0]) || !Number.isInteger(p[1])) return;
+          const k = p[1] * SIZE + p[0];
+          if (board[k] !== EMPTY || seenDefense.has(k)) return;
+          seenDefense.add(k);
+          defenseCandidates.push(p);
+        };
+        addDefense(move2);
+        for (let i = 0; i < path2.length; i += 2) addDefense(path2[i]);
+
+        const unknown = [];
+        for (let i = 0; i < Math.min(4, defenseCandidates.length); i++) {
+          const remaining = stage3TotalMs - (performance.now() - stage3Started);
+          if (remaining <= 20) { unknown.push(defenseCandidates[i]); continue; }
+          const slots = Math.min(4, defenseCandidates.length) - i;
+          const candidate = defenseCandidates[i];
+          const dBoard = board.slice();
+          const dEval = createEvaluator(dBoard);
+          dEval.init();
+          dEval.move(candidate[0], candidate[1], role);
+          const db = {
+            nodes: 0,
+            maxNodes: Math.max(50000, Math.floor(b3.maxNodes / Math.max(1, slots))),
+            t0: performance.now(),
+            maxMs: Math.max(20, remaining / slots),
+            incOuter,
+          };
+          try {
+            const [dv] = vct(dEval, dBoard, other(role), vctDefDepth, 0, [], -MAX, MAX, db, new Map(), candidate);
+            budget.stageNodes.s3 += db.nodes;
+            if (dv < FIVE) {
+              return { move: candidate, value, path: path2, verified: true };
+            }
+          } catch (e) {
+            budget.stageNodes.s3 += db.nodes;
+            if (e !== BUDGET) throw e;
+            unknown.push(candidate);
+          }
+        }
+        // 全部候选均被证伪时局面可能已败；若有超时未知候选，至少不要退回
+        // 已经确认被杀的原着，并把未验证状态交给 Lazy SMP 谈合降权。
+        return { move: unknown[0] || move2, value, path: path2, verified: false };
       } catch (e) {
         if (e !== BUDGET) throw e;
         budget.stageNodes.s3 = b3.nodes;
+        return { move, value, path: bestPath, verified: false };
       }
     }
-    return { move, value, path: bestPath };
+    return { move, value, path: bestPath, verified: true };
   }
 
   // ---------- 启发式保底 (v5 做棋/防守) ----------
@@ -1329,7 +1445,9 @@
   }
 
   function evalBoardConn(board, color) {
-    const mine = evalBoard(board, color);
+    let stoneCount = 0;
+    for (let i = 0; i < board.length; i++) if (board[i] !== EMPTY) stoneCount++;
+    const mine = evalBoard(board, color, stoneCount);
     const conn = connectivity(board, color) - connectivity(board, other(color));
     return mine + conn * 5e3;
   }
@@ -1399,13 +1517,29 @@
   // 评分最高的候选。预算固定 1.2s/20 万节点 —— 杀链验证通常 <200ms。
   // 背景: 直接按评分返回可能选到被杀点 (实测 P6 局面 (8,9) 堵后黑仍可杀),
   // v11.5 时代预算小对手弱, 该问题不显; 现在对手会用多线集结杀。
-  function safeDefensePick(board, color, scored, fallback) {
+  function safeDefensePick(board, color, scored, fallback, requireVerified = false) {
     const opp = other(color);
-    const b = { nodes: 0, maxNodes: 200000, t0: performance.now(), maxMs: 1200, incOuter: null };
-    for (let i = 0; i < Math.min(3, scored.length); i++) {
+    const started = performance.now();
+    const deadline = started + 1200;
+    const limit = Math.min(4, scored.length);
+    const unknown = [];
+    const killed = new Set();
+    for (let i = 0; i < limit; i++) {
       const p = scored[i].p;
       const x = p[0] !== undefined ? p[0] : p.x;
       const y = p[1] !== undefined ? p[1] : p.y;
+      const remaining = deadline - performance.now();
+      if (remaining <= 20) { unknown.push(p); continue; }
+      // 每个候选拿独立预算，避免第一个复杂分支吃光全部 1.2 秒后，后续候选
+      // 从未验证却又回退到已经证明被杀的第一名。
+      const slots = limit - i;
+      const b = {
+        nodes: 0,
+        maxNodes: 100000,
+        t0: performance.now(),
+        maxMs: Math.max(20, remaining / slots),
+        incOuter: null,
+      };
       const vb = board.slice();
       vb[idx(x, y)] = color;
       const ev = createEvaluator(vb);
@@ -1413,18 +1547,25 @@
       try {
         const [value2] = vct(ev, vb, opp, 18, 0, [], -MAX, MAX, b, new Map(), [x, y]);
         if (value2 < FIVE) return { x, y };
+        killed.add(y * SIZE + x);
       } catch (e) {
         if (e !== BUDGET) throw e;
-        break;
+        unknown.push(p);
       }
     }
-    const f = fallback;
+    if (requireVerified) return null;
+    // 未知优先于“已确认被杀”；若前四名都被杀，尝试尚未验证的下一候选。
+    const f = unknown[0] || scored.find(({ p }) => {
+      const x = p[0] !== undefined ? p[0] : p.x;
+      const y = p[1] !== undefined ? p[1] : p.y;
+      return !killed.has(y * SIZE + x);
+    })?.p || fallback;
     return { x: f[0] !== undefined ? f[0] : f.x, y: f[1] !== undefined ? f[1] : f.y };
   }
 
   // 根节点防守统一决策：先去重，再用“堵后剩余的精确威胁数”排序，最后用
   // VCT 排除表面上堵住一条线、实际仍被另一条线杀掉的伪防守。
-  function chooseForcedDefense(board, color, candidates, urgency = new Map(), verify = true) {
+  function chooseForcedDefense(board, color, candidates, urgency = new Map(), verify = true, requireVerified = false) {
     const opp = other(color);
     const unique = new Map();
     for (const p of candidates) {
@@ -1453,7 +1594,7 @@
     }).sort((a, b) => b.s - a.s);
     if (!scored.length) return null;
     if (!verify) return { x: scored[0].p.x, y: scored[0].p.y };
-    return safeDefensePick(board, color, scored, scored[0].p);
+    return safeDefensePick(board, color, scored, scored[0].p, requireVerified);
   }
 
   // ---------- 入口 ----------
@@ -1577,16 +1718,19 @@
       if (pick) return { ...pick, tactical: 'block-three-threat' };
     }
 
-    // 跳三/多线局面仅凭一个成四点未必能挡住真正杀棋起点（实战中可能应
-    // 先堵另一条集结线）。把精确成四点作为强引导，但仍让阶段 3 VCT 选择
-    // 唯一安全防守；连续三连则已在上面无条件硬堵。
+    // 对手下一手能形成至少一个立即成五点时，根节点必须在这些精确启动点中
+    // 选择防守。旧版只把它缓存为启发式引导，主搜索在并发/超时时仍会覆盖，
+    // 重现“跳三已经成形却继续做棋”。候选内部再用 VCT 排除伪防守。
     if (launches.length) {
       const urgency = new Map(launches.map((p) => [p.y * SIZE + p.x, 3 + Math.min(2, p.replies)]));
-      const pick = chooseForcedDefense(board, color, launches, urgency, false);
+      const pick = chooseForcedDefense(board, color, launches, urgency, true, true);
       if (pick) {
-        setPick(pick);
-        if (!isDeep) return { ...pick, tactical: 'block-four-launch' };
+        return { ...pick, tactical: 'block-four-launch' };
       }
+      // 局部启动点在短预算内未能证明安全时，只作为强引导；复杂多线局面
+      // 仍交给阶段 3 寻找启动点之外的安静拆线防守。
+      const guided = chooseForcedDefense(board, color, launches, urgency, false);
+      if (guided) setPick(guided);
     }
 
     // 尚未形成三连的“下一手双威胁”仍交给完整搜索验证。它只是潜在杀点，
@@ -1712,7 +1856,10 @@
       if (res && res.move) {
         // v47: 透传 value/path —— dispatcher 谈合 (pickBest) 据此比较 worker
         //   间走法质量; 否则谈合协议只能拿到 workerId, 退化为确定性选 workerId=0
-        const r = { x: res.move[0], y: res.move[1], value: res.value, path: res.path };
+        const r = {
+          x: res.move[0], y: res.move[1], value: res.value, path: res.path,
+          verified: res.verified !== false,
+        };
         return useJitter ? { ...r, jitterUsed: true } : r;
       }
     } catch (e) {
@@ -1721,7 +1868,10 @@
     // v11.2: 预算耗尽(阶段超时)或搜索无果, 但已有部分搜索结果 → 用它, 而非纯启发式
     if (budget.best && budget.best.move) {
         // v47: 同上, 预算截断后用 budget.best —— 必须带 value/path
-      const r = { x: budget.best.move[0], y: budget.best.move[1], value: budget.best.value, path: budget.best.path };
+      const r = {
+        x: budget.best.move[0], y: budget.best.move[1],
+        value: budget.best.value, path: budget.best.path, verified: false,
+      };
       return useJitter ? { ...r, jitterUsed: true } : r;
     }
 
@@ -1780,6 +1930,40 @@
       const evaluator = createEvaluator(searchBoard);
       evaluator.init();
       return evaluator.pointScore(x, y, color);
+    },
+    valuableMoves(board, color, opts) {
+      const searchBoard = board.slice();
+      const evaluator = createEvaluator(searchBoard);
+      evaluator.init();
+      return getValuableMoves(
+        evaluator, searchBoard, color,
+        (opts && opts.cDepth) || 0,
+        !!(opts && opts.onlyThree),
+        !!(opts && opts.onlyFour),
+        (opts && opts.lastMove) || null,
+        0,
+      );
+    },
+    // 搜索正确性回归钩子：允许直接覆盖内部非根节点、奇数深度和终局入口。
+    searchNode(board, color, opts) {
+      const searchBoard = board.slice();
+      const evaluator = createEvaluator(searchBoard);
+      evaluator.init();
+      const cDepth = (opts && Number.isInteger(opts.cDepth)) ? opts.cDepth : 0;
+      const depth = (opts && Number.isInteger(opts.depth)) ? opts.depth : 4;
+      const path = (opts && opts.path) ? opts.path.slice() : [];
+      const budget = {
+        nodes: 0,
+        maxNodes: (opts && opts.maxNodes) || 1000000,
+        t0: performance.now(),
+        maxMs: (opts && opts.maxMs) || 2000,
+        jitterSeed: 0,
+      };
+      const [value, move, pv] = _minmax(
+        evaluator, searchBoard, color, depth, cDepth, path,
+        -MAX, MAX, budget, new Map(), (opts && opts.lastMove) || null, null,
+      );
+      return { value, move, path: pv, nodes: budget.nodes };
     },
     // v47.4: 增量一致性钩子 —— 验证增量 hash/evaluate 与全盘重算一致
     incrementalConsistency(board) {

@@ -48,6 +48,8 @@ parentPort.on('message', (msg) => {
       x: r.x, y: r.y,
       value: r.value || 0,
       path: r.path || [],
+      // 精确根规则默认可信；搜索显式标 false 表示安全验证超时。
+      verified: r.verified !== false,
       depth: r.depth || 0,
       workerId: workerData.workerId,
       ms: Date.now() - t0,

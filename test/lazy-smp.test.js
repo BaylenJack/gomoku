@@ -8,7 +8,9 @@ import * as proto from '../src/lazy-smp-protocol.cjs';
 const HINT_PATH = path.resolve('public/hint.js');
 
 function loadEngine() {
-  const src = fs.readFileSync(HINT_PATH, 'utf8');
+  // 协议/抖动测试只需要完成至少一轮搜索，不应为每个样本消耗生产 14 秒预算。
+  const src = fs.readFileSync(HINT_PATH, 'utf8')
+    .replace('const DEEP_BUDGET_MS = 14000;', 'const DEEP_BUDGET_MS = 800;');
   const sandbox = {
     module: { exports: {} }, exports: {}, console,
     performance: { now: () => Date.now() },
@@ -254,4 +256,22 @@ test('v47: applyJitter 抖动提升分散度 (KEEP=3)', () => {
   }
   // 简单局面可能所有 worker 收敛同一点 (no choice); 至少跑通不报错
   assert.ok(seen.size >= 1, `期望至少 1 种选点, 实际 ${seen.size}`);
+});
+
+test('pickBest: 同为强制失败时选择更长路径延缓败局', () => {
+  const { pickBest, FIVE } = proto;
+  const results = [
+    { x: 1, y: 1, value: -FIVE, path: [[1, 1]], workerId: 0 },
+    { x: 2, y: 2, value: -FIVE, path: [[2, 2], [3, 3], [4, 4]], workerId: 1 },
+  ];
+  assert.equal(pickBest(results).workerId, 1);
+});
+
+test('pickBest: 已完成安全验证的结果优先于超时未验证高分', () => {
+  const { pickBest } = proto;
+  const results = [
+    { x: 1, y: 1, value: 9_000_000, path: [], workerId: 0, verified: false },
+    { x: 2, y: 2, value: 1000, path: [], workerId: 1, verified: true },
+  ];
+  assert.equal(pickBest(results).workerId, 1);
 });

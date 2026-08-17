@@ -34,16 +34,24 @@ function pickBest(results) {
 }
 
 function cmpResult(a, b) {
+  // 0. 完成安全验证的结果优先。未验证通常表示阶段 3 超时，不能凭一个更高的
+  // 浅层 value 覆盖另一 worker 已确认不会被 VCT 杀的走法。
+  const aVerified = a.verified !== false;
+  const bVerified = b.verified !== false;
+  if (aVerified !== bVerified) return aVerified ? -1 : 1;
   // 1. 己方必胜 (value >= FIVE) 优先; 双方都必胜 / 都不必胜时, 进入 value 比较
   const aWin = a.value >= FIVE;
   const bWin = b.value >= FIVE;
   if (aWin !== bWin) return aWin ? -1 : 1;
   // 2. value 降序: 大 value 优先 (包括双方都输时 -50000 优于 -100000)
   if (a.value !== b.value) return b.value - a.value;
-  // 3. path 短优先: 必胜路径越短越好
+  // 3. 必胜越短越好；强制失败时相反，应尽量延长路径。
   const al = (a.path || []).length;
   const bl = (b.path || []).length;
-  if (al !== bl) return al - bl;
+  if (al !== bl) {
+    if (a.value <= -FIVE && b.value <= -FIVE) return bl - al;
+    return al - bl;
+  }
   // 4. workerId 小优先: 稳定兜底 (workerId=0 无抖动, 始终确定性)
   return a.workerId - b.workerId;
 }
