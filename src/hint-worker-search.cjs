@@ -1,62 +1,77 @@
 'use strict';
 
-// v46 Lazy SMP 单 worker 执行器 —— dispatcher (hint-worker.cjs) 启动 4 个本 worker,
-//   各加载独立 hint.js 副本但带不同 workerId + jitterSeed, 走法顺序分散 → 谈合时
-//   选全局最优。workerData 由 dispatcher 注入 (publicDir / workerId / jitterSeed),
-//   主线程 postMessage 派发 { id, board, color, deep }, worker 回 { id, x, y, value,
-//   path, depth, workerId, ms }。错误以 { id, error } 形式回传, 不抛崩 worker。
-
+// v12 深度引擎单路执行器：每个线程拥有独立 VM、置换表与搜索历史。
 const { parentPort, workerData } = require('node:worker_threads');
-const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
-const HINT_PATH = path.join(workerData.publicDir, 'hint.js');
+const ENGINE_PATH = path.join(workerData.publicDir, 'hint.js');
 
-function loadEngine() {
-  let src;
-  try { src = fs.readFileSync(HINT_PATH, 'utf8'); }
-  catch (e) { return { error: '引擎文件读取失败: ' + e.message }; }
+function compileEngine() {
+  const source = fs.readFileSync(ENGINE_PATH, 'utf8');
   const sandbox = {
-    module: { exports: {} }, exports: {}, global: {},
-    performance: { now: () => Date.now() }, console,
+    module: { exports: {} },
+    exports: {},
+    global: {},
+    console,
+    performance: { now: () => Date.now() },
   };
   sandbox.globalThis = sandbox;
-  try {
-    vm.createContext(sandbox);
-    vm.runInContext(src, sandbox, { timeout: 30000 });
-    return sandbox.module.exports;
-  } catch (e) { return { error: '引擎编译失败: ' + e.message }; }
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox, { filename: ENGINE_PATH, timeout: 30_000 });
+  if (!sandbox.module.exports || typeof sandbox.module.exports.computeBest !== 'function') {
+    throw new Error('深度引擎没有导出 computeBest');
+  }
+  return sandbox.module.exports;
 }
 
-const engine = loadEngine();
+let engine;
+let compileError = null;
+try {
+  engine = compileEngine();
+} catch (error) {
+  compileError = error;
+}
 
-parentPort.on('message', (msg) => {
-  if (engine.error) {
-    parentPort.postMessage({ id: msg.id, error: engine.error });
+parentPort.on('message', (message) => {
+  if (compileError) {
+    parentPort.postMessage({
+      id: message.id,
+      workerId: workerData.workerId,
+      error: `深度引擎编译失败: ${compileError.message}`,
+    });
     return;
   }
-  const t0 = Date.now();
+
+  const startedAt = Date.now();
   try {
-    const r = engine.computeBest(msg.board, msg.color, {
-      deep: msg.deep === true,
+    const result = engine.computeBest(message.board, message.color, {
+      deep: true,
       workerId: workerData.workerId,
       jitterSeed: workerData.jitterSeed,
     });
     parentPort.postMessage({
-      id: msg.id,
-      x: r.x, y: r.y,
-      value: r.value || 0,
-      path: r.path || [],
-      // 精确根规则默认可信；搜索显式标 false 表示安全验证超时。
-      verified: r.verified !== false,
-      depth: r.depth || 0,
-      nodes: r.nodes || 0,
-      predictedStop: !!r.predictedStop,
+      id: message.id,
       workerId: workerData.workerId,
-      ms: Date.now() - t0,
+      x: result.x,
+      y: result.y,
+      value: Number.isFinite(result.value) ? result.value : 0,
+      path: Array.isArray(result.path) ? result.path : [],
+      depth: Number.isInteger(result.depth) ? result.depth : 0,
+      nodes: Number.isFinite(result.nodes) ? result.nodes : 0,
+      verified: result.verified !== false,
+      predictedStop: !!result.predictedStop,
+      iterations: Array.isArray(result.iterations) ? result.iterations : [],
+      engine: result.engine || 'deep-v12',
+      ms: Date.now() - startedAt,
     });
-  } catch (e) {
-    parentPort.postMessage({ id: msg.id, error: '计算失败: ' + e.message });
+  } catch (error) {
+    parentPort.postMessage({
+      id: message.id,
+      workerId: workerData.workerId,
+      error: `深度搜索失败: ${error.message}`,
+      ms: Date.now() - startedAt,
+    });
   }
 });

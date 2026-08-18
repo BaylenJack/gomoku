@@ -52,10 +52,10 @@ function runDispatcher(url, message, timeoutMs = 10000) {
   });
 }
 
-test('v11.8 深度引擎三个核心文件保持逐字节不变', () => {
-  assert.equal(sha256(deepEngine), '4e52c2a4efb73db5de98c15aa50e4bd624f15ba905bf9444146950e1e1650511');
-  assert.equal(sha256(deepDispatcher), '6b0763a7a86f090782fff276d97299f6e30e4599381f5ce3e154d5395f30dd5c');
-  assert.equal(sha256(deepSearchWorker), 'e468ee982de2ef64f2ea5704a11ed964b879c1de8be71917f070feecd3039dc0');
+test('重写深度引擎时普通引擎三个核心文件保持逐字节不变', () => {
+  assert.equal(sha256(normalEngine), 'a8d8e6d9170131b23cc1cc2b0207e4fb314e9879c74eb4b35d7e11bf6e81527f');
+  assert.equal(sha256(normalDispatcher), '808e3296d25a553929b44ef82b1460e24a5bd77a5488e4abc5ee8cc4486f951b');
+  assert.equal(sha256(normalSearchWorker), '547756d500a947e0f15dbd994a5644e4f6aa8a0dc9945e4735218be2c0154d52');
 });
 
 test('普通引擎固定精确5层、500万节点和7秒计算预算', () => {

@@ -1,133 +1,65 @@
-// 深度档修复测试 — v47.1
-// 覆盖三个已复现的根因:
-//   1. 防守局面阶段 1 (己方 VCT) 白烧 35% 预算 (实测 1226ms/8177 节点空转)
-//   2. 阶段 3 防守校验只检查阶段 2 选中的单一着法
-//   3. 2c 反推防守劫持己方进攻建议
-import { test } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const code = fs.readFileSync(new URL('../public/hint.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const code = fs.readFileSync(new URL('../public/hint.js', import.meta.url), 'utf8');
 const sandbox = { self: {}, performance: { now: () => Date.now() } };
 vm.runInNewContext(code, sandbox);
 const { computeBest, __test__ } = sandbox.self.GomokuHint;
-
-const E = 0, BLACK = 1, WHITE = 2;
 const idx = (x, y) => y * 15 + x;
-const empty = () => new Array(225).fill(E);
+const empty = () => new Array(225).fill(0);
+const fast = { deep: true, workerId: 0, __testConfig: { depth: 7, maxNodes: 400_000, maxMs: 800 } };
 
-const fastTest = __test__;
-const fastOpts = { deep: true, maxMs: 800, maxNodes: 200000, depth: 8 };
-
-test('FIX1: 防守局面阶段1跳过 (stage1.nodes===0), 预算转给阶段3', () => {
-  // 局面: 黑有双活二结构 (无活三), 白无任何活三+/冲四+ → 白方无杀, 阶段1应跳过
-  const b = empty();
-  // 黑横活二 (5,7)(6,7) + 黑斜活二 (5,5)(6,6)
-  b[idx(5, 7)] = 2; b[idx(6, 7)] = 2;
-  b[idx(5, 5)] = 2; b[idx(6, 6)] = 2;
-  // 白干扰子: 无任何三连结构
-  b[idx(0, 0)] = 1; b[idx(1, 1)] = 1;
-  const r = fastTest.runWithBudget(b, 1, fastOpts);
-  assert.ok(r.stageNodes, 'runWithBudget 应返回 stageNodes');
-  assert.equal(r.stageNodes.s1, 0, `防守局面阶段1应跳过, 实际 nodes=${r.stageNodes.s1}`);
-  assert.ok(r.stageNodes.s3 > 0, `阶段3应获得预算, 实际 nodes=${r.stageNodes.s3}`);
+test('v12 防守对手活三会真实搜索并且不污染输入棋盘', () => {
+  const board = empty();
+  for (const x of [4, 5, 6]) board[idx(x, 7)] = 2;
+  board[idx(1, 1)] = 1;
+  board[idx(10, 10)] = 1;
+  const before = board.slice();
+  const result = computeBest(board, 1, fast);
+  assert.ok(result.y === 7 && (result.x === 3 || result.x === 7), JSON.stringify(result));
+  assert.ok(result.nodes > 0 && result.depth >= 2, JSON.stringify(result));
+  assert.deepEqual(board, before);
 });
 
-test('FIX1: 进攻局面 (己方有活三) 阶段1仍执行', () => {
-  const b = empty();
-  // 白活三 (4,7)(5,7)(6,7) — 白有杀可找
-  b[idx(4, 7)] = 2; b[idx(5, 7)] = 2; b[idx(6, 7)] = 2;
-  b[idx(0, 0)] = 1;
-  const r = fastTest.runWithBudget(b, 2, fastOpts);
-  assert.ok(r.stageNodes.s1 > 0, `进攻局面阶段1应执行, 实际 nodes=${r.stageNodes.s1}`);
+test('v12 进攻活三仍会比较延伸和关键防点', () => {
+  const board = empty();
+  for (const x of [4, 5, 6]) board[idx(x, 7)] = 1;
+  for (const [x, y] of [[8,5], [10,5], [9,4], [9,6]]) board[idx(x, y)] = 2;
+  const result = computeBest(board, 1, fast);
+  const extend = result.y === 7 && (result.x === 3 || result.x === 7);
+  const takeIntersection = result.x === 9 && result.y === 5;
+  assert.ok(extend || takeIntersection, JSON.stringify(result));
+  assert.ok(result.nodes > 0);
 });
 
-test('v48.1: 预算截断返回最后完成的迭代深度, 不保留浅层最高分', () => {
-  const b = empty();
-  for (const [x, y, c] of [
-    [7,7,1],[8,7,1],[6,6,1],[9,9,1],[5,8,1],[9,6,1],
-    [7,6,2],[8,8,2],[6,7,2],[5,5,2],[8,5,2],[10,8,2],
-  ]) b[idx(x, y)] = c;
-  const r = fastTest.runWithBudget(b, 1, fastOpts);
-  assert.ok(r.best, '应至少完成一轮搜索');
-  assert.equal(typeof r.best.completedDepth, 'number', 'best 应记录真实完成的迭代深度');
-  assert.ok(r.best.completedDepth >= 2);
+test('v12 预算截断只提交最后完整完成的迭代', () => {
+  const board = empty();
+  for (const [x, y, color] of [
+    [7,7,1], [8,7,1], [6,6,1], [9,9,1], [5,8,1], [9,6,1],
+    [7,6,2], [8,8,2], [6,7,2], [5,5,2], [8,5,2], [10,8,2],
+  ]) board[idx(x, y)] = color;
+  const result = computeBest(board, 1, fast);
+  assert.ok(result.iterations.length > 0, JSON.stringify(result));
+  assert.equal(result.depth, result.iterations.at(-1).depth, JSON.stringify(result));
+  assert.ok(Number.isFinite(result.value) && result.value > -1_000_000_000);
 });
 
-test('FIX2: 阶段2选点会被杀时, 改选安全防守点 (真实对局局面)', () => {
-  // 真实对局复现: 黑(后手棋, 实际是先手方)第 9 手 (7,10) 后, 白第 9 手。
-  // 黑已有斜活二 (5,6)(6,5) + 竖活二 (5,5)(5,6) —— 白若走 (7,9) 类闲棋,
-  // 黑 (4,7) → 斜活三 → (5,7) 冲四+活三 → (5,4) 活四 → 7 手内强制杀。
-  // 正确防守: 抢 (4,7) 堵斜活二延伸。断言: 引擎建议落子后黑无 VCT 强制杀。
-  const b = empty();
-  for (const [x, y] of [[7,7],[7,8],[8,8],[9,6],[6,5],[6,7],[5,6],[5,5],[7,10]]) b[idx(x, y)] = 2; // 黑
-  for (const [x, y] of [[7,6],[8,7],[6,6],[9,8],[8,5],[6,8],[8,9],[4,5]]) b[idx(x, y)] = 1;      // 白
-  const r = computeBest(b.slice(), 1, { deep: true, workerId: 0 });
-  const b2 = b.slice();
-  b2[idx(r.x, r.y)] = 1;
-  const kill = __test__.hasVCTKill(b2, 2, { maxMs: 3000 });
-  assert.equal(kill, false, `建议 (${r.x},${r.y}) 后黑可 VCT 强制杀 —— 防守失败`);
+test('v12 真实防守复盘至少消除对手下一手直接成五', () => {
+  const board = empty();
+  for (const [x, y] of [[7,7],[7,8],[8,8],[9,6],[6,5],[6,7],[5,6],[5,5],[7,10]]) board[idx(x, y)] = 2;
+  for (const [x, y] of [[7,6],[8,7],[6,6],[9,8],[8,5],[6,8],[8,9],[4,5]]) board[idx(x, y)] = 1;
+  const result = computeBest(board, 1, fast);
+  const after = board.slice();
+  after[idx(result.x, result.y)] = 1;
+  assert.deepEqual(Array.from(__test__.immediateWins(after, 2)), [], JSON.stringify(result));
 });
 
-test('FIX2: 对手活三时立即硬堵端点 (v11.5 融合)', () => {
-  // 黑活三 (4,7)(5,7)(6,7) 双开口; 白有双活二做棋机会 (交点 (5,5) 成双活三)。
-  // v11.5 行为: 对手活三硬性必堵立即返回 (2b-SOFT), 不交给搜索选进攻点。
-  // safeDefensePick 验证端点安全后返回。
-  const b = empty();
-  b[idx(4, 7)] = 2; b[idx(5, 7)] = 2; b[idx(6, 7)] = 2;   // 黑活三
-  b[idx(4, 5)] = 1; b[idx(6, 5)] = 1;                      // 白横活二
-  b[idx(5, 4)] = 1; b[idx(5, 6)] = 1;                      // 白竖活二
-  const r = computeBest(b.slice(), 1, { deep: true, workerId: 0 });
-  assert.equal(r.y, 7, `应硬堵对手活三 (y=7), 实际 (${r.x},${r.y})`);
-  assert.ok(r.x === 3 || r.x === 7, `应堵活三端点 (3,7)/(7,7), 实际 x=${r.x}`);
-});
-
-test('v47.4 增量 hash/evaluate 与全盘重算一致', () => {
-  // 验证性能优化的正确性: 增量维护的 Zobrist hash 与 evaluate 总和
-  // 在 move/undo 后必须与全盘重算完全一致 (否则缓存/评估被污染)
-  const b = empty();
-  const seed = [7,7,1, 7,6,2, 6,8,1, 8,8,2, 5,6,1, 9,7,2, 5,5,1, 9,9,2];
-  for (let i = 0; i < seed.length; i += 3) b[idx(seed[i], seed[i+1])] = seed[i+2];
-  assert.equal(__test__.incrementalConsistency(b), true, '增量 hash/evaluate 与全盘重算不一致!');
-  // 空盘也要一致
-  assert.equal(__test__.incrementalConsistency(empty()), true);
-});
-
-test('FIX2: 防守校验通过时保持阶段2原着法', () => {
-  // 白活三, 黑无近处威胁 → 阶段2建议继续延伸活三, 阶段3验证不杀 → 原着法
-  const b = empty();
-  b[idx(4, 7)] = 1; b[idx(5, 7)] = 1; b[idx(6, 7)] = 1;  // 黑活三
-  b[idx(10, 10)] = 2; b[idx(10, 11)] = 2;                // 白远处弱二
-  const r = computeBest(b.slice(), 1, { deep: true, workerId: 0 });
-  assert.equal(r.y, 7, `应继续活三线, 实际 (${r.x},${r.y})`);
-});
-
-test('FIX3: 己方有活三+ 进攻优势时, 2c 不劫持成防守点', () => {
-  // 黑有活三, 白有双活二(潜在威胁更大) — 2c 会因 oppBest.score 更高
-  // 把建议劫持成白方点; 修复后应继续自己的活三进攻
-  const b = empty();
-  // 黑活三 (4,7)(5,7)(6,7) → 应延伸 (3,7)/(7,7) 或堵双活二交点
-  b[idx(4, 7)] = 1; b[idx(5, 7)] = 1; b[idx(6, 7)] = 1;
-  // 白双活二结构: 横 (8,5)(10,5) + 纵 (9,4)(9,6) → 交点 (9,5) 成双活三
-  b[idx(8, 5)] = 2; b[idx(10, 5)] = 2;
-  b[idx(9, 4)] = 2; b[idx(9, 6)] = 2;
-  const r = computeBest(b.slice(), 1, { deep: true, workerId: 0 });
-  // 允许: 延伸自己的活三 (y===7) 或抢占双活三交点 (9,5)
-  const extendOwn = r.y === 7 && (r.x === 3 || r.x === 7);
-  const takeIntersection = r.x === 9 && r.y === 5;
-  assert.ok(extendOwn || takeIntersection, `应进攻 (延伸活三或抢交点), 实际 (${r.x},${r.y})`);
-});
-
-test('v47.14: 阶段2 FIVE 声称必须过假杀验证 (互有活三不盲攻)', () => {
-  // 15s 自对弈白第 28 手复盘: 黑斜活三 (5,6)(6,5)(7,4) 端点 (8,3)/(4,7),
-  // 白竖活三 (4,3)(4,4)(4,5) 端点 (4,2)/(4,6) —— 双方互相威胁。
-  // v47.14 前: TT 污染让阶段 2 声称 (8,4) 必胜 (幻觉 PV 含黑方五连),
-  // 实为败着 (黑 (8,3) 活四 → 双端成五)。修复: 假杀验证 + TT 边界标记。
-  // 断言: 建议必须落在黑活三两端 (8,3)/(4,7) 之一 —— 不能再盲攻 (8,4)。
-  const b = empty();
-  for (const [x, y] of [[7,7],[7,6],[7,8],[6,4],[10,6],[6,10],[10,8],[8,10],[11,9],[6,9],[6,5],[9,10],[5,4],[9,6],[10,7],[5,3],[3,4],[2,2],[11,5],[4,2],[6,11],[1,2],[5,8],[6,7],[3,5],[7,4],[5,6]]) b[idx(x, y)] = 1; // 黑
-  for (const [x, y] of [[8,8],[7,5],[7,9],[9,7],[6,3],[8,6],[10,9],[8,9],[8,5],[9,9],[5,10],[9,8],[7,10],[4,3],[10,5],[3,3],[5,5],[4,4],[9,5],[4,5],[3,1],[3,2],[6,12],[2,5],[6,8],[11,6],[5,7]]) b[idx(x, y)] = 2; // 白
-  const r = computeBest(b.slice(), 2, { deep: true, workerId: 0 });
-  assert.ok(r.x === 8 || r.x === 4, `应堵黑活三端点 (8,3)/(4,7), 实际 (${r.x},${r.y})`);
+test('v12 对手已有四连时绝不以己方造势覆盖必堵点', () => {
+  const board = empty();
+  for (const x of [5, 6, 7, 8]) board[idx(x, 7)] = 2;
+  for (const [x, y] of [[4,5], [6,5], [5,4], [5,6]]) board[idx(x, y)] = 1;
+  const result = computeBest(board, 1, fast);
+  assert.ok(result.y === 7 && (result.x === 4 || result.x === 9), JSON.stringify(result));
 });

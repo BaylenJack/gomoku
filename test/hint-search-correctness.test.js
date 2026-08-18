@@ -6,36 +6,31 @@ import vm from 'node:vm';
 const code = fs.readFileSync(new URL('../public/hint.js', import.meta.url), 'utf8');
 const sandbox = { self: {}, performance: { now: () => Date.now() } };
 vm.runInNewContext(code, sandbox);
-const hook = sandbox.self.GomokuHint.__test__;
+const { computeBest, __test__ } = sandbox.self.GomokuHint;
 const idx = (x, y) => y * 15 + x;
 const empty = () => new Array(225).fill(0);
 
-test('搜索内部奇数深度不会返回未初始化的 -MAX 哨兵', () => {
+test('奇数目标深度也会搜索合法着法，不返回未初始化哨兵', () => {
   const board = empty();
-  board[idx(7, 7)] = 1;
-  board[idx(8, 7)] = 2;
-  const path = [[7, 7], [8, 7], [7, 8], [8, 8]];
-  const result = hook.searchNode(board, 1, {
-    depth: 5, cDepth: 4, path, lastMove: [8, 8], maxMs: 1000,
+  for (const [x, y, color] of [[7,7,1], [8,7,2], [7,8,1], [8,8,2]]) board[idx(x, y)] = color;
+  const result = computeBest(board, 1, {
+    deep: true,
+    workerId: 0,
+    __testConfig: { depth: 5, maxNodes: 300_000, maxMs: 700 },
   });
-  assert.notEqual(result.value, -1_000_000_000);
-  assert.ok(result.move, '仍有合法候选时必须实际搜索一手');
-  assert.ok(result.nodes > 1, '不能在入口直接空转返回');
+  assert.ok(Number.isFinite(result.value) && result.value > -1_000_000_000, JSON.stringify(result));
+  assert.equal(board[idx(result.x, result.y)], 0);
+  assert.ok(result.nodes > 1);
 });
 
-test('搜索在已有五连的节点立即终止，不生成非法后续 PV', () => {
+test('入口拒绝在已有五连的终局继续生成非法后续着法', () => {
   const board = empty();
   for (let x = 3; x <= 7; x++) board[idx(x, 7)] = 1;
   board[idx(5, 5)] = 2;
-  const path = [[7, 7]];
-  const result = hook.searchNode(board, 2, { depth: 6, cDepth: 1, path });
-  assert.equal(result.value, -10_000_000);
-  assert.equal(result.move, null);
-  assert.deepEqual(result.path, path);
-  assert.equal(result.nodes, 1);
+  assert.throws(() => computeBest(board, 2), /棋局已结束/);
 });
 
-test('普通四威胁存在时仍保留更强的精确两手必胜候选', () => {
+test('普通四威胁存在时仍保留更强的复合必胜候选', () => {
   const board = empty();
   const stones = [
     [13,9,1],[2,3,2],[10,10,1],[1,4,2],[13,5,1],[3,6,2],
@@ -44,8 +39,8 @@ test('普通四威胁存在时仍保留更强的精确两手必胜候选', () =>
     [8,6,1],[2,6,2],[3,2,1],[2,4,2],[13,13,1],[8,2,2],[1,2,1],
   ];
   for (const [x, y, color] of stones) board[idx(x, y)] = color;
-  const forced = hook.forcedWinInTwoPoints(board, 2);
-  assert.ok(forced.some((p) => p.x === 2 && p.y === 5 && p.replies >= 2));
-  const moves = hook.valuableMoves(board, 2);
+  const shape = __test__.analyzePoint(board, 2, 5, 2);
+  assert.ok(shape.forced || shape.winCells.length >= 2, JSON.stringify(shape));
+  const moves = __test__.valuableMoves(board, 2);
   assert.ok(moves.some(([x, y]) => x === 2 && y === 5), '候选生成不得漏掉 (2,5)');
 });

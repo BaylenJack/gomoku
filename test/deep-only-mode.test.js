@@ -24,13 +24,15 @@ test('服务端忽略客户端档位并固定返回深度结果', () => {
   assert.doesNotMatch(server, /body\.deep/);
 });
 
-test('dispatcher 只保留 Lazy SMP 深度路径', () => {
-  assert.match(dispatcher, /w\.postMessage\(\{ id: msg\.id, board: msg\.board, color: msg\.color, deep: true \}\)/);
-  assert.doesNotMatch(dispatcher, /msg\.deep|loadEngine|computeBest\(msg\.board/);
+test('dispatcher 只保留 v12 四路独立深度路径', () => {
+  assert.match(dispatcher, /const NUM_WORKERS = 4;/);
+  assert.match(dispatcher, /hint-worker-search\.cjs/);
+  assert.match(dispatcher, /deep: true/);
+  assert.doesNotMatch(dispatcher, /msg\.deep|loadEngine|computeBest\(msg\.board|lazy-smp-protocol/);
 });
 
 test('深度模式固定为 10 层、3000 万节点并受 8 秒端到端窗口约束', () => {
-  assert.match(engine, /v11\.8/);
+  assert.match(engine, /v12\.0/);
   assert.match(engine, /const depth = 10;/);
   assert.match(engine, /const nodeBudget = 30000000;/);
   assert.match(engine, /const timeBudgetMs = 7000;/);
@@ -85,6 +87,39 @@ test('四路深度 dispatcher 对三连必须深搜，反击时必须证明必�
     assert.ok(blocked || provenCounterattack, `三连局面返回未经证明的走法: ${JSON.stringify(result)}`);
     assert.ok(result.nodes > 0 && result.depth >= 2, `三连局面没有进入深搜: ${JSON.stringify(result)}`);
     assert.equal(result.deep, true);
+  } finally {
+    await worker.terminate();
+  }
+});
+
+test('v12 深度引擎复杂中盘在8秒端到端窗口内返回完整四路结果', async () => {
+  const worker = new Worker(new URL('../src/hint-worker.cjs', import.meta.url), {
+    workerData: { publicDir: path.resolve('public') },
+  });
+  const board = new Array(225).fill(0);
+  const idx = (x, y) => y * 15 + x;
+  for (const [x, y, color] of [
+    [2,2,1], [12,2,1], [2,12,1], [12,12,1], [5,5,1], [9,9,1],
+    [7,2,2], [2,7,2], [12,7,2], [7,12,2], [5,9,2], [9,5,2],
+  ]) board[idx(x, y)] = color;
+  const startedAt = Date.now();
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('复杂中盘超过8秒窗口')), 8200);
+      worker.once('error', reject);
+      worker.once('message', (message) => {
+        clearTimeout(timer);
+        resolve(message);
+      });
+      worker.postMessage({ id: 'deep-v12-midgame-budget', board, color: 1 });
+    });
+    const wallMs = Date.now() - startedAt;
+    assert.ok(wallMs < 8000, `端到端耗时 ${wallMs}ms: ${JSON.stringify(result)}`);
+    assert.equal(result.engine, 'deep-v12');
+    assert.equal(result.votes, 4, JSON.stringify(result));
+    assert.equal(result.incomplete, false, JSON.stringify(result));
+    assert.ok(result.depth >= 2, JSON.stringify(result));
+    assert.equal(board[idx(result.x, result.y)], 0, JSON.stringify(result));
   } finally {
     await worker.terminate();
   }
