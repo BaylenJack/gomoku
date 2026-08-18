@@ -77,7 +77,7 @@ let winAnim = null;     // { start }
 let dpr = 1, cell = 0, pad = 0, boardPx = 0;
 
 // 提示引擎状态
-let hintOn = false;          // 深度提示开关
+let hintMode = null;         // null | 'deep' | 'normal'，两种提示互斥
 let hintMark = null;         // { x, y }  本地计算的推荐落点, 仅本地渲染
 let hintHighlightUntil = 0;  // 显示持续到某时刻(给"闪烁"留时间)
 
@@ -725,42 +725,68 @@ $('overClose').onclick = () => $('overModal').classList.add('hidden');
 $('overNew').onclick = () => { $('overModal').classList.add('hidden'); send({ type: 'new-game' }); };
 
 // ================= 特权提示(仅服务端白名单身份可见) =================
-
-// ================= 特权提示(仅服务端白名单身份可见) =================
 // 普通玩家的浏览器: 没有按钮、没有引擎、没有网络痕迹 —— 整个功能不存在。
 // 只有 joined.hint===1 时(服务端按 token 白名单判定)才动态创建一切。
 let hintEnabled = false;     // 本次会话是否有特权
 
-// 动态创建提示按钮(普通玩家永远不会执行到这里)
+const HINT_MODES = {
+  deep: {
+    buttonId: 'hintBtn', icon: '🧠', label: '深度', endpoint: '/hint', css: 'deep',
+  },
+  normal: {
+    buttonId: 'normalHintBtn', icon: '◉', label: '普通', endpoint: '/hint-normal', css: 'normal',
+  },
+};
+
+// 动态创建两个独立提示按钮。深度在左、普通在右；普通玩家永远不会执行到这里。
 function createHintButton() {
   const row = document.createElement('div');
   row.className = 'hint-row';
-  const btn = document.createElement('button');
-  btn.id = 'hintBtn';
-  btn.className = 'btn-hint';
-  btn.textContent = '🧠 深度提示';
-  btn.title = '单击开启或关闭深度提示';
-  btn.addEventListener('click', () => {
-    if (hintOn) {
-      resetHint();
-      draw();
-      return;
-    }
-    hintOn = true;
-    btn.classList.add('active', 'deep', 'calculating');
-    btn.textContent = '🧠 深度计算中…';
-    showHint();
-  });
-  row.appendChild(btn);
+  for (const mode of ['deep', 'normal']) {
+    const cfg = HINT_MODES[mode];
+    const btn = document.createElement('button');
+    btn.id = cfg.buttonId;
+    btn.className = `btn-hint ${cfg.css}`;
+    btn.textContent = `${cfg.icon} ${cfg.label}提示`;
+    btn.title = `单击开启或关闭${cfg.label}提示`;
+    btn.addEventListener('click', () => toggleHintMode(mode));
+    row.appendChild(btn);
+  }
   document.querySelector('.toolbar').after(row);
-  return btn;
+  return row;
 }
 
-let hintRequestSeq = 0;     // 只允许最新棋盘的提示结果落到 UI
-let hintAbort = null;       // 新棋局状态到达时取消旧 HTTP 响应
-// 唯一提示档位: 服务端 8 秒深度搜索。失败时不降级成普通档。
-function computeHintAsync(board, color, controller) {
+// 两个模式各自维护序号和 AbortController；切换模式时双方都失效，杜绝串结果。
+const hintRequestSeq = { deep: 0, normal: 0 };
+const hintAbort = { deep: null, normal: null };
+
+function setHintButton(mode, state) {
+  const cfg = HINT_MODES[mode];
+  const btn = document.getElementById(cfg.buttonId);
+  if (!btn) return;
+  btn.classList.toggle('active', state !== 'off');
+  btn.classList.toggle('calculating', state === 'calculating');
+  if (state === 'calculating') btn.textContent = `${cfg.icon} ${cfg.label}计算中…`;
+  else if (state === 'on') btn.textContent = `${cfg.icon} ${cfg.label} 开`;
+  else btn.textContent = `${cfg.icon} ${cfg.label}提示`;
+}
+
+function toggleHintMode(mode) {
+  if (hintMode === mode) {
+    resetHint();
+    draw();
+    return;
+  }
+  resetHint();
+  hintMode = mode;
+  setHintButton(mode, 'calculating');
+  showHint(mode);
+}
+
+// 两个接口都受同一个 8 秒用户等待上限约束，但后端引擎池完全独立。
+function computeHintAsync(board, color, controller, mode) {
   const timeoutMs = 8000;
+  const cfg = HINT_MODES[mode];
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
@@ -769,7 +795,7 @@ function computeHintAsync(board, color, controller) {
     }, timeoutMs);
   });
   return Promise.race([
-    fetch('/hint', {
+    fetch(cfg.endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ board, color, token: TOKEN }),
@@ -789,72 +815,59 @@ function computeHintAsync(board, color, controller) {
 
 // 重置提示状态(落子/新对局/胜负/关闭时调用)
 function resetHint() {
-  hintRequestSeq++;
-  if (hintAbort) hintAbort.abort();
-  hintAbort = null;
+  for (const mode of ['deep', 'normal']) {
+    hintRequestSeq[mode]++;
+    if (hintAbort[mode]) hintAbort[mode].abort();
+    hintAbort[mode] = null;
+    setHintButton(mode, 'off');
+  }
   hintMark = null;
   hintHighlightUntil = 0;
-  hintOn = false;
-  const btn = document.getElementById('hintBtn');
-  if (btn) {
-    btn.classList.remove('active', 'deep', 'calculating');
-    btn.textContent = '🧠 深度提示';
-  }
+  hintMode = null;
 }
 
-// 显示深度提示
-async function showHint() {
+// 显示当前模式提示。模式、棋盘或回合任一变化，旧结果都不能写回 UI。
+async function showHint(mode = hintMode) {
   if (!hintEnabled) return;
+  if (!HINT_MODES[mode] || hintMode !== mode) return;
   if (!state || state.status !== 'playing') {
     toast('对局未开始'); return;
   }
-  const requestSeq = ++hintRequestSeq;
-  if (hintAbort) hintAbort.abort();
+  const cfg = HINT_MODES[mode];
+  const requestSeq = ++hintRequestSeq[mode];
+  if (hintAbort[mode]) hintAbort[mode].abort();
   const controller = new AbortController();
-  hintAbort = controller;
+  hintAbort[mode] = controller;
   const boardSnapshot = state.board.slice();
   const colorSnapshot = state.turn;
   try {
-    const { x, y } = await computeHintAsync(boardSnapshot, colorSnapshot, controller);
+    const { x, y } = await computeHintAsync(boardSnapshot, colorSnapshot, controller, mode);
     // 搜索期间棋盘可能已经变化。旧结果即使落点现在仍为空，也绝不能覆盖
     // 新棋盘提示；否则就会出现“对方四连了还显示上一回合进攻点”。
-    if (requestSeq !== hintRequestSeq || !state || state.turn !== colorSnapshot ||
+    if (hintMode !== mode || requestSeq !== hintRequestSeq[mode] || !state || state.turn !== colorSnapshot ||
         state.board.length !== boardSnapshot.length ||
         state.board.some((v, i) => v !== boardSnapshot[i])) return;
     if (state.board[y * SIZE + x] !== EMPTY) { toast('提示暂不可用'); return; }
     hintMark = { x, y };
     hintHighlightUntil = Infinity;
-    const btn = document.getElementById('hintBtn');
-    if (btn) {
-      btn.classList.remove('calculating');
-      btn.classList.add('active', 'deep');
-      btn.textContent = '🧠 深度 开';
-    }
-    toast(`🧠 深度建议 (${x + 1}, ${y + 1})`, 2500);
+    setHintButton(mode, 'on');
+    toast(`${cfg.icon} ${cfg.label}建议 (${x + 1}, ${y + 1})`, 2500);
     draw();
     loop();
   } catch (e) {
-    if (requestSeq !== hintRequestSeq || (e && e.name === 'AbortError')) return;
-    const btn = document.getElementById('hintBtn');
-    if (btn) {
-      btn.classList.remove('calculating');
-      btn.textContent = '🧠 深度 开';
-    }
-    toast('提示引擎不可用');
+    if (hintMode !== mode || requestSeq !== hintRequestSeq[mode] || (e && e.name === 'AbortError')) return;
+    setHintButton(mode, 'on');
+    toast(`${cfg.label}提示引擎不可用`);
   } finally {
-    if (requestSeq === hintRequestSeq) hintAbort = null;
+    if (requestSeq === hintRequestSeq[mode]) hintAbort[mode] = null;
   }
 }
 
 // 每次 state 更新后, 若提示开着则自动刷新
 function autoRefreshHint() {
-  if (!hintEnabled || !hintOn || !state || state.status !== 'playing') return;
-  const btn = document.getElementById('hintBtn');
-  if (btn) {
-    btn.classList.add('calculating');
-    btn.textContent = '🧠 深度计算中…';
-  }
-  showHint();
+  if (!hintEnabled || !hintMode || !state || state.status !== 'playing') return;
+  setHintButton(hintMode, 'calculating');
+  showHint(hintMode);
 }
 
 // ================= 表情 =================

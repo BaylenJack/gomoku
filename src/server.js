@@ -163,6 +163,57 @@ function requestHint(board, color) {
   });
 }
 
+// ---------- 普通提示：与深度提示完全独立的 dispatcher / search-worker 池 ----------
+// 两个普通 dispatcher 可并发服务两个请求；每个请求内部仍用四路根节点分流。
+// 独立进程边界保证普通引擎的 VM、置换表、杀手表和故障恢复都不会进入深度池。
+const NORMAL_HINT_WORKER_COUNT = 2;
+const normalHintWorkers = [];
+
+function spawnNormalHintWorker() {
+  const worker = new Worker(new URL('./hint-normal-worker.cjs', import.meta.url), {
+    workerData: { publicDir: PUBLIC_DIR },
+  });
+  const entry = { worker, busy: false, current: null };
+  worker.on('message', (m) => {
+    const q = entry.current;
+    entry.current = null;
+    entry.busy = false;
+    if (q) q.resolve(m);
+  });
+  worker.on('error', (e) => respawnNormalHintWorker(entry, `错误: ${e.message}`));
+  worker.on('exit', (code) => respawnNormalHintWorker(entry, code === 0 ? '正常退出' : `异常退出 code=${code}`));
+  return entry;
+}
+
+function respawnNormalHintWorker(entry, reason) {
+  console.error(`[hint-normal] worker ${reason}: 重建中`);
+  if (entry.current) entry.current.reject(new Error('普通引擎不可用'));
+  entry.current = null;
+  const i = normalHintWorkers.indexOf(entry);
+  if (i < 0) return;
+  normalHintWorkers.splice(i, 1);
+  normalHintWorkers.push(spawnNormalHintWorker());
+}
+
+for (let i = 0; i < NORMAL_HINT_WORKER_COUNT; i++) normalHintWorkers.push(spawnNormalHintWorker());
+
+function requestNormalHint(board, color) {
+  return new Promise((resolve, reject) => {
+    const entry = normalHintWorkers.find((w) => !w.busy);
+    if (!entry) return reject(new Error('普通引擎忙, 请稍后再试'));
+    const id = Math.random().toString(36).slice(2);
+    entry.busy = true;
+    entry.current = { id, resolve, reject };
+    try {
+      entry.worker.postMessage({ id, board, color });
+    } catch (e) {
+      entry.busy = false;
+      entry.current = null;
+      reject(e);
+    }
+  });
+}
+
 // 棋面签名: 子数 + 散列 —— 日志里能认出是哪盘棋, 又不刷满 225 个数字
 function hintBoardSig(board) {
   let n = 0, h = 0;
@@ -172,7 +223,9 @@ function hintBoardSig(board) {
   return `${n}子/${h.toString(16)}`;
 }
 
-function handleHint(req, res) {
+function handleHint(req, res, engineRequest = requestHint, mode = 'deep') {
+  const logTag = mode === 'normal' ? 'hint-normal' : 'hint';
+  const modeLabel = mode === 'normal' ? '普通' : '深度';
   // 只接受小体积 JSON (225 数字)
   const chunks = [];
   let size = 0;
@@ -192,25 +245,25 @@ function handleHint(req, res) {
       // 特权校验: 只有白名单 token 能调用服务器 AI
       if (!PRIVILEGED_TOKENS.has(token)) {
         // v11.2: /hint 请求日志 —— 之前完全无日志, 问题再发生无从追溯
-        console.log(`[hint] 拒绝: token=${token.slice(0, 8)}… 不在白名单`);
+        console.log(`[${logTag}] 拒绝: token=${token.slice(0, 8)}… 不在白名单`);
         res.writeHead(403, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: '无权限' }));
       }
       const board = Array.isArray(body.board) ? body.board : null;
       const color = body.color === 1 || body.color === 2 ? body.color : 0;
       if (!board || board.length !== 225 || color === 0) {
-        console.log(`[hint] 参数不合法: board=${Array.isArray(board) ? board.length + '格' : typeof board} color=${color}`);
+        console.log(`[${logTag}] 参数不合法: board=${Array.isArray(board) ? board.length + '格' : typeof board} color=${color}`);
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: '参数不合法' }));
       }
       const sig = hintBoardSig(board);
       // v11.2: /hint 请求日志 —— 之前完全无日志, 问题再发生无从追溯
-      console.log(`[hint] 深度请求: token=${token.slice(0, 8)}… color=${color} ${sig}`);
+      console.log(`[${logTag}] ${modeLabel}请求: token=${token.slice(0, 8)}… color=${color} ${sig}`);
       const t0 = Date.now();
-      requestHint(board, color)
+      engineRequest(board, color)
         .then((r) => {
           const ms = Date.now() - t0;
-          console.log(`[hint] 深度完成: ${sig} ms=${ms} → ${
+          console.log(`[${logTag}] ${modeLabel}完成: ${sig} ms=${ms} → ${
             r.error ? '错误: ' + r.error : `(${r.x},${r.y})`}`);
           if (r.error) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -218,7 +271,9 @@ function handleHint(req, res) {
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           // 把 votes / incomplete 透传给前端；部分 worker 超时时仍可使用谈合结果。
-          const payload = { ok: true, x: r.x, y: r.y, ms, deep: true };
+          const payload = { ok: true, x: r.x, y: r.y, ms };
+          if (mode === 'deep') payload.deep = true;
+          else payload.normal = true;
           if (r.votes !== undefined) payload.votes = r.votes;
           if (r.incomplete !== undefined) payload.incomplete = r.incomplete;
           if (r.depth !== undefined) payload.depth = r.depth;
@@ -229,7 +284,7 @@ function handleHint(req, res) {
           res.end(JSON.stringify(payload));
         })
         .catch((e) => {
-          console.log(`[hint] 深度失败: ${sig} 错误: ${e.message}`);
+          console.log(`[${logTag}] ${modeLabel}失败: ${sig} 错误: ${e.message}`);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: '计算失败: ' + e.message }));
         });
@@ -257,6 +312,12 @@ const server = http.createServer((req, res) => {
     // 特权 token 校验 → 8 秒深度搜索 → 返回 { x, y, ms, deep: true }
     if (pathname === '/hint' && req.method === 'POST') {
       handleHint(req, res);
+      return;
+    }
+
+    // 普通提示使用独立引擎文件、独立 dispatcher 和独立 search-worker 池。
+    if (pathname === '/hint-normal' && req.method === 'POST') {
+      handleHint(req, res, requestNormalHint, 'normal');
       return;
     }
 

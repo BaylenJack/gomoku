@@ -9,11 +9,13 @@ const server = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'ut
 const dispatcher = fs.readFileSync(new URL('../src/hint-worker.cjs', import.meta.url), 'utf8');
 const engine = fs.readFileSync(new URL('../public/hint.js', import.meta.url), 'utf8');
 
-test('提示按钮单击直接启动唯一的深度模式', () => {
+test('深度按钮仍由单击直接启动，普通按钮是独立入口', () => {
   assert.match(app, /btn\.addEventListener\('click'/);
   assert.match(app, /JSON\.stringify\(\{ board, color, token: TOKEN \}\)/);
   assert.doesNotMatch(app, /pointerdown|pointerup|longPressFired|hintDeep/);
-  assert.doesNotMatch(app, /普通提示|🤖 普通|computeHintLocal|hintWorker/);
+  assert.match(app, /buttonId: 'hintBtn'.*endpoint: '\/hint'/);
+  assert.match(app, /buttonId: 'normalHintBtn'.*endpoint: '\/hint-normal'/);
+  assert.doesNotMatch(app, /computeHintLocal|hintWorker/);
 });
 
 test('服务端忽略客户端档位并固定返回深度结果', () => {
