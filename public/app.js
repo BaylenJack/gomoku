@@ -729,6 +729,7 @@ $('overNew').onclick = () => { $('overModal').classList.add('hidden'); send({ ty
 // 只有 joined.hint===1 时(服务端按 token 白名单判定)才动态创建一切。
 let hintEnabled = false;     // 本次会话是否有特权
 let hintUiHidden = false;    // 提示按钮整套是否被隐藏(折叠态)
+let hintUiLastToggle = 0;    // 上次切换时间, 用于忽略快速连点
 
 const HINT_MODES = {
   ultra: {
@@ -769,6 +770,9 @@ function createHintButton() {
 
 // 隐藏/显示整套提示按钮。隐藏时三模式按钮与本按钮都隐形，但本按钮原位保持可点击，用于恢复。
 function toggleHintVisibility() {
+  const now = Date.now();
+  if (now - hintUiLastToggle < 300) return;   // 忽略 300ms 内的连点, 避免双击来回切换
+  hintUiLastToggle = now;
   const row = document.querySelector('.hint-row');
   if (!row) return;
   hintUiHidden = !hintUiHidden;
