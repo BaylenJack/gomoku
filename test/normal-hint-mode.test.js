@@ -68,7 +68,7 @@ test('普通引擎固定精确5层、500万节点和7秒计算预算', () => {
   assert.match(app, /const timeoutMs = 8000;/);
 });
 
-test('普通与深度引擎拥有独立文件、Worker池、接口和请求状态', () => {
+test('普通与深度引擎在新增第三档后仍拥有独立文件、Worker池、接口和请求状态', () => {
   assert.match(normalDispatcher, /hint-normal-worker-search\.cjs/);
   assert.match(normalSearchWorker, /hint-normal\.js/);
   assert.match(deepDispatcher, /hint-worker-search\.cjs/);
@@ -77,12 +77,13 @@ test('普通与深度引擎拥有独立文件、Worker池、接口和请求状�
   assert.match(server, /const normalHintWorkers = \[\]/);
   assert.match(server, /new URL\('\.\/hint-normal-worker\.cjs'/);
   assert.match(server, /pathname === '\/hint-normal'/);
-  assert.match(app, /const hintRequestSeq = \{ deep: 0, normal: 0 \}/);
-  assert.match(app, /const hintAbort = \{ deep: null, normal: null \}/);
+  assert.match(app, /const hintRequestSeq = \{ ultra: 0, deep: 0, normal: 0 \}/);
+  assert.match(app, /const hintAbort = \{ ultra: null, deep: null, normal: null \}/);
 });
 
-test('普通按钮在深度按钮右侧且两个模式互斥', () => {
-  assert.match(app, /for \(const mode of \['deep', 'normal'\]\)/);
+test('三个按钮顺序明确且三种模式互斥', () => {
+  assert.match(app, /for \(const mode of \['ultra', 'deep', 'normal'\]\)/);
+  assert.match(app, /buttonId: 'ultraHintBtn'.*endpoint: '\/hint-ultra'/);
   assert.match(app, /buttonId: 'hintBtn'.*endpoint: '\/hint'/);
   assert.match(app, /buttonId: 'normalHintBtn'.*endpoint: '\/hint-normal'/);
   assert.match(app, /if \(hintMode === mode\)[\s\S]*resetHint\(\)/);

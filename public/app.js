@@ -77,7 +77,7 @@ let winAnim = null;     // { start }
 let dpr = 1, cell = 0, pad = 0, boardPx = 0;
 
 // 提示引擎状态
-let hintMode = null;         // null | 'deep' | 'normal'，两种提示互斥
+let hintMode = null;         // null | 'ultra' | 'deep' | 'normal'，三种提示互斥
 let hintMark = null;         // { x, y }  本地计算的推荐落点, 仅本地渲染
 let hintHighlightUntil = 0;  // 显示持续到某时刻(给"闪烁"留时间)
 
@@ -730,6 +730,9 @@ $('overNew').onclick = () => { $('overModal').classList.add('hidden'); send({ ty
 let hintEnabled = false;     // 本次会话是否有特权
 
 const HINT_MODES = {
+  ultra: {
+    buttonId: 'ultraHintBtn', icon: '◇', label: '超深度', endpoint: '/hint-ultra', css: 'ultra',
+  },
   deep: {
     buttonId: 'hintBtn', icon: '🧠', label: '深度', endpoint: '/hint', css: 'deep',
   },
@@ -738,11 +741,11 @@ const HINT_MODES = {
   },
 };
 
-// 动态创建两个独立提示按钮。深度在左、普通在右；普通玩家永远不会执行到这里。
+// 动态创建三个独立提示按钮；普通玩家永远不会执行到这里。
 function createHintButton() {
   const row = document.createElement('div');
   row.className = 'hint-row';
-  for (const mode of ['deep', 'normal']) {
+  for (const mode of ['ultra', 'deep', 'normal']) {
     const cfg = HINT_MODES[mode];
     const btn = document.createElement('button');
     btn.id = cfg.buttonId;
@@ -756,9 +759,9 @@ function createHintButton() {
   return row;
 }
 
-// 两个模式各自维护序号和 AbortController；切换模式时双方都失效，杜绝串结果。
-const hintRequestSeq = { deep: 0, normal: 0 };
-const hintAbort = { deep: null, normal: null };
+// 三个模式各自维护序号和 AbortController；切换模式时全部失效，杜绝串结果。
+const hintRequestSeq = { ultra: 0, deep: 0, normal: 0 };
+const hintAbort = { ultra: null, deep: null, normal: null };
 
 function setHintButton(mode, state) {
   const cfg = HINT_MODES[mode];
@@ -783,7 +786,7 @@ function toggleHintMode(mode) {
   showHint(mode);
 }
 
-// 两个接口都受同一个 8 秒用户等待上限约束，但后端引擎池完全独立。
+// 三个接口都受同一个 8 秒用户等待上限约束，但后端引擎池完全独立。
 function computeHintAsync(board, color, controller, mode) {
   const timeoutMs = 8000;
   const cfg = HINT_MODES[mode];
@@ -815,7 +818,7 @@ function computeHintAsync(board, color, controller, mode) {
 
 // 重置提示状态(落子/新对局/胜负/关闭时调用)
 function resetHint() {
-  for (const mode of ['deep', 'normal']) {
+  for (const mode of ['ultra', 'deep', 'normal']) {
     hintRequestSeq[mode]++;
     if (hintAbort[mode]) hintAbort[mode].abort();
     hintAbort[mode] = null;

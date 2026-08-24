@@ -105,7 +105,7 @@ const MIME = {
 
 // ---------- 服务器端 AI 提示引擎 ----------
 // 用 worker_threads 跑引擎(独立线程), 主进程事件循环不被阻塞。
-// 只保留 8 秒深度档，所有提示请求统一走 Lazy SMP。
+// 三种 8 秒档位各自使用独立的核心、dispatcher 和内部搜索 Worker。
 // 特权 token 才允许调用(沿用 HINT_TOKEN / claim 兑换机制)。
 
 import { Worker } from 'node:worker_threads';
@@ -214,6 +214,55 @@ function requestNormalHint(board, color) {
   });
 }
 
+// ---------- 超深度提示：根分片并行，与现有两套引擎完全隔离 ----------
+const ULTRA_HINT_WORKER_COUNT = 2;
+const ultraHintWorkers = [];
+
+function spawnUltraHintWorker() {
+  const worker = new Worker(new URL('./hint-ultra-worker.cjs', import.meta.url), {
+    workerData: { publicDir: PUBLIC_DIR },
+  });
+  const entry = { worker, busy: false, current: null };
+  worker.on('message', (message) => {
+    const request = entry.current;
+    entry.current = null;
+    entry.busy = false;
+    if (request) request.resolve(message);
+  });
+  worker.on('error', (error) => respawnUltraHintWorker(entry, `错误: ${error.message}`));
+  worker.on('exit', (code) => respawnUltraHintWorker(entry, code === 0 ? '正常退出' : `异常退出 code=${code}`));
+  return entry;
+}
+
+function respawnUltraHintWorker(entry, reason) {
+  console.error(`[hint-ultra] worker ${reason}: 重建中`);
+  if (entry.current) entry.current.reject(new Error('超深度引擎不可用'));
+  entry.current = null;
+  const index = ultraHintWorkers.indexOf(entry);
+  if (index < 0) return;
+  ultraHintWorkers.splice(index, 1);
+  ultraHintWorkers.push(spawnUltraHintWorker());
+}
+
+for (let i = 0; i < ULTRA_HINT_WORKER_COUNT; i++) ultraHintWorkers.push(spawnUltraHintWorker());
+
+function requestUltraHint(board, color) {
+  return new Promise((resolve, reject) => {
+    const entry = ultraHintWorkers.find((worker) => !worker.busy);
+    if (!entry) return reject(new Error('超深度引擎忙, 请稍后再试'));
+    const id = Math.random().toString(36).slice(2);
+    entry.busy = true;
+    entry.current = { id, resolve, reject };
+    try {
+      entry.worker.postMessage({ id, board, color });
+    } catch (error) {
+      entry.busy = false;
+      entry.current = null;
+      reject(error);
+    }
+  });
+}
+
 // 棋面签名: 子数 + 散列 —— 日志里能认出是哪盘棋, 又不刷满 225 个数字
 function hintBoardSig(board) {
   let n = 0, h = 0;
@@ -224,8 +273,8 @@ function hintBoardSig(board) {
 }
 
 function handleHint(req, res, engineRequest = requestHint, mode = 'deep') {
-  const logTag = mode === 'normal' ? 'hint-normal' : 'hint';
-  const modeLabel = mode === 'normal' ? '普通' : '深度';
+  const logTag = mode === 'normal' ? 'hint-normal' : mode === 'ultra' ? 'hint-ultra' : 'hint';
+  const modeLabel = mode === 'normal' ? '普通' : mode === 'ultra' ? '超深度' : '深度';
   // 只接受小体积 JSON (225 数字)
   const chunks = [];
   let size = 0;
@@ -273,7 +322,8 @@ function handleHint(req, res, engineRequest = requestHint, mode = 'deep') {
           // 把 votes / incomplete 透传给前端；部分 worker 超时时仍可使用谈合结果。
           const payload = { ok: true, x: r.x, y: r.y, ms };
           if (mode === 'deep') payload.deep = true;
-          else payload.normal = true;
+          else if (mode === 'normal') payload.normal = true;
+          else payload.ultra = true;
           if (r.votes !== undefined) payload.votes = r.votes;
           if (r.incomplete !== undefined) payload.incomplete = r.incomplete;
           if (r.depth !== undefined) payload.depth = r.depth;
@@ -318,6 +368,12 @@ const server = http.createServer((req, res) => {
     // 普通提示使用独立引擎文件、独立 dispatcher 和独立 search-worker 池。
     if (pathname === '/hint-normal' && req.method === 'POST') {
       handleHint(req, res, requestNormalHint, 'normal');
+      return;
+    }
+
+    // 超深度提示拥有独立核心、根分片 Worker 池和请求状态。
+    if (pathname === '/hint-ultra' && req.method === 'POST') {
+      handleHint(req, res, requestUltraHint, 'ultra');
       return;
     }
 
