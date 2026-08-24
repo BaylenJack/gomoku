@@ -303,6 +303,25 @@ body { display: flex; flex-direction: column; align-items: center;
 .emoji-bar { display: flex; justify-content: center; gap: 6px; }
 
 .hint-row { display: flex; justify-content: center; gap: 8px; margin-top: -2px; flex-wrap: wrap; }
+
+/* 隐藏按钮: 与控制柄, 展开态可见, 折叠态隐形但原位可点击 */
+.hint-toggle {
+  padding: 6px 12px; font-size: 12px;
+  color: #6b5d4d; letter-spacing: 1px;
+  background: transparent;
+  border: 1px dashed rgba(216, 166, 87, .14);
+  border-radius: 8px; cursor: pointer;
+  transition: color .2s, border-color .2s, opacity .2s;
+  font-family: inherit;
+}
+.hint-toggle:hover { color: var(--gold); border-color: rgba(216,166,87,.4); }
+.hint-toggle:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+
+/* 折叠态: 三模式按钮不可见不可点(保留占位); 隐藏按钮不可见但保留可点击, 供原位恢复 */
+.hint-row.collapsed .btn-hint { opacity: 0; pointer-events: none; transition: opacity .2s; }
+.hint-row.collapsed .hint-toggle { opacity: 0; cursor: pointer; }
+.hint-row.collapsed .hint-toggle:focus-visible { outline: none; }
+
 .btn-hint {
   padding: 6px 14px; font-size: 12px;
   color: #8b7a68; letter-spacing: 1px;

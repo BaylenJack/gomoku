@@ -728,6 +728,7 @@ $('overNew').onclick = () => { $('overModal').classList.add('hidden'); send({ ty
 // 普通玩家的浏览器: 没有按钮、没有引擎、没有网络痕迹 —— 整个功能不存在。
 // 只有 joined.hint===1 时(服务端按 token 白名单判定)才动态创建一切。
 let hintEnabled = false;     // 本次会话是否有特权
+let hintUiHidden = false;    // 提示按钮整套是否被隐藏(折叠态)
 
 const HINT_MODES = {
   ultra: {
@@ -755,8 +756,27 @@ function createHintButton() {
     btn.addEventListener('click', () => toggleHintMode(mode));
     row.appendChild(btn);
   }
+  const toggle = document.createElement('button');
+  toggle.className = 'hint-toggle';
+  toggle.id = 'hintToggleBtn';
+  toggle.textContent = '▾ 隐藏';
+  toggle.title = '隐藏/显示提示引擎';
+  toggle.addEventListener('click', toggleHintVisibility);
+  row.appendChild(toggle);
   document.querySelector('.toolbar').after(row);
   return row;
+}
+
+// 隐藏/显示整套提示按钮。隐藏时三模式按钮与本按钮都隐形，但本按钮原位保持可点击，用于恢复。
+function toggleHintVisibility() {
+  const row = document.querySelector('.hint-row');
+  if (!row) return;
+  hintUiHidden = !hintUiHidden;
+  row.classList.toggle('collapsed', hintUiHidden);
+  if (hintUiHidden) {
+    resetHint();   // 关闭当前模式并把 hintMark/hintHighlightUntil 清空
+    draw();        // 让棋盘高亮消失
+  }
 }
 
 // 三个模式各自维护序号和 AbortController；切换模式时全部失效，杜绝串结果。
