@@ -80,6 +80,7 @@ let dpr = 1, cell = 0, pad = 0, boardPx = 0;
 let hintMode = null;         // null | 'ultra' | 'deep' | 'normal'，三种提示互斥
 let hintMark = null;         // { x, y }  本地计算的推荐落点, 仅本地渲染
 let hintHighlightUntil = 0;  // 显示持续到某时刻(给"闪烁"留时间)
+let autoPlay = false;        // 自动落子: 开启后每回合由 AI 替你落子, 不弹提示圈
 
 // 计时
 let timerDeadline = null;
@@ -301,8 +302,8 @@ function draw() {
     g.globalAlpha = 1;
   }
 
-  // 提示标记(纯本地, 淡黄圆环 + 中心点, 缓缓呼吸)
-  if (hintMark && performance.now() < hintHighlightUntil && state.status === 'playing') {
+  // 提示标记(纯本地, 淡黄圆环 + 中心点, 缓缓呼吸) —— 自动落子时不显示建议圈
+  if (hintMark && !autoPlay && performance.now() < hintHighlightUntil && state.status === 'playing') {
     const cx = gx(hintMark.x), cy = gy(hintMark.y);
     const pulse = 0.6 + Math.sin(now / 320) * 0.25;
     g.save();
@@ -542,6 +543,8 @@ function handle(m) {
         hintEnabled = true;
         createHintButton();
       }
+      // 进房时若自动落子已开且正轮到我, 立即接手
+      if (autoPlay) autoPlayMove();
       render();
       break;
 
@@ -580,6 +583,8 @@ function handle(m) {
         // 胜负已分, 提示清除
         resetHint();
       }
+      // 每次状态更新后: 若自动落子开着且正轮到我(开局/悔棋/断线重连都会走到这), 立即接手
+      if (autoPlay) autoPlayMove();
       resetTurnTimer();
       render();
       loop();
@@ -765,6 +770,18 @@ function createHintButton() {
   toggle.addEventListener('click', toggleHintVisibility);
   row.appendChild(toggle);
   document.querySelector('.toolbar').after(row);
+
+  // 自动落子: 单独分开的独立按钮, 不随提示栏折叠, 开启后 AI 静默落子。
+  const autoRow = document.createElement('div');
+  autoRow.className = 'auto-row';
+  const autoBtn = document.createElement('button');
+  autoBtn.id = 'autoPlayBtn';
+  autoBtn.className = 'btn-auto';
+  autoBtn.textContent = '🤖 自动落子';
+  autoBtn.title = '开启后每回合由 AI 自动替你落子，不显示提示圈';
+  autoBtn.addEventListener('click', toggleAutoPlay);
+  autoRow.appendChild(autoBtn);
+  row.after(autoRow);
   return row;
 }
 
@@ -777,6 +794,9 @@ function toggleHintVisibility() {
   if (!row) return;
   hintUiHidden = !hintUiHidden;
   row.classList.toggle('collapsed', hintUiHidden);
+  // 自动落子按钮与提示栏一起隐藏/恢复(不影响 autoPlay 状态)
+  const autoRow = document.querySelector('.auto-row');
+  if (autoRow) autoRow.classList.toggle('collapsed', hintUiHidden);
   if (hintUiHidden) {
     resetHint();   // 关闭当前模式并把 hintMark/hintHighlightUntil 清空
     draw();        // 让棋盘高亮消失
@@ -799,13 +819,19 @@ function setHintButton(mode, state) {
 }
 
 function toggleHintMode(mode) {
-  if (hintMode === mode) {
+  if (hintMode === mode && !autoPlay) {
     resetHint();
     draw();
     return;
   }
   resetHint();
   hintMode = mode;
+  if (autoPlay) {
+    // 自动落子时, 点模式按钮只用来选引擎, 不显示提示圈
+    setHintButton(mode, 'off');
+    autoPlayMove();
+    return;
+  }
   setHintButton(mode, 'calculating');
   showHint(mode);
 }
@@ -875,6 +901,11 @@ async function showHint(mode = hintMode) {
         state.board.length !== boardSnapshot.length ||
         state.board.some((v, i) => v !== boardSnapshot[i])) return;
     if (state.board[y * SIZE + x] !== EMPTY) { toast('提示暂不可用'); return; }
+    // 自动落子开启时: 直接把这一手发出去, 不显示建议圈也不弹提示
+    if (autoPlay && state.turn === myColor) {
+      send({ type: 'move', x, y });
+      return;
+    }
     hintMark = { x, y };
     hintHighlightUntil = Infinity;
     setHintButton(mode, 'on');
@@ -890,9 +921,58 @@ async function showHint(mode = hintMode) {
   }
 }
 
-// 每次 state 更新后, 若提示开着则自动刷新
+// ============ 自动落子(独立按钮) ============
+// 复用提示引擎算落点, 但结果不外显 —— 静默发送 move, 由服务端权威落子。
+const AUTO_DEFAULT_MODE = 'deep'; // 未选提示模式时, 自动落子默认用深度引擎
+
+function updateAutoPlayBtn() {
+  const btn = document.getElementById('autoPlayBtn');
+  if (!btn) return;
+  btn.classList.toggle('active', autoPlay);
+  btn.textContent = autoPlay ? '🤖 自动落子·开' : '🤖 自动落子';
+  btn.title = autoPlay ? '点击关闭自动落子' : '开启后每回合由 AI 自动替你落子，不显示提示圈';
+}
+
+function toggleAutoPlay() {
+  autoPlay = !autoPlay;
+  updateAutoPlayBtn();
+  // 自动落子不显示建议圈: 清掉手动提示, 并中止在途请求, 避免旧结果闪现
+  resetHint();
+  draw();
+  if (autoPlay) autoPlayMove();
+}
+
+// 自动落子: 用提示引擎算出落点后静默发 move, 不显示建议圈/不弹提示。
+async function autoPlayMove() {
+  if (!autoPlay || !hintEnabled || !state) return;
+  if (myColor == null || state.status !== 'playing' || state.turn !== myColor) return;
+  const mode = hintMode || AUTO_DEFAULT_MODE;
+  const seq = ++hintRequestSeq[mode];
+  if (hintAbort[mode]) hintAbort[mode].abort();
+  const controller = new AbortController();
+  hintAbort[mode] = controller;
+  const boardSnapshot = state.board.slice();
+  const colorSnapshot = state.turn;
+  try {
+    const { x, y } = await computeHintAsync(boardSnapshot, colorSnapshot, controller, mode);
+    // 计算期间棋盘/回合/开关/对局任一变化 → 放弃本次落子, 避免旧结果覆盖新棋盘
+    if (!autoPlay || !state || myColor == null || state.status !== 'playing' ||
+        state.turn !== myColor || state.board.length !== boardSnapshot.length ||
+        state.board.some((v, i) => v !== boardSnapshot[i])) return;
+    if (state.board[y * SIZE + x] !== EMPTY) return;
+    send({ type: 'move', x, y });
+  } catch {
+    // 引擎忙/超时/失败: 静默忽略, 不打断用户
+  } finally {
+    if (seq === hintRequestSeq[mode]) hintAbort[mode] = null;
+  }
+}
+
+// 每次 state 更新后: 自动落子开着走自动, 否则提示开着才刷新手动提示
 function autoRefreshHint() {
-  if (!hintEnabled || !hintMode || !state || state.status !== 'playing') return;
+  if (!hintEnabled || !state || state.status !== 'playing') return;
+  if (autoPlay) { autoPlayMove(); return; }
+  if (!hintMode) return;
   setHintButton(hintMode, 'calculating');
   showHint(hintMode);
 }

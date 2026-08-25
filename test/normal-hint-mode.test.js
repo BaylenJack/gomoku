@@ -86,7 +86,7 @@ test('三个按钮顺序明确且三种模式互斥', () => {
   assert.match(app, /buttonId: 'ultraHintBtn'.*endpoint: '\/hint-ultra'/);
   assert.match(app, /buttonId: 'hintBtn'.*endpoint: '\/hint'/);
   assert.match(app, /buttonId: 'normalHintBtn'.*endpoint: '\/hint-normal'/);
-  assert.match(app, /if \(hintMode === mode\)[\s\S]*resetHint\(\)/);
+  assert.match(app, /if \(hintMode === mode(\s*&&\s*!autoPlay)?\)[\s\S]*resetHint\(\)/);
   assert.match(app, /hintMode !== mode \|\| requestSeq !== hintRequestSeq\[mode\]/);
 });
 
