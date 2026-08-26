@@ -942,6 +942,15 @@ function toggleAutoPlay() {
   if (autoPlay) autoPlayMove();
 }
 
+// 可中止睡眠: 信号中断时立即返回, 供自动落子延迟等待在状态变化时及时放弃。
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal && signal.aborted) return resolve();
+    const timer = setTimeout(resolve, ms);
+    if (signal) signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
 // 自动落子: 用提示引擎算出落点后静默发 move, 不显示建议圈/不弹提示。
 async function autoPlayMove() {
   if (!autoPlay || !hintEnabled || !state) return;
@@ -954,12 +963,21 @@ async function autoPlayMove() {
   const boardSnapshot = state.board.slice();
   const colorSnapshot = state.turn;
   try {
+    const t0 = performance.now();
     const { x, y } = await computeHintAsync(boardSnapshot, colorSnapshot, controller, mode);
+    const elapsed = performance.now() - t0;
     // 计算期间棋盘/回合/开关/对局任一变化 → 放弃本次落子, 避免旧结果覆盖新棋盘
     if (!autoPlay || !state || myColor == null || state.status !== 'playing' ||
         state.turn !== myColor || state.board.length !== boardSnapshot.length ||
         state.board.some((v, i) => v !== boardSnapshot[i])) return;
     if (state.board[y * SIZE + x] !== EMPTY) return;
+    // 引擎思考 <3s 时, 补一个 1~3s 的随机延迟, 让自动落子更像真人落子。
+    // 仅作用于自动落子这条路径, 不影响手动提示及其它引擎。等待期间若自动落子被关、对局结束
+    // 或新请求已接管(seq 变化)则放弃落子。
+    if (elapsed < 3000) {
+      await sleep(1000 + Math.random() * 2000, controller.signal);
+      if (seq !== hintRequestSeq[mode] || !autoPlay || !state || state.turn !== myColor) return;
+    }
     send({ type: 'move', x, y });
   } catch {
     // 引擎忙/超时/失败: 静默忽略, 不打断用户

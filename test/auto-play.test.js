@@ -49,3 +49,16 @@ test('点击隐藏按钮时自动落子按钮一起隐藏(状态不变)', () => 
   // 折叠时 auto 按钮隐形不可点
   assert.match(style, /\.auto-row\.collapsed \.btn-auto \{ opacity: 0; pointer-events: none; \}/);
 });
+
+test('自动落子引擎思考<3s 时补 1~3s 随机延迟(仅自动落子路径)', () => {
+  // 只测量自动落子路径的耗时, 不触碰服务端引擎/其它 hint 路径
+  assert.match(app, /const t0 = performance\.now\(\);/);
+  assert.match(app, /const elapsed = performance\.now\(\) - t0;/);
+  // 阈值 3s 与 1~3s 随机延迟范围写死在自动落子函数内
+  assert.match(app, /if \(elapsed < 3000\)/);
+  assert.match(app, /await sleep\(1000 \+ Math\.random\(\) \* 2000, controller\.signal\)/);
+  // 可中止睡眠工具: 让延迟等待在状态变化时及时放弃
+  assert.match(app, /function sleep\(ms, signal\)/);
+  // 延迟等待后仍校验 seq/自动落子开关/对局状态, 避免等待期间发出过期落子
+  assert.match(app, /if \(seq !== hintRequestSeq\[mode\] \|\| !autoPlay \|\| !state \|\| state\.turn !== myColor\) return;/);
+});
